@@ -4,8 +4,12 @@
 [Zz]ib
 [Zz]ibaldone
 Adwaita
+Automerge
 devenv
 gitlint
+Loro('s)?
 mdformat
 MIT
 Nygard
+PDFs
+Yjs
