@@ -1,0 +1,46 @@
+# General-purpose entries from Google.WordListCase, without the Google, Android, mobile UI and GCP
+# terms.
+---
+extends: substitution
+ignorecase: true
+level: error
+link: "https://developers.google.com/style/word-list"
+message: "Use '%s' instead of '%s'."
+swap:
+  "(?:WiFi|wifi)": Wi-Fi
+  "(?:cell ?phone|smart ?phone)": phone|mobile phone
+  "(?:e-mail|Email|E-mail)": email
+  "(?:file ?path|path ?name)": path
+  "(?:kill|terminate|abort)": stop|exit|cancel|end
+  "(?:ok|Okay)": OK|okay
+  '(?<!single )sign-?on': single sign-on
+  '3\-D': 3D
+  '\bOauth2\.0\b|\bOAuth ?2\b(?!\.0)|\bOauth\b(?! ?2)': OAuth 2.0
+  a\.k\.a|aka: or|also known as
+  above: preceding
+  account name: username
+  application: app
+  approx\.: approximately
+  autoupdate: automatically update
+  cellular data: mobile data
+  cellular network: mobile network
+  chapter: documents|pages|sections
+  check box: checkbox
+  click on: click|click in
+  content type: media type
+  data are: data is
+  disabled?: turn off|off
+  fewer data: less data
+  file name: filename
+  functionality: capability|feature
+  grayed-out: unavailable
+  in order to: to
+  ingest: import|load
+  open-source: open source
+  regex: regular expression
+  sign into: sign in to
+  stylesheet: style sheet
+  synch: sync
+  tablename: table name
+  "un(?:check|select)": clear
+  vs\.: versus

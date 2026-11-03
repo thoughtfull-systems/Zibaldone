@@ -1,0 +1,9 @@
+[Bb]acklinks?
+[Ll]ibadwaita
+[Ww]ikilinks?
+[Zz]ibaldone
+Adwaita
+devenv
+gitlint
+mdformat
+MIT

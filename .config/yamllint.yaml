@@ -1,0 +1,7 @@
+---
+extends: default
+
+rules:
+  key-ordering: enable
+  line-length:
+    max: 100

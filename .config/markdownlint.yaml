@@ -1,0 +1,7 @@
+---
+# https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md
+# mdformat alternates markers so adjacent lists stay separate.
+MD004: false
+MD013:
+  line_length: 100
+default: true

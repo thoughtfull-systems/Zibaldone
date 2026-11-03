@@ -1,0 +1,16 @@
+# General-purpose entries from Google.WordList, without the Google, Android and GCP product terms.
+---
+extends: substitution
+ignorecase: false
+level: error
+link: "https://developers.google.com/style/word-list"
+message: "Use '%s' instead of '%s'."
+swap:
+  Ajax: AJAX
+  HTTPs: HTTPS
+  SHA1: SHA-1
+  World Wide Web: web
+  authN: authentication
+  authZ: authorization
+  k8s: Kubernetes
+  url: URL
