@@ -5,6 +5,17 @@ Instructions for coding agents working in this repository.
 Zibaldone is a private, personal project. It has no license, so don't add a `LICENSE` file or
 license headers.
 
+Zib is short for Zibaldone, and `zib` is the name of its command-line interface (CLI). Write "Zib"
+or "Zibaldone" for the project, and lowercase `zib` only for the command, in code formatting.
+
+## Decisions
+
+Work on Zibaldone follows a log of design and architectural decisions in `decisions/`. Read the
+existing decisions and follow them before making a choice that defines a data format or protocol,
+sets a guideline for languages or technologies, or would be hard to reverse.
+[Decision 0000](decisions/0000-record-decisions.md) describes when to write a decision, the format,
+and the process.
+
 ## Environment
 
 The development environment comes from [devenv](https://devenv.sh). Run commands inside it with

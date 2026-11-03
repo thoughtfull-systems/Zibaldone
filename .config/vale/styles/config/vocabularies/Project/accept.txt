@@ -1,9 +1,11 @@
 [Bb]acklinks?
 [Ll]ibadwaita
 [Ww]ikilinks?
+[Zz]ib
 [Zz]ibaldone
 Adwaita
 devenv
 gitlint
 mdformat
 MIT
+Nygard
