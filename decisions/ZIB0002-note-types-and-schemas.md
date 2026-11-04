@@ -36,10 +36,13 @@ A later specification defines the exact encoding. In outline:
   `book`. A name never changes and never gets reused for a different type.
 - **Schemas.** A schema lists the type's fields. Each field has a name, which follows the same rules
   as type names, a kind, and a search mode.
-  - **Kinds:** text, integer, decimal, boolean, date, time of day, date and time, a link to a note,
-    a file, which holds a blob's hash as [decision ZIB0004](ZIB0004-storage-and-sync-of-files.md)
-    defines it, a choice from a fixed set of values, and a list of any of these. A time of day has
-    no date or time zone, so a journal prompt set for 07:00 comes up at 07:00 wherever the owner is.
+  - **Kinds:** text, integer, decimal, boolean, date, time, timestamp, a link to a note, a file,
+    which holds a blob's hash as [decision ZIB0004](ZIB0004-storage-and-sync-of-files.md) defines
+    it, a choice from a fixed set of values, and a list of any of these. A date has no time, and a
+    time has no date. Neither has a time zone, so a journal prompt set for 07:00 comes up at 07:00
+    wherever the owner is. A timestamp marks an instant, in Coordinated Universal Time. Kinds for
+    dates and times with time zones, durations, and intervals can join later, for calendar events
+    and recurring events.
   - **Search modes:** `text` indexes the value for full-text search, `filter` indexes it for exact
     matches, ranges, and sorting, and `none` leaves it out of the index.
   - **Derived fields:** a field of the file kind can derive from another file field of the same
