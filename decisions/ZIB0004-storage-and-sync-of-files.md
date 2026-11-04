@@ -81,8 +81,11 @@ machines transfer blobs.
   fields derived from it, which takes their blobs out of use too.
 - **Collecting garbage.** A machine deletes a blob, and removes its own identifier from the blob's
   entry, once the blob hasn't been in use in its copy of the space for 30 days. The wait gives
-  machines that haven't synced yet time to add a reference back. An entry for a blob not in use,
-  with no holders, leaves the map.
+  machines that haven't synced yet time to add a reference back. Each machine starts the 30 days
+  itself, when it first finds the blob out of use, and records that time in its cache directory
+  beside its search index. It clears the record if the blob comes back into use. Nothing syncs, so
+  machines never disagree about the time, and a machine that loses its cache only starts the wait
+  again. An entry for a blob not in use, with no holders, leaves the map.
 
 Against the criteria:
 
