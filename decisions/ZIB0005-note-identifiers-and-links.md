@@ -57,6 +57,13 @@ specification defines the exact syntax.
   a space the machine lacks, shows as a link to a missing note. When the owner deletes a note for
   good, its space keeps a tombstone with its identifier and last title, so links to it still say
   what they pointed to.
+- **Moving notes.** Moving a note to another space happens on one machine that holds both. It
+  fetches any blobs that the note's file fields hold and it lacks, copies the note into the target
+  with the same identifier as new changes, and deletes it from the source without a tombstone or a
+  trip through the trash, since the note still exists. A machine that holds only the source shows
+  links to it as links to a missing note. The app warns before a move that it discards any edits to
+  the note that other machines haven't synced yet. The note's history stays behind, and the notes it
+  links to stay in their own spaces, since links reach across spaces.
 - **URIs.** Outside the app, a uniform resource identifier (URI) of the form `zib:note/<id>` names a
   note. Each implementation registers itself as the handler of the `zib` scheme. A web app also
   serves each note at `https://<host>/note/<id>` and registers `web+zib`, because browsers only let
@@ -110,6 +117,8 @@ Against the criteria:
 - Decision ZIB0004 refers to this decision for the syntax of links to files, which goes through file
   notes.
 - The specification for spaces needs a tombstone map for notes deleted for good.
+- A move writes two documents. If the app stops between them, the note exists in both spaces, and
+  the owner deletes one copy.
 - Every implementation derives titles by the same rule, so the rule lives in shared code.
 - Raw text shows identifiers where titles would be, so an export to markdown files rewrites links to
   file names and fills in titles.
