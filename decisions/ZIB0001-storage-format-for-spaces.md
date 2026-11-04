@@ -118,8 +118,8 @@ Against the criteria:
   movable tree and no way to trim history, and its maps hold no typed values beyond JSON. It does
   worse than Loro on scales to a lifetime of notes for the same reasons as Automerge.
 
-- **SQLite with a CRDT extension, such as cr-sqlite.** Tables and queries suit typed fields and
-  search well. But cr-sqlite merges rows and columns, not the characters of a text value, so two
+- **SQLite with a CRDT extension, such as `cr-sqlite`.** Tables and queries suit typed fields and
+  search well. But `cr-sqlite` merges rows and columns, not the characters of a text value, so two
   edits to the same note's body keep only one of them, which fails lossless merging. Its development
   has also slowed, and its browser build depends on a WebAssembly port of SQLite.
 
