@@ -82,8 +82,12 @@ by value. A list is one plain value, so the last write to the whole list wins.
 
 - **Creating.** A writer creates a note in one commit: its map with `type`, `body`, `fields`, `meta`
   with all four keys, and `settings`.
-- **Editing.** A commit that changes a note's body or fields also sets `updated` and `updated-by`. A
-  writer that commits many small edits, such as keystrokes, may set them once per commit.
+- **Editing.** An editor commits the owner's edits to a note 3 seconds after the owner pauses, and
+  when the note closes. While the note is live, as the [sync specification](sync.md#live-editing)
+  defines, it commits within 50 milliseconds instead.
+- **Updated.** A writer sets `updated` and `updated-by` when it changes a note's body or fields, but
+  while an editor has the note open, at most once a minute, and once more when the note closes. Each
+  write stays in the document's history, so writing them on every commit would bloat it.
 - **Deleting for good.** A writer deletes a note for good in one commit: it removes the note's key
   from `notes` and adds its entry to `tombstones`.
 - **Moving.** Moving a note to another space removes it from this space with no tombstone, as

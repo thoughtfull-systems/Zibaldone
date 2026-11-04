@@ -36,8 +36,9 @@ A work machine shares the work space and must never receive the personal one.
   use their own.
 - **Files on demand.** A machine can fetch one file from any machine that holds it, and check each
   part as it arrives.
-- **Simple pairing.** Adding a machine to a space takes no typing. Most of the time the machines
-  share a local network, so the common case is to pick the other machine from a list and confirm.
+- **Simple pairing.** Adding a machine to a space takes no typing in the usual cases. Most of the
+  time the machines share a local network, so the common case is to pick the other machine from a
+  list and confirm.
 
 ## Decision
 
@@ -75,6 +76,13 @@ defines the protocol.
   secret, which works once, for 15 minutes. It shows the link as a QR code for a phone to scan, and
   as text to open on another machine. The new machine connects and sends the secret, and the
   inviting machine adds the new one to `machines` and sends it the space.
+- **Pairing by address.** When multicast DNS can't reach the other machine, such as on a network
+  that blocks it, the owner can type or paste the other machine's address on a member instead: its
+  public key, shown and typed as 52 characters of Crockford's Base32 in uppercase, in groups of four
+  separated by hyphens, optionally followed by network addresses to try first. Readers forgive case
+  and the letters people confuse, as they do for identifiers. The member connects to it, and the two
+  pair as nearby machines do, with the other machine's Add machine screen open and the same
+  six-digit code.
 - **After pairing.** The new machine's owner gives each space a pet name, and from then on, the new
   machine syncs with every member of those spaces.
 - **Removing a machine.** Any member can remove another. Removal marks the machine's entry in
@@ -100,16 +108,25 @@ defines the protocol.
 - **Relays.** By default, sync uses the public relays and address lookup of n0, the company behind
   iroh, which cost nothing and need no account. A relay learns which addresses connect, their IP
   addresses, and how much traffic passes, but no content. The owner can set their own relay instead.
-- **When to sync.** While Zib runs, a machine accepts connections from the members of its spaces. It
-  syncs with every member shortly after each local change, when it starts, when the network changes,
-  after waking from sleep, and every 15 minutes. After a failed sync, it retries after 30 seconds,
-  then doubles the wait each time, up to 10 minutes. On Android, a periodic background job syncs as
-  often as Android allows. A browser syncs while the app is open.
-- **Sync status.** Every app shows an icon that marks whether the machine holds changes no other
-  machine has yet: one form while any change or file it created waits to sync, and another once
-  every one has reached another member of its space. A machine learns what each member holds from
-  the version vectors and holder entries it receives, so the icon changes as soon as a sync
-  completes. Opening the icon shows the state of each space and when it last synced.
+- **When to sync.** While Zib runs, a machine accepts connections from the members of its spaces. In
+  the background, it takes its time: it syncs each space with every member every 30 seconds, and
+  when it starts, when the network changes, and after waking from sleep. When the owner opens a note
+  to edit, the machine syncs the note's space with every member at once, so the note is as current
+  as it can be. After a failed sync, it retries after 30 seconds, then doubles the wait each time,
+  up to 10 minutes. On Android, a periodic background job syncs as often as Android allows. A
+  browser syncs while the app is open.
+- **Live editing.** While two machines both have the same note open for editing, they send each
+  other every change to its space as it happens, within a fraction of a second, so the owner watches
+  one machine's typing appear on the other, much as in a shared online document. Each machine also
+  shows the other's cursor and selection in the note, labeled with the other machine's name. Cursors
+  never enter the document. Live editing ends when either closes the note.
+- **Sync status.** Every app shows an icon with three states for the changes and files this machine
+  made: not synced while any of them has reached no other member, partly synced while each has
+  reached at least one other member but not every member, and synced once every member has every
+  one. For files, every member with the `all` policy counts. The icon shows the least synced state
+  across the machine's spaces. A machine learns what each member holds from the version vectors and
+  holder entries it receives, so the icon changes as soon as a sync completes. Opening the icon
+  shows the state of each space and when it last synced.
 - **Always-on machines.** Zib can run without a window, as a background service on a desktop or a
   small server, which the owner starts and controls through the `zib` command. It joins spaces as an
   ordinary member, with the `all` policy, so changes and files pass between machines that rarely run
@@ -132,8 +149,9 @@ Against the criteria:
 - **Files on demand:** iroh-blobs fetches single blobs by hash from any holder and verifies them as
   they stream.
 - **Simple pairing:** machines on one network pair with a tap and a glance at two codes. Elsewhere,
-  a phone joins by scanning a code, and other machines by opening a link. Every member then syncs
-  with the new one, with no pairing between each pair of machines.
+  a phone joins by scanning a code, and other machines by opening a link, or, where multicast DNS
+  fails, by pasting an address. Every member then syncs with the new one, with no pairing between
+  each pair of machines.
 
 ## Rejected alternatives
 
@@ -188,9 +206,12 @@ Against the criteria:
   phone needs removing from each of its spaces.
 - A removed machine keeps its copy of the space from before its removal. Removal stops future
   changes reaching it, but can't take back what it already has.
-- Each implementation needs screens to pair nearby machines, make and accept invites, name machines,
-  remove them, sync by hand, show sync status, and set a relay. Android needs a camera to scan
-  invites, and holds a multicast lock while it listens for nearby machines.
+- Each implementation needs screens to pair nearby machines, make and accept invites, pair by
+  address, name machines, remove them, sync by hand, show sync status, and set a relay. Android
+  needs a camera to scan invites, and holds a multicast lock while it listens for nearby machines.
+- Live editing sends a message for each change while two machines share an open note, which costs
+  little on a local network and a little more through a relay. Background sync every 30 seconds
+  keeps connections to members open, or reopens them, while Zib runs.
 - A machine announces its public key on every local network it joins, so someone watching that
   network can tell when the same machine returns. Its name goes out only while the owner pairs.
 - Address lookup through n0 publishes each machine's current relay under its public key, but nothing

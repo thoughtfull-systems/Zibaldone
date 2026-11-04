@@ -47,7 +47,8 @@ asynchronous functions, with changes pushed back through listeners.
   threads, and each app passes the change to its interface thread: Android through a Kotlin flow,
   and GTK through a channel that the main loop reads.
 - **Typing.** Each keystroke goes to its space's task, which applies it and returns quickly, so the
-  editor never waits on sync, indexing, or rendering, which follow afterward.
+  editor never waits on sync, indexing, or rendering. Those follow once the owner pauses, not after
+  every commit, so fast typing doesn't repeat the work.
 - **A browser later.** The core reaches the runtime only through a small module of its own, for
   spawning tasks, timers, and blocking work. A WebAssembly build can replace that module with one
   built on the browser's event loop, without changing the rest of the core.
