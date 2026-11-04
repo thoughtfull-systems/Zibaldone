@@ -1,16 +1,17 @@
-# 0006 Sync of spaces and files
+# ZIB0006 Sync of spaces and files
 
 ## Context
 
 Earlier decisions leave the sync transport and protocol to this one:
 
-- [Decision 0001](0001-storage-format-for-spaces.md) stores each space as a Loro document, whose
-  updates any channel can carry.
-- [Decision 0003](0003-space-identity-and-machine-settings.md) puts each space's identifier in its
-  document, so sync can offer a space by identifier. It leaves the names of other machines to sync.
-- [Decision 0004](0004-storage-and-sync-of-files.md) stores files as blobs named by BLAKE3 hashes,
-  outside the document. Sync has to fetch a single blob on demand from whichever machine holds it,
-  check it as it arrives, and keep the `files` map free of machines that left the space.
+- [Decision ZIB0001](ZIB0001-storage-format-for-spaces.md) stores each space as a Loro document,
+  whose updates any channel can carry.
+- [Decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md) puts each space's identifier in
+  its document, so sync can offer a space by identifier. It leaves the names of other machines to
+  sync.
+- [Decision ZIB0004](ZIB0004-storage-and-sync-of-files.md) stores files as blobs named by BLAKE3
+  hashes, outside the document. Sync has to fetch a single blob on demand from whichever machine
+  holds it, check it as it arrives, and keep the `files` map free of machines that left the space.
 
 The owner runs Zib on Linux machines, an Android phone, and in a browser. Any two of them should
 sync at home on one network or over the internet. A laptop sits behind a home router, and a phone on
@@ -49,9 +50,9 @@ defines the protocol.
   Security (TLS) 1.3 inside each connection, keyed by the two machines' key pairs, so each side
   proves it holds the secret key for its address.
 - **Members.** A root `machines` map in the space's document lists the space's machines, keyed by
-  the machine identifiers from decision 0003. Each entry holds the machine's public key, its name,
-  and its file policy from decision 0004. A machine names itself when it joins, and the owner can
-  rename any machine from any machine in the space.
+  the machine identifiers from decision ZIB0003. Each entry holds the machine's public key, its
+  name, and its file policy from decision ZIB0004. A machine names itself when it joins, and the
+  owner can rename any machine from any machine in the space.
 - **Trust.** A machine syncs a space only with machines that its own copy of the space lists in
   `machines`, and refuses any other connection for that space. Joining one space never grants access
   to another.
@@ -80,7 +81,7 @@ defines the protocol.
   `all` policy fetches every blob in `files` that it lacks. A machine with the `on demand` policy
   fetches a blob when the owner opens it, from any holder that's online. Every machine fetches every
   derived blob. Before a machine drops a blob, it asks an `all` holder over the same connection to
-  confirm that it holds the blob, as decision 0004 requires.
+  confirm that it holds the blob, as decision ZIB0004 requires.
 - **Connections.** iroh connects through a relay first, tries a direct path with hole punching, and
   moves the connection there once it works. Machines find each other by public key, through iroh's
   address lookup and, on a local network, through multicast DNS, so members on one network connect
@@ -156,7 +157,7 @@ Against the criteria:
 
 ## Consequences
 
-- Decision 0001's outline gains the root `machines` map.
+- Decision ZIB0001's outline gains the root `machines` map.
 - Each implementation depends on iroh and iroh-blobs, through the Rust crates or bindings, and on an
   asynchronous runtime. They add a few megabytes to each build.
 - Two machines sync only while both run. Without an always-on machine, a phone with the `on demand`

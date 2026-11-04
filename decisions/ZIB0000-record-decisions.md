@@ -1,4 +1,4 @@
-# 0000 Record design and architectural decisions
+# ZIB0000 Record design and architectural decisions
 
 ## Context
 
@@ -45,12 +45,12 @@ technologies, shapes how the parts of Zibaldone fit together, or would be hard t
 too when a reader of the code would reasonably ask why it works this way and the answer doesn't fit
 in a source comment.
 
-### Files and numbering
+### Identifiers and files
 
-Name each file with the next unused four-digit number, zero-padded, followed by a short title in
-lowercase words joined by hyphens: `0001-sync-protocol.md`. The number identifies the decision, so
-never reuse or change it. Start the document with a level-one heading that repeats the number and
-gives the title in sentence case: `# 0001 Sync protocol`.
+Give each decision an identifier: `ZIB` followed by the next unused four-digit number, zero-padded.
+Name its file with the identifier and a short title in lowercase words joined by hyphens:
+`ZIB0001-sync-protocol.md`. Never reuse or change an identifier. Start the document with a level-one
+heading that repeats the identifier and gives the title in sentence case: `# ZIB0001 Sync protocol`.
 
 ### Sections
 
@@ -95,13 +95,13 @@ and explain why it no longer wins.
 
 When the context or the criteria need major changes, write a new decision instead, and explain what
 changed. Leave the old decision's text alone, and add a line under its title that links to the new
-one, such as `Superseded by [0007](0007-sync-protocol-v2.md).`
+one, such as `Superseded by [ZIB0007](ZIB0007-sync-protocol-v2.md).`
 
 ### Moving the log into Zib
 
-When Zib can store the decisions, move each one into it with its number and title unchanged. A
-reference such as "decision 0001" then still names the same decision, and the skill or MCP server
-looks it up by number. Write a new decision for the move that covers how Zib stores the log, how
+When Zib can store the decisions, move each one into it with its identifier and title unchanged. A
+reference such as "decision ZIB0001" then still names the same decision, and the skill or MCP server
+looks it up by identifier. Write a new decision for the move that covers how Zib stores the log, how
 agents reach it, and how the process in this document changes.
 
 ### Evaluation
@@ -115,9 +115,9 @@ agents reach it, and how the process in this document changes.
   each rejected alternative explains its shortfall against the criteria it fails.
 - **Low ceremony:** only two sections are mandatory, a short decision fits on one screen, and
   merging a decision accepts it without a separate status to track.
-- **Stable references:** the number never changes. A decision keeps its number through revisions and
-  through the move into Zib, and when it no longer applies, it links to the decision that supersedes
-  it.
+- **Stable references:** the identifier never changes. A decision keeps its identifier through
+  revisions and through the move into Zib, and when it no longer applies, it links to the decision
+  that supersedes it.
 
 ## Rejected alternatives
 
@@ -147,7 +147,7 @@ agents reach it, and how the process in this document changes.
 - Choices made before this decision, such as the devenv setup, have no record. Write one for an
   earlier choice when it comes up for review or someone questions it.
 - AGENTS.md points contributors to this decision, so agents follow the same process.
-- Moving the log into Zib needs a skill or MCP server that finds a decision by number, and a new
+- Moving the log into Zib needs a skill or MCP server that finds a decision by identifier, and a new
   decision that records the move.
 
 [nygard]: https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions

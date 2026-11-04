@@ -1,8 +1,8 @@
-# 0005 Note identifiers and links
+# ZIB0005 Note identifiers and links
 
 ## Context
 
-[Decision 0001](0001-storage-format-for-spaces.md) keys each space's `notes` map by a note
+[Decision ZIB0001](ZIB0001-storage-format-for-spaces.md) keys each space's `notes` map by a note
 identifier and leaves its form to this decision. Notes link to each other inside their markdown
 bodies, and other software links to them too: a browser bookmark, a calendar entry, or a launcher on
 the desktop. A link has to keep working while the note it points to changes.
@@ -11,8 +11,8 @@ Machines create notes offline, so identifiers can't come from a shared counter. 
 from its text, so it changes whenever the text does. A note can also move from one space to another,
 and a link from a note in one space can point to a note in another, on a machine that holds both.
 
-[Decision 0004](0004-storage-and-sync-of-files.md) gives every file a note of the `file` type. A
-note's body shows an image or links to a PDF through that note.
+[Decision ZIB0004](ZIB0004-storage-and-sync-of-files.md) gives every file a note of the `file` type.
+A note's body shows an image or links to a PDF through that note.
 
 ## Criteria
 
@@ -33,7 +33,7 @@ note's body shows an image or links to a PDF through that note.
 Give every note a version 7 Universally Unique Identifier (UUID) when someone creates it, written as
 26 lowercase characters of Crockford's Base32. The identifier never changes, never gets reused, and
 stays the same when the note moves to another space. A space's identifier from
-[decision 0003](0003-space-identity-and-machine-settings.md) uses the same text form. A later
+[decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md) uses the same text form. A later
 specification defines the exact syntax.
 
 - **Wikilinks.** Inside a note's body, link to a note with `[[id]]` or `[[id|label]]`. Typing `[[`
@@ -61,7 +61,7 @@ specification defines the exact syntax.
   web pages handle schemes that start with `web+`. Standard markdown links with a `zib:` URI work
   inside bodies too.
 - **Backlinks.** Each machine finds backlinks by parsing every body, and keeps them in the search
-  index that decision 0003 places on the machine.
+  index that decision ZIB0003 places on the machine.
 
 Against the criteria:
 
@@ -105,7 +105,7 @@ Against the criteria:
 
 - Every implementation needs a version 7 UUID generator, a Crockford Base32 codec, and a wikilink
   parser.
-- Decision 0004 refers to this decision for the syntax of links to files, which goes through file
+- Decision ZIB0004 refers to this decision for the syntax of links to files, which goes through file
   notes.
 - The specification for spaces needs a tombstone map for notes deleted for good.
 - Every implementation derives titles by the same rule, so the rule lives in shared code.

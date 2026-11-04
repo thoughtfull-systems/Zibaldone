@@ -1,12 +1,12 @@
-# 0002 Note types and their schemas
+# ZIB0002 Note types and their schemas
 
 ## Context
 
-[Decision 0001](0001-storage-format-for-spaces.md) gives every note a `type`, which never changes,
-and a `fields` map that holds the attributes its type defines, such as a book's author. Search and
-filters use these fields, so each implementation needs to know what kind of value each field holds.
-Decision 0001 also reserves a `schemas` key in each space for the definitions of the types the space
-uses, and leaves their form to this decision.
+[Decision ZIB0001](ZIB0001-storage-format-for-spaces.md) gives every note a `type`, which never
+changes, and a `fields` map that holds the attributes its type defines, such as a book's author.
+Search and filters use these fields, so each implementation needs to know what kind of value each
+field holds. Decision ZIB0001 also reserves a `schemas` key in each space for the definitions of the
+types the space uses, and leaves their form to this decision.
 
 Types come built into the app. Nobody creates types through the interface. The set of types and
 their fields still grows from one release to the next, and machines don't update in step. A phone
@@ -37,9 +37,9 @@ A later specification defines the exact encoding. In outline:
 - **Schemas.** A schema lists the type's fields. Each field has a name, which follows the same rules
   as type names, a kind, and a search mode.
   - **Kinds:** text, integer, decimal, boolean, date, time of day, date and time, a link to a note,
-    a file, as [decision 0004](0004-storage-and-sync-of-files.md) defines it, a choice from a fixed
-    set of values, and a list of any of these. A time of day has no date or time zone, so a journal
-    prompt set for 07:00 comes up at 07:00 wherever the owner is.
+    a file, as [decision ZIB0004](ZIB0004-storage-and-sync-of-files.md) defines it, a choice from a
+    fixed set of values, and a list of any of these. A time of day has no date or time zone, so a
+    journal prompt set for 07:00 comes up at 07:00 wherever the owner is.
   - **Search modes:** `text` indexes the value for full-text search, `filter` indexes it for exact
     matches, ranges, and sorting, and `none` leaves it out of the index.
   - A schema can mark a field as deprecated. Releases stop offering it for new values but keep
@@ -73,7 +73,7 @@ Against the criteria:
   Edits write single keys in the `fields` map, so editing one field never touches the fields the
   release doesn't know.
 - **Merge-safe:** releases only add to schemas and never rewrite what's there, so concurrent writes
-  agree. Notes merge field by field as decision 0001 defines, whichever release made each edit.
+  agree. Notes merge field by field as decision ZIB0001 defines, whichever release made each edit.
 - **Searchable:** every field carries a kind and a search mode, which together tell the index what
   to do with it, even for fields the release has never seen.
 - **Low ceremony:** a new field is a new entry in its type's schema, with no version to bump. No

@@ -13,8 +13,8 @@ or "Zibaldone" for the project, and lowercase `zib` only for the command, in cod
 Work on Zibaldone follows a log of design and architectural decisions in `decisions/`. Read the
 existing decisions and follow them before making a choice that defines a data format or protocol,
 sets a guideline for languages or technologies, or would be hard to reverse.
-[Decision 0000](decisions/0000-record-decisions.md) describes when to write a decision, the format,
-and the process.
+[Decision ZIB0000](decisions/ZIB0000-record-decisions.md) describes when to write a decision, the
+format, and the process.
 
 ## Environment
 

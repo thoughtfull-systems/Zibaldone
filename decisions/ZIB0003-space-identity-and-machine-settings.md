@@ -1,9 +1,9 @@
-# 0003 Space identity and machine settings
+# ZIB0003 Space identity and machine settings
 
 ## Context
 
-[Decision 0001](0001-storage-format-for-spaces.md) stores each space as one Loro document, with
-settings that sync to every machine that shares the space. Each machine also has settings that
+[Decision ZIB0001](ZIB0001-storage-format-for-spaces.md) stores each space as one Loro document,
+with settings that sync to every machine that shares the space. Each machine also has settings that
 belong to it alone, such as window sizes, which spaces it shows, and how much disk it may use. These
 never sync.
 
@@ -12,8 +12,8 @@ with which document on another. Each space needs an identity for that. Its name 
 machine gives each space a name of its own, a pet name, and renaming a space on one machine never
 changes its name on another. The owner might call a space Work on a laptop and Job on a phone.
 
-Machines also need an identity, because decision 0001 records which machine created and last changed
-each note.
+Machines also need an identity, because decision ZIB0001 records which machine created and last
+changed each note.
 
 ## Criteria
 
@@ -110,13 +110,13 @@ Against the criteria:
 
 - Sync pairs machines per space by identifier, and the decision on sync defines how one machine
   offers a space to another and how the other accepts it, names it, and records its identifier.
-- Decision 0001's outline gains a root `meta` map, which holds the space's identifier.
+- Decision ZIB0001's outline gains a root `meta` map, which holds the space's identifier.
 - A copy of a space's document is the same space, not a new one. Starting a new space means creating
   one, and a feature that copies a space as a template would have to give the copy a new identifier.
 - A merge loses the source's history and any changes to the source that other machines hadn't synced
   to the merging machine. The owner removes the source from those machines by hand, and copies over
   anything left behind.
-- Merging on a machine with the `on demand` policy from decision 0004 needs the source's files
+- Merging on a machine with the `on demand` policy from decision ZIB0004 needs the source's files
   available from another machine, since the merge fetches them all.
 - Each implementation needs a way to create, name, rename, and remove spaces, and to merge one space
   into another.

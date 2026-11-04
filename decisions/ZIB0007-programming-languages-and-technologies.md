@@ -1,22 +1,22 @@
-# 0007 Programming languages and technologies
+# ZIB0007 Programming languages and technologies
 
 ## Context
 
 Zib runs on Linux, on an Android phone, and in a browser. Apple and Windows platforms may come
 later. On Linux, the `zib` command works beside the app and can run as an always-on member of a
-space, as [decision 0006](0006-sync-of-spaces-and-files.md) describes.
+space, as [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md) describes.
 
 Earlier decisions fixed the libraries that every implementation depends on, and each is a Rust
 library:
 
-- [Loro](0001-storage-format-for-spaces.md), for the spaces' documents.
-- [BLAKE3](0004-storage-and-sync-of-files.md), the hash that names each file.
-- [iroh and iroh-blobs](0006-sync-of-spaces-and-files.md), for sync.
+- [Loro](ZIB0001-storage-format-for-spaces.md), for the spaces' documents.
+- [BLAKE3](ZIB0004-storage-and-sync-of-files.md), the hash that names each file.
+- [iroh and iroh-blobs](ZIB0006-sync-of-spaces-and-files.md), for sync.
 
 Beyond those libraries, a lot of logic doesn't depend on the platform: the schema rules of
-[decision 0002](0002-note-types-and-schemas.md), the identifiers and wikilink parser of
-[decision 0005](0005-note-identifiers-and-links.md), the checks on incoming updates, the rules for
-keeping and dropping blobs, and the search index.
+[decision ZIB0002](ZIB0002-note-types-and-schemas.md), the identifiers and wikilink parser of
+[decision ZIB0005](ZIB0005-note-identifiers-and-links.md), the checks on incoming updates, the rules
+for keeping and dropping blobs, and the search index.
 
 The owner prefers a native app on each platform to one implementation that feels slightly off
 everywhere.
@@ -59,7 +59,7 @@ platform around it as a thin layer:
   services through interfaces that each app implements, and never contains user interface code.
 - **Linux:** a Rust app built with GTK 4 and libadwaita, which links the core directly.
 - **`zib` command:** Rust, linking the core directly. It shares the machine's store with the Linux
-  app, as [decision 0003](0003-space-identity-and-machine-settings.md) requires.
+  app, as [decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md) requires.
 - **Android:** a Kotlin app built with Jetpack Compose, which calls the core through bindings that
   [UniFFI] generates.
 - **Web:** a TypeScript app, which loads the core as WebAssembly through `wasm-bindgen`. It chooses

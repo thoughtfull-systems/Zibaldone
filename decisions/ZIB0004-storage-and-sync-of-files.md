@@ -1,11 +1,11 @@
-# 0004 Storage and sync of files
+# ZIB0004 Storage and sync of files
 
 ## Context
 
 Zib holds binary files, PDFs and images among them, beside its notes.
-[Decision 0001](0001-storage-format-for-spaces.md) stores a space's notes in one Loro document, and
-leaves the bytes of files to this decision. A note describes a file, and other notes can show or
-link to it, as an image in a note's body or a book's cover.
+[Decision ZIB0001](ZIB0001-storage-format-for-spaces.md) stores a space's notes in one Loro
+document, and leaves the bytes of files to this decision. A note describes a file, and other notes
+can show or link to it, as an image in a note's body or a book's cover.
 
 Files are far larger than notes, and a space can collect gigabytes of them over the years. A laptop
 can hold them all, but an Android phone or a web app in a browser should keep only some of them and
@@ -44,21 +44,21 @@ machines transfer blobs.
   kind, a file, whose value is the blob's hash. The note's body starts with the file's name, which
   serves as its title, and goes on to describe the file. Other types can hold files in fields of the
   same kind, and a note's body can show or link to a file through its note, as
-  [decision 0005](0005-note-identifiers-and-links.md) defines.
+  [decision ZIB0005](ZIB0005-note-identifiers-and-links.md) defines.
 - **The `files` map.** A root `files` map in the space's document holds an entry for each blob,
   keyed by its hash: its size, its media type, the hashes of its derived blobs, and the machines
   that hold it. Each machine adds its own identifier, from
-  [decision 0003](0003-space-identity-and-machine-settings.md), once it holds the whole blob and has
-  checked its hash, and removes it when it drops the blob. Each machine writes only its own key, so
-  these writes never conflict.
+  [decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md), once it holds the whole blob
+  and has checked its hash, and removes it when it drops the blob. Each machine writes only its own
+  key, so these writes never conflict.
 - **What a machine keeps.** Each machine has a fixed policy, which its implementation sets and which
   never changes. The space's document records it in the machine's entry in the `machines` map, as
-  [decision 0006](0006-sync-of-spaces-and-files.md) defines it, so every machine knows which others
-  keep every file. The `all` policy has the machine fetch and keep every blob. The `on demand`
-  policy fetches a blob when the owner opens it, keeps it in a cache up to a size the owner sets,
-  and drops the blobs it opened least recently when the cache fills. The owner can also keep
-  particular files on a machine, whatever its policy. The Linux app and the `zib` command use `all`,
-  and Android and the web use `on demand`.
+  [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md) defines it, so every machine knows which
+  others keep every file. The `all` policy has the machine fetch and keep every blob. The
+  `on demand` policy fetches a blob when the owner opens it, keeps it in a cache up to a size the
+  owner sets, and drops the blobs it opened least recently when the cache fills. The owner can also
+  keep particular files on a machine, whatever its policy. The Linux app and the `zib` command use
+  `all`, and Android and the web use `on demand`.
 - **Dropping a blob.** Only a machine with the `on demand` policy drops a blob that a note refers
   to. A machine with the `all` policy deletes blobs only by collecting garbage. Before it drops a
   blob, a machine connects to a holder that the space lists with the `all` policy, and asks whether
@@ -70,7 +70,7 @@ machines transfer blobs.
 - **Derived blobs.** The first machine that can read a file's text writes it to a blob of its own,
   and the first that can draw a small preview image writes that too. Every machine fetches every
   derived blob, whatever its policy, so it can search and preview every file. Each machine indexes
-  the text as [decision 0002](0002-note-types-and-schemas.md) indexes `text` fields.
+  the text as [decision ZIB0002](ZIB0002-note-types-and-schemas.md) indexes `text` fields.
 - **Collecting garbage.** A machine deletes a blob, and removes its own identifier from the blob's
   entry, once no note in its copy of the space has referred to the blob for 30 days. The wait gives
   machines that haven't synced yet time to add a reference back. An entry with no references and no
@@ -125,7 +125,8 @@ Against the criteria:
 
 ## Consequences
 
-- Decision 0001's outline gains the root `files` map, and decision 0002's kinds gain the file kind.
+- Decision ZIB0001's outline gains the root `files` map, and decision ZIB0002's kinds gain the file
+  kind.
 - The decision on sync needs to transfer blobs as well as document updates, verify them as they
   arrive, and fetch from whichever machine holds a blob. [iroh-blobs], which uses BLAKE3, is a
   candidate.
