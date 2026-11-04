@@ -1,3 +1,4 @@
+[Aa]utolinks?
 [Bb]acklinks?
 [Ll]ibadwaita
 [Ww]ikilinks?
@@ -5,9 +6,12 @@
 [Zz]ibaldone
 Adwaita
 Automerge
+CommonMark
 Crockford('s)?
 devenv
+Djot
 FTS5
+GFM('s)?
 gitlint
 iroh('s)?
 Jetpack
@@ -16,11 +20,13 @@ mdformat
 MIT
 Multiplatform
 Nygard
+Pandoc('s)?
 PDFs
 Rust
 SQLite
 Syncthing
 Tantivy
 Tauri
+Typst
 UniFFI
 Yjs
