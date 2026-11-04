@@ -14,11 +14,6 @@ a note in one space can point to a note in another, on a machine that holds both
 [Decision 0004](0004-storage-and-sync-of-files.md) gives every file a note of the `file` type. A
 note's body shows an image or links to a PDF through that note.
 
-Commonplace, in the sibling `vibes` repository, settled the same questions in its decisions 0003 and
-0008\. It gave each note a version 7 Universally Unique Identifier (UUID), linked with wikilinks by
-identifier, and later stopped copying titles into links, because copied titles went stale and
-rewriting them on two machines at once doubled them. This decision weighs those choices afresh.
-
 ## Criteria
 
 - **Stable.** A link keeps pointing to the same note through edits, renames, and moves between
@@ -35,9 +30,9 @@ rewriting them on two machines at once doubled them. This decision weighs those 
 
 ## Decision
 
-Give every note an identifier when someone creates it: a version 7 UUID, written as 26 lowercase
-characters of Crockford's Base32. The identifier never changes, never gets reused, and stays the
-same when the note moves to another space. A space's identifier from
+Give every note a version 7 Universally Unique Identifier (UUID) when someone creates it, written as
+26 lowercase characters of Crockford's Base32. The identifier never changes, never gets reused, and
+stays the same when the note moves to another space. A space's identifier from
 [decision 0003](0003-space-identity-and-machine-settings.md) uses the same text form. A later
 specification defines the exact syntax.
 
@@ -86,8 +81,8 @@ Against the criteria:
 - **Links by title.** They're the quickest to type and the most readable, but they break when a
   title changes, and they can't reach a note without a title. They fail the stable criterion.
 - **Titles copied into labels.** The raw text would read well, but a copied title goes stale when
-  the target's title changes, and rewriting it on two machines at once doubles it. Commonplace
-  learned this the hard way. It fails the current titles and merge-safe criteria.
+  the target's title changes, and rewriting it on two machines at once doubles it. It fails the
+  current titles and merge-safe criteria.
 - **Version 4 UUIDs, which are all random.** They work as well, but version 7's leading timestamp
   sorts identifiers by creation and keeps indexes that use them as keys in order. The creation time
   is already in each note's `meta`, so version 7 reveals nothing new.

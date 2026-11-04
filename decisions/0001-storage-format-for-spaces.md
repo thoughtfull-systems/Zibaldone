@@ -24,11 +24,6 @@ binary files. This decision covers how a space stores its notes, their attribute
 and how concurrent changes merge. It's the format every implementation reads and writes, so it's the
 hardest choice in Zib to reverse.
 
-The sibling `vibes` repository built Commonplace, an earlier personal knowledge management app, on
-the same principles. Its decisions 0002, 0005, and 0007 chose a [Loro] document per library, a
-`settings` map per note, and one library per space. This decision weighs the options afresh, using
-Commonplace's reasoning and experience as evidence.
-
 ## Criteria
 
 - **Lossless merging.** Concurrent edits on two offline machines merge without losing either side,
@@ -46,7 +41,7 @@ Commonplace's reasoning and experience as evidence.
 
 ## Decision
 
-Store each space as a single Loro document, a Conflict-free Replicated Data Type (CRDT). A later
+Store each space as a single [Loro] document, a Conflict-free Replicated Data Type (CRDT). A later
 specification defines the exact containers and keys. In outline:
 
 - **`notes`** maps each note's identifier to a map with these keys:

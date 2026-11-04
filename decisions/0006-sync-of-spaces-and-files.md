@@ -20,10 +20,6 @@ has to forward traffic between them, and anything on that path must learn nothin
 
 A work machine shares the work space and must never receive the personal one.
 
-Commonplace, in the sibling `vibes` repository, chose [iroh] in its decision 0013, with trust
-between each pair of devices and share identifiers kept in each device's store. This decision weighs
-that afresh, against Zib's choice to keep a space's identity in the space.
-
 ## Criteria
 
 - **Private.** Encryption and authentication cover every byte between machines, end to end. Nothing
@@ -44,7 +40,7 @@ that afresh, against Zib's choice to keep a space's identity in the space.
 
 ## Decision
 
-Sync over iroh, a Rust library that dials encrypted connections by public key, and transfer files
+Sync over [iroh], a Rust library that dials encrypted connections by public key, and transfer files
 with [iroh-blobs]. Record each space's machines in the space's document. A later specification
 defines the protocol.
 
@@ -121,10 +117,9 @@ Against the criteria:
 
 ## Rejected alternatives
 
-- **Trust between each pair of machines, with share identifiers in machine stores.** This is
-  Commonplace's design. It keeps membership out of the document, but a backup then loses who shares
-  the space, and each new machine has to pair with every other one. It fails the self-contained and
-  simple pairing criteria.
+- **Trust between each pair of machines, with share identifiers in machine stores.** It keeps
+  membership out of the document, but a backup then loses who shares the space, and each new machine
+  has to pair with every other one. It fails the self-contained and simple pairing criteria.
 - **Plain TCP connections, encrypted with the Noise protocol.** It's small and private, but a
   machine behind NAT can't accept a connection, and a browser can't open a raw TCP connection at
   all. It fails the reachable criterion unless Zib builds its own relays.

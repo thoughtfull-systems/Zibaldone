@@ -66,8 +66,7 @@ with `--no-verify`.
 
 The hooks cover only the file types the repository has, so Rust, Kotlin, `.toml`, and GitHub Actions
 workflows have none yet. When you add the first file of a new type, add hooks that format and lint
-it in the same commit. The sibling `vibes` repository configures hooks for each of these, so copy
-its setup.
+it in the same commit.
 
 ## Line length
 

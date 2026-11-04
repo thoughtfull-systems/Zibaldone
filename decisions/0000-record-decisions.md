@@ -10,8 +10,7 @@ contributor, human or agent, then can't tell whether a constraint still matters,
 preserves it out of caution or breaks it by accident.
 
 The project needs a lightweight way to record each significant decision, the problem behind it, the
-options it weighed, and the reasons for the outcome. The sibling `vibes` repository already keeps
-such a log, and Zibaldone follows its structure.
+options it weighed, and the reasons for the outcome.
 
 For now the decisions live as markdown files on disk. Once Zibaldone can hold them, the log moves
 into Zibaldone itself, Zib for short, and agents reach the decisions there through a skill or a
@@ -36,9 +35,8 @@ example and template for later decisions.
 ## Decision
 
 Record each significant design or architectural decision as a markdown file in the `decisions`
-directory. The format follows the one in `vibes`, which adapts the architecture decision records
-that Michael Nygard [described][nygard] to put the criteria and the rejected alternatives on the
-record.
+directory. The format adapts the architecture decision records that Michael Nygard
+[described][nygard] to put the criteria and the rejected alternatives on the record.
 
 ### When to write a decision
 
@@ -149,8 +147,6 @@ agents reach it, and how the process in this document changes.
 - Choices made before this decision, such as the devenv setup, have no record. Write one for an
   earlier choice when it comes up for review or someone questions it.
 - AGENTS.md points contributors to this decision, so agents follow the same process.
-- Decisions stay in the same format as the ones in `vibes`, so a change to the format in one
-  repository is worth considering for the other.
 - Moving the log into Zib needs a skill or MCP server that finds a decision by number, and a new
   decision that records the move.
 

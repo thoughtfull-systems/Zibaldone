@@ -18,10 +18,8 @@ Beyond those libraries, a lot of logic doesn't depend on the platform: the schem
 [decision 0005](0005-note-identifiers-and-links.md), the checks on incoming updates, the rules for
 keeping and dropping blobs, and the search index.
 
-The sibling `vibes` repository faced the same platforms in its decision 0001. Its owner, who also
-owns Zib, preferred a native app on each platform to one implementation that feels slightly off
-everywhere. It chose native toolkits, with an optional Rust core for shared logic. This decision
-weighs that afresh, now that Zib's formats depend on Rust libraries outright.
+The owner prefers a native app on each platform to one implementation that feels slightly off
+everywhere.
 
 ## Criteria
 
@@ -100,11 +98,10 @@ Against the criteria:
 - **Flutter, Compose Multiplatform, or React Native.** Each covers every platform with one
   interface, but draws its own widgets or bridges to them, and none feels native on both Linux and
   Android. They fail native feel, and each would need its own bridge to the Rust libraries.
-- **A core limited to formats, storage, and sync.** This is the line Commonplace drew: each app
-  builds its own features and screens on a core that only reads, writes, and syncs. The core's
-  interface stays small, but every list's order, every action's rules, and every screen's behavior
-  get written once per app and drift apart. It fails feature parity and one source of truth for
-  logic.
+- **A core limited to formats, storage, and sync.** Each app builds its own features and screens on
+  a core that only reads, writes, and syncs. The core's interface stays small, but every list's
+  order, every action's rules, and every screen's behavior get written once per app and drift apart.
+  It fails feature parity and one source of truth for logic.
 - **No shared core, with the Rust libraries called from each platform.** Each implementation would
   use Loro's and iroh's own packages or bindings. But every schema rule, link parser, and blob rule
   would exist once per platform, and the copies would drift. It fails one source of truth for logic
@@ -120,9 +117,8 @@ Against the criteria:
 
 - The development environment provides the Rust toolchain, GTK 4, and libadwaita, and gains Android
   and web toolchains when those implementations begin.
-- The first Rust files bring `rustfmt` and `clippy` hooks, with a 100-character line limit, copied
-  from the `vibes` setup. Kotlin and TypeScript files bring their own formatters and linters in the
-  same way.
+- The first Rust files bring `rustfmt` and `clippy` hooks, with a 100-character line limit. Kotlin
+  and TypeScript files bring their own formatters and linters in the same way.
 - The core exposes an interface that UniFFI and `wasm-bindgen` can both express, which rules out
   some Rust idioms, such as generic types and borrowed references, at that boundary.
 - The core's interface is large, since it covers every screen. Its screen models need a way to tell

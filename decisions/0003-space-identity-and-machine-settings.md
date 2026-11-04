@@ -15,12 +15,6 @@ changes its name on another. The owner might call a space Work on a laptop and J
 Machines also need an identity, because decision 0001 records which machine created and last changed
 each note.
 
-Commonplace, in the sibling `vibes` repository, reached the same pet names in its decision 0007. It
-kept the identity of a library out of the document, and gave its sync a share identifier that only
-the machines' own stores held. That kept a copied document from syncing as the original, but it
-meant a document alone couldn't identify its library, so a backup had to carry the identifier
-separately. This decision weighs the same question afresh.
-
 ## Criteria
 
 - **Unique.** Any machine can create a space or set itself up without coordinating with another, and
@@ -84,11 +78,11 @@ Against the criteria:
 
 ## Rejected alternatives
 
-- **An identifier in each machine's store, outside the document.** This is Commonplace's approach. A
-  copy of a document would never sync as the original, and a merge would have no identifiers to
-  reconcile. But a document alone wouldn't identify its space, so a backup would need the machine's
-  store or a note of the identifier beside it. It fails self-contained. Copying a document to start
-  a new space, the case it guards against, isn't a way the owner works.
+- **An identifier in each machine's store, outside the document.** A copy of a document would never
+  sync as the original, and a merge would have no identifiers to reconcile. But a document alone
+  wouldn't identify its space, so a backup would need the machine's store or a note of the
+  identifier beside it. It fails self-contained. Copying a document to start a new space, the case
+  it guards against, isn't a way the owner works.
 - **A name inside the space's document.** It would sync, so a new machine would show the space's
   name without asking. But two machines that rename a space at once conflict, and every machine
   would have to use the same name. It fails names stay local.
