@@ -9,10 +9,15 @@ Crockford('s)?
 devenv
 gitlint
 iroh('s)?
+Jetpack
 Loro('s)?
 mdformat
 MIT
+Multiplatform
 Nygard
 PDFs
+Rust
 Syncthing
+Tauri
+UniFFI
 Yjs
