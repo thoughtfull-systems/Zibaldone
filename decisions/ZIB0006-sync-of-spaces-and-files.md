@@ -61,7 +61,7 @@ defines the protocol.
   screen open on two machines on the same network, each announces its public key and name with
   multicast Domain Name System (DNS), and lists the others that do. Either machine can pick the
   other. The member picks which of its spaces to share, and the two machines connect and agree on a
-  six-digit code, which both show. The owner confirms on the other machine once the codes match. The
+  six-digit code, which both show. The owner confirms on each machine once the codes match. The
   member then adds the new machine to `machines` and sends it each space. A machine ignores pairing
   requests unless its Add machine screen is open.
 - **Pairing codes.** The two machines derive the code from both public keys and a random value from
