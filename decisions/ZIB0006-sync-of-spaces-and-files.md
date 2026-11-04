@@ -59,10 +59,17 @@ defines the protocol.
 - **Nearby pairing.** Most machines join a space this way. While the owner has the Add machine
   screen open on two machines on the same network, each announces its public key and name with
   multicast Domain Name System (DNS), and lists the others that do. Either machine can pick the
-  other. The member picks which of its spaces to share, both machines show a six-digit code derived
-  from both public keys, and the owner confirms on the other machine once the codes match. The
+  other. The member picks which of its spaces to share, and the two machines connect and agree on a
+  six-digit code, which both show. The owner confirms on the other machine once the codes match. The
   member then adds the new machine to `machines` and sends it each space. A machine ignores pairing
   requests unless its Add machine screen is open.
+- **Pairing codes.** The two machines derive the code from both public keys and a random value from
+  each machine, exchanged so that neither side can choose its value after seeing the other's. The
+  machine that picked the other sends a hash of its random value first, the other machine replies
+  with its own random value, and the first then reveals its value, which the second checks against
+  the hash. A machine in the middle has to commit to its values before it learns the real ones, so
+  it gets one guess in a million at making the codes match, and a failed guess shows the owner two
+  different codes. Every attempt uses new random values.
 - **Invites.** For a machine on another network, or a browser, which can't use multicast DNS, a
   member makes an invite: a link that holds its address, the space's identifier, and a random
   secret, which works once, for 15 minutes. It shows the link as a QR code for a phone to scan, and
@@ -107,7 +114,9 @@ defines the protocol.
 Against the criteria:
 
 - **Private:** each connection runs TLS 1.3 with the machines' keys, which encrypts and
-  authenticates every connection, and relays forward packets they can't decrypt.
+  authenticates every connection, and relays forward packets they can't decrypt. A machine in the
+  middle of nearby pairing has one chance in a million of matching codes, and only one try before
+  the two screens show different codes.
 - **Per-space membership:** a machine syncs a space only with the keys its own copy of that space
   lists.
 - **Self-contained:** `machines` lives in the document, so a restored backup knows its members, and
@@ -151,6 +160,10 @@ Against the criteria:
 - **Nearby pairing without a code.** Picking a machine from the list would be enough, but anyone on
   the same network, such as a café's, could announce a machine with a familiar name. Comparing codes
   proves the two screens show the same pair of keys. It fails the private criterion.
+- **A code derived from the public keys alone.** It needs no exchange beyond the keys. But a machine
+  in the middle can make new key pairs until the code for its key and one machine's key matches the
+  code for another of its keys and the other machine's key. A six-digit code takes about a million
+  tries, which a laptop makes in seconds. It fails the private criterion.
 - **Pet names for machines.** Each machine could name the others as it likes, as it names spaces.
   But a machine's name serves to answer which machine changed a note, which reads best when every
   machine gives the same answer. Machines rarely get renamed, so a shared name costs little.
