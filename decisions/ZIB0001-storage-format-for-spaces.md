@@ -125,8 +125,9 @@ Against the criteria:
 
 - Every implementation depends on Loro, through its Rust crate, its JavaScript package, or bindings.
   A decision on languages and technologies needs to account for that.
-- Only one process at a time may write a space on a machine, so each implementation guards against a
-  second instance.
+- Only one process at a time may write a space on a machine.
+  [Decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md) defines how other processes on
+  the machine reach the space.
 - A space's document keeps its full history and grows over time. Trimming history with shallow
   snapshots needs a rule for when every machine has caught up.
 - Search over fields and text needs an index on each machine, built from the document, because Loro

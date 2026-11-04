@@ -107,9 +107,10 @@ defines the protocol.
   every one has reached another member of its space. A machine learns what each member holds from
   the version vectors and holder entries it receives, so the icon changes as soon as a sync
   completes. Opening the icon shows the state of each space and when it last synced.
-- **Always-on machines.** The `zib` command can run as a background service on a desktop or a small
-  server. It joins spaces as an ordinary member, with the `all` policy, so changes and files pass
-  between machines that rarely run at the same time.
+- **Always-on machines.** Zib can run without a window, as a background service on a desktop or a
+  small server, which the owner starts and controls through the `zib` command. It joins spaces as an
+  ordinary member, with the `all` policy, so changes and files pass between machines that rarely run
+  at the same time.
 
 Against the criteria:
 

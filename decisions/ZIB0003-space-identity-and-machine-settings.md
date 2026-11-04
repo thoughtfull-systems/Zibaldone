@@ -55,14 +55,25 @@ space's pet name, and every machine setting, in a store that belongs to the mach
 - **Machine settings.** The store holds the machine's preferences for each implementation, such as
   window sizes, whether each space shows, and the last space a note went into. Each implementation
   chooses the store's form, such as a file in the user's configuration directory on Linux or a
-  preferences store on Android. Implementations that share a machine and a store, such as the Linux
-  app and the `zib` command, share its format too.
+  preferences store on Android.
 - **Where a setting belongs.** A preference about one machine, its screen, or its owner's habits on
   it goes in the machine's store. A preference about a space's content that should hold on every
   machine goes in the space's `settings`. A preference about one note goes in the note's `settings`.
 - **Derived data.** Search indexes, thumbnails, and caches live on the machine too, in its cache
   directory, apart from its settings. A machine can delete and rebuild them from its spaces at any
   time, so they never sync.
+- **One instance per machine.** On each machine, one instance of Zib runs at a time, and only it
+  loads and writes the spaces' documents, stores their blobs, and syncs them. It takes a lock when
+  it starts, which the operating system releases if it dies.
+  - **Linux.** Starting the app while an instance runs brings that instance's window to the front,
+    and the new process exits. The `zib` command never opens a space itself: it sends each command
+    to the running instance over a Unix socket, and starts the instance first if none runs. On a
+    machine without a desktop, such as a small server, the instance runs without a window, as a
+    background service.
+  - **Browser.** Each tab runs the app, so the first tab takes the lock through the Web Locks
+    interface and holds the spaces. Other tabs read and change them through that tab, over a
+    broadcast channel. When it closes, another tab takes the lock.
+  - **Android.** The app runs as one process, so it needs no lock.
 
 Against the criteria:
 
@@ -91,8 +102,7 @@ Against the criteria:
   storage, but a new space has no changes until someone writes one. It depends on Loro's internals
   for no gain over storing the identifier.
 - **Loro's peer identifiers as machine identifiers.** Loro already tags each change with a peer
-  identifier. But two processes on one machine, such as the app and the `zib` command, must not
-  share a peer identifier, and Loro's peer identifiers can change, so they can't name a machine.
+  identifier. But Loro's peer identifiers can change, so they can't name a machine.
 - **Machine settings in a space of their own that never syncs.** The settings would use the same
   format as everything else. But they'd need a document that sync must always skip, and Loro's
   merging adds nothing to settings that only one machine ever writes. It adds a special case without
@@ -105,6 +115,16 @@ Against the criteria:
 - **One format for every machine store.** A shared format would let any implementation read any
   store. But no store ever leaves its machine, so only implementations on the same machine need to
   agree, and they already do.
+- **The `zib` command opening spaces on its own.** The command would work without the app, taking
+  the lock itself when no instance runs. But it would need a second way to reach a space when an
+  instance does run, and two ways to do every operation. It adds a path without meeting any
+  criterion better.
+- **Separate machine identities for the Linux app and the `zib` command.** Neither would wait for
+  the other. But one computer would hold two copies of every space and its files, sync with itself,
+  and show as two machines.
+- **A lock that makes a second instance fail.** It's the simplest rule, but a second launch of the
+  app would show an error instead of the window, and a second browser tab couldn't show the space at
+  all.
 
 ## Consequences
 
@@ -122,4 +142,5 @@ Against the criteria:
   into another.
 - Notes record machine identifiers, not names. Showing which machine changed a note needs names for
   other machines, which the decision on sync can provide.
-- The Linux app and the `zib` command share one store and one format on each machine.
+- The `zib` command keeps no state of its own. Every command goes through the running instance,
+  which the command starts when it needs to.

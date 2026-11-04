@@ -3,8 +3,9 @@
 ## Context
 
 Zib runs on Linux, on an Android phone, and in a browser. Apple and Windows platforms may come
-later. On Linux, the `zib` command works beside the app and can run as an always-on member of a
-space, as [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md) describes.
+later. On Linux, the `zib` command controls the running app, which can also run without a window as
+an always-on member of a space, as [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md)
+describes.
 
 Earlier decisions fixed the libraries that every implementation depends on, and each is a Rust
 library:
@@ -58,8 +59,8 @@ platform around it as a thin layer:
   file pickers, URI handlers, the camera, background jobs, and storage. The core calls those
   services through interfaces that each app implements, and never contains user interface code.
 - **Linux:** a Rust app built with GTK 4 and libadwaita, which links the core directly.
-- **`zib` command:** Rust, linking the core directly. It shares the machine's store with the Linux
-  app, as [decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md) requires.
+- **`zib` command:** Rust. It sends commands to the running Linux app, and starts it first if none
+  runs, as [decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md) requires.
 - **Android:** a Kotlin app built with Jetpack Compose, which calls the core through bindings that
   [UniFFI] generates.
 - **Web:** a TypeScript app, which loads the core as WebAssembly through `wasm-bindgen`. It chooses

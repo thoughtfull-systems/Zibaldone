@@ -57,8 +57,8 @@ machines transfer blobs.
   others keep every file. The `all` policy has the machine fetch and keep every blob. The
   `on demand` policy fetches a blob when the owner opens it, keeps it in a cache up to a size the
   owner sets, and drops the blobs it opened least recently when the cache fills. The owner can also
-  keep particular files on a machine, whatever its policy. The Linux app and the `zib` command use
-  `all`, and Android and the web use `on demand`.
+  keep particular files on a machine, whatever its policy. The Linux app uses `all`, and Android and
+  the web use `on demand`.
 - **Dropping a blob.** Only a machine with the `on demand` policy drops a blob that a note refers
   to. A machine with the `all` policy deletes blobs only by collecting garbage. Before it drops a
   blob, a machine connects to a holder that the space lists with the `all` policy, and asks whether
