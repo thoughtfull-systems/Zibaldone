@@ -22,6 +22,11 @@ const HEADING_COLORS: [&str; 4] = [
     "markup-heading-color-4",
 ];
 const HIDDEN: &str = "markup-hidden";
+/// Covers the whole text, so GTK repaints every run of text that moves. GTK's GL renderer
+/// repaints too little around text that moves or goes, such as syntax as it hides, and leaves faint
+/// ghosts of its antialiased edges. A background makes it repaint each run's whole cell. A fully
+/// transparent one renders black.
+const REPAINT: &str = "markup-repaint";
 const QUOTE_MARGIN: &str = "markup-quote-margin";
 /// How far a block quote sits inside the editor's left margin.
 const QUOTE_INDENT: i32 = 16;
@@ -286,6 +291,13 @@ fn color_headings(table: &gtk::TextTagTable, dark: bool) {
 }
 
 fn add_tags(table: &gtk::TextTagTable) {
+    // Added first, so every other background shows over it.
+    table.add(
+        &gtk::TextTag::builder()
+            .name(REPAINT)
+            .background_rgba(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.01))
+            .build(),
+    );
     let dim = gdk::RGBA::new(0.5, 0.5, 0.5, 0.9);
     let shade = gdk::RGBA::new(0.5, 0.5, 0.5, 0.15);
     let link = gdk::RGBA::new(0.21, 0.52, 0.89, 1.0);
@@ -345,15 +357,7 @@ fn add_tags(table: &gtk::TextTagTable) {
             .weight(700)
             .foreground_rgba(&dim)
             .build(),
-        gtk::TextTag::builder()
-            .name(tag(Style::ListPrefix))
-            .family("monospace")
-            // GTK's GL renderer leaves a faint ghost of a marker that moves or goes, such as when
-            // Tab indents an item, because it redraws too little around the old marker. A
-            // background makes it redraw the marker's whole cell. A fully transparent one renders
-            // black.
-            .background_rgba(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.01))
-            .build(),
+        gtk::TextTag::builder().name(tag(Style::ListPrefix)).family("monospace").build(),
         gtk::TextTag::builder().name(HIDDEN).invisible(true).build(),
         gtk::TextTag::builder()
             .name(REMOTE)
@@ -449,6 +453,7 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview) {
     for name in names {
         buffer.remove_tag_by_name(name, &start, &end);
     }
+    buffer.apply_tag_by_name(REPAINT, &start, &end);
     let body = text(buffer);
     let mut byte_chars = vec![0; body.len() + 1];
     let mut char_bytes = Vec::with_capacity(body.len() + 1);
