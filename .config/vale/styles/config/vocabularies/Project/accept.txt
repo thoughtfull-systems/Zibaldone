@@ -5,6 +5,7 @@
 [Zz]ibaldone
 Adwaita
 Automerge
+Crockford('s)?
 devenv
 gitlint
 Loro('s)?

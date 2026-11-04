@@ -42,7 +42,7 @@ machines transfer blobs.
 - **Notes for files.** Every file has a note of the built-in `file` type, which holds the file's
   name, and a field of a new kind, a file, whose value is the blob's hash. The note's body describes
   the file. Other types can hold files in fields of the same kind, and a note's body can show or
-  link to a file by its hash, with the syntax a later decision on links defines.
+  link to a file through its note, as [decision 0005](0005-note-identifiers-and-links.md) defines.
 - **The `files` map.** A root `files` map in the space's document holds an entry for each blob,
   keyed by its hash: its size, its media type, the hashes of its derived blobs, and the machines
   that hold it. Each machine adds its own identifier, from
