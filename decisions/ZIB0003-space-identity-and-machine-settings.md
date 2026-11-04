@@ -37,7 +37,8 @@ space's pet name, and every machine setting, in a store that belongs to the mach
 - **Space identifiers.** Creating a space gives it a random 128-bit identifier, which the creating
   machine writes to the `id` key of a root `meta` map in the space's document. Nothing changes it
   afterward. Sync offers a space by its identifier, and a machine that receives one learns it again
-  from the document's first update. A later decision on sync defines the details.
+  from the document's first update, as [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md)
+  describes.
 - **One document per identifier.** A machine holds at most one document for each identifier. A
   document it opens or receives with an identifier it already holds, such as a copy restored from a
   backup, is the same space, so the machine merges it into the one it has.
@@ -128,8 +129,8 @@ Against the criteria:
 
 ## Consequences
 
-- Sync pairs machines per space by identifier, and the decision on sync defines how one machine
-  offers a space to another and how the other accepts it, names it, and records its identifier.
+- Sync pairs machines per space by identifier, and decision ZIB0006 defines how one machine offers a
+  space to another and how the other accepts it, names it, and records its identifier.
 - Decision ZIB0001's outline gains a root `meta` map, which holds the space's identifier.
 - A copy of a space's document is the same space, not a new one. Starting a new space means creating
   one, and a feature that copies a space as a template would have to give the copy a new identifier.
@@ -141,6 +142,6 @@ Against the criteria:
 - Each implementation needs a way to create, name, rename, and remove spaces, and to merge one space
   into another.
 - Notes record machine identifiers, not names. Showing which machine changed a note needs names for
-  other machines, which the decision on sync can provide.
+  other machines, which the `machines` map from decision ZIB0006 provides.
 - The `zib` command keeps no state of its own. Every command goes through the running instance,
   which the command starts when it needs to.

@@ -79,7 +79,8 @@ specification defines the exact syntax.
   web pages handle schemes that start with `web+`. Standard markdown links with a `zib:` URI work
   inside bodies too.
 - **Backlinks.** Each machine finds backlinks by parsing every body, and keeps them in the search
-  index that decision ZIB0003 places on the machine.
+  index that decision ZIB0003 places on the machine and [decision ZIB0008](ZIB0008-search-index.md)
+  defines.
 
 Against the criteria:
 
@@ -121,8 +122,8 @@ Against the criteria:
 
 ## Consequences
 
-- Every implementation needs a version 7 UUID generator, a Crockford Base32 codec, and a wikilink
-  parser.
+- The core needs a version 7 UUID generator, a Crockford Base32 codec, and a wikilink parser, which
+  every implementation shares through it.
 - Decision ZIB0004 refers to this decision for the syntax of links to files, which goes through file
   notes.
 - The specification for spaces needs a tombstone map for notes deleted for good.

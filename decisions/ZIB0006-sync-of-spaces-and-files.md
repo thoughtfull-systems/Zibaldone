@@ -179,8 +179,9 @@ Against the criteria:
 ## Consequences
 
 - Decision ZIB0001's outline gains the root `machines` map.
-- Each implementation depends on iroh and iroh-blobs, through the Rust crates or bindings, and on an
-  asynchronous runtime. They add a few megabytes to each build.
+- Every implementation reaches iroh and iroh-blobs through the core, on the Tokio runtime that
+  [decision ZIB0011](ZIB0011-concurrency-in-the-core.md) chooses. They add a few megabytes to each
+  build.
 - Two machines sync only while both run. Without an always-on machine, a phone with the `on demand`
   policy can open only the files that a running machine holds.
 - A member that holds a space can add any machine to it. Every member has the same trust, so a lost

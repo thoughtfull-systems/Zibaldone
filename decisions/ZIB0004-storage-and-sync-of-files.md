@@ -31,8 +31,8 @@ it, and a machine that drops a file to save space must not drop the last copy.
 ## Decision
 
 Store each file as an immutable blob, named by the [BLAKE3] hash of its bytes, outside the space's
-document. A later specification defines the exact encoding, and the decision on sync defines how
-machines transfer blobs.
+document. A later specification defines the exact encoding, and
+[decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md) defines how machines transfer blobs.
 
 - **Blobs.** A blob never changes. Changing a file makes a new blob with a new hash, and the note
   points to the new one. Annotations and other changes the app makes to a file live in notes, not in
@@ -143,9 +143,8 @@ Against the criteria:
 
 - Decision ZIB0001's outline gains the root `files` map, and decision ZIB0002's kinds gain the file
   kind.
-- The decision on sync needs to transfer blobs as well as document updates, verify them as they
-  arrive, and fetch from whichever machine holds a blob. [iroh-blobs], which uses BLAKE3, is a
-  candidate.
+- Sync transfers blobs as well as document updates, verifies them as they arrive, and fetches from
+  whichever machine holds a blob. Decision ZIB0006 does this with [iroh-blobs], which uses BLAKE3.
 - The `files` map can list a machine that no longer exists, so a file can look safer than it really
   is. Removing a machine from a space needs to remove it from every entry.
 - On a machine with the `on demand` policy, a file that no other machine is online to send can't

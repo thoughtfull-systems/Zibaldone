@@ -127,8 +127,8 @@ Against the criteria:
 - Most new features and many changes to a screen touch the core as well as each app. Tests of
   behavior live in the core, and the apps' tests cover rendering and platform services.
 - Each feature's specification lists the ways each platform differs.
-- The core builds for WebAssembly, so its dependencies must too. The search index needs a library
-  that runs in a browser, which a later decision chooses.
+- The core builds for WebAssembly, so its dependencies must too. The search index's library has to
+  build for a browser too, which [decision ZIB0008](ZIB0008-search-index.md) allows for.
 - Android and the web carry the core's code and its libraries in every build, which adds a few
   megabytes.
 

@@ -74,8 +74,10 @@ of [decision ZIB0002](ZIB0002-note-types-and-schemas.md), and the document carri
 version.
 
 Each implementation decides how to keep the document on its machine, as long as it can load it, save
-it, and exchange updates in Loro's encoding. A later decision defines identifiers for notes, how
-notes link to each other, and the sync transport.
+it, and exchange updates in Loro's encoding.
+[Decision ZIB0005](ZIB0005-note-identifiers-and-links.md) defines identifiers for notes and how
+notes link to each other, and [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md) defines the
+sync transport.
 
 Against the criteria:
 
@@ -144,18 +146,20 @@ Against the criteria:
   rewrites a whole map from what it understands.
 - A change that can't be additive falls outside these rules. The owner updates every machine and
   migrates the spaces by hand, with a decision that records the change.
-- Every implementation depends on Loro, through its Rust crate, its JavaScript package, or bindings.
-  A decision on languages and technologies needs to account for that.
+- Every implementation depends on Loro, which it reaches through the Rust core of
+  [decision ZIB0007](ZIB0007-programming-languages-and-technologies.md).
 - Only one process at a time may write a space on a machine.
   [Decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md) defines how other processes on
   the machine reach the space.
 - A space's document keeps its full history and grows over time. Trimming history with shallow
   snapshots needs a rule for when every machine has caught up.
 - Search over fields and text needs an index on each machine, built from the document, because Loro
-  has no query language. The index stays on the machine and never syncs.
+  has no query language. The index stays on the machine and never syncs, and
+  [decision ZIB0008](ZIB0008-search-index.md) chooses its library.
 - The last write to a field wins, and deleting a note while another machine edits it discards the
   edits. A later specification can soften this with a trash that keeps deleted notes for a while.
 - Note types and their schemas, space identity and machine settings, file storage, note identifiers
-  and links, the sync transport, and the export format each need a follow-on decision.
+  and links, and the sync transport each have a follow-on decision, from ZIB0002 to ZIB0006. The
+  export format waits for a later one.
 
 [loro]: https://loro.dev/
