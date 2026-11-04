@@ -59,30 +59,34 @@ machines transfer blobs.
   owner sets, and drops the blobs it opened least recently when the cache fills. The owner can also
   keep particular files on a machine, whatever its policy. The Linux app uses `all`, and Android and
   the web use `on demand`.
-- **Dropping a blob.** Only a machine with the `on demand` policy drops a blob that a note refers
-  to. A machine with the `all` policy deletes blobs only by collecting garbage. Before it drops a
-  blob, a machine connects to a holder that the space lists with the `all` policy, and asks whether
-  it holds the blob. It drops the blob only when the holder confirms it. The `files` map alone isn't
-  enough, because its holders may since have left the space or lost their disks. If no such holder
-  is online, the machine keeps the blob and asks again later, even when its cache overflows.
+- **Dropping a blob.** Only a machine with the `on demand` policy drops a blob in use. A machine
+  with the `all` policy deletes blobs only by collecting garbage. Before it drops a blob, a machine
+  connects to a holder that the space lists with the `all` policy, and asks whether it holds the
+  blob. It drops the blob only when the holder confirms it. The `files` map alone isn't enough,
+  because its holders may since have left the space or lost their disks. If no such holder is
+  online, the machine keeps the blob and asks again later, even when its cache overflows.
 - **New blobs.** A blob created on a machine with the `on demand` policy stays there until a machine
   with the `all` policy confirms it holds the blob, whatever the cache's size.
 - **Derived blobs.** The first machine that can read a file's text writes it to a blob of its own,
   and the first that can draw a small preview image writes that too. Every machine fetches every
   derived blob, whatever its policy, so it can search and preview every file. Each machine indexes
   the text as [decision ZIB0002](ZIB0002-note-types-and-schemas.md) indexes `text` fields.
+- **Blobs in use.** A blob is in use while a note in the space refers to it, or while the entry of a
+  blob in use lists it as a derived blob. Derived blobs have entries of their own in the `files`
+  map, with holders like any other blob, so they stay in use exactly as long as the file they come
+  from.
 - **Collecting garbage.** A machine deletes a blob, and removes its own identifier from the blob's
-  entry, once no note in its copy of the space has referred to the blob for 30 days. The wait gives
-  machines that haven't synced yet time to add a reference back. An entry with no references and no
-  holders leaves the map.
+  entry, once the blob hasn't been in use in its copy of the space for 30 days. The wait gives
+  machines that haven't synced yet time to add a reference back. An entry for a blob not in use,
+  with no holders, leaves the map.
 
 Against the criteria:
 
 - **Partial copies:** the `on demand` policy keeps a cache of the files the owner uses, and the
   `files` map lists the other machines a machine can fetch the rest from.
 - **No lost files:** a machine drops a blob only after an `all` machine confirms, at that moment,
-  that it holds the blob, and `all` machines never drop blobs that notes refer to. A stale `files`
-  map can't lead a machine to drop the last copy.
+  that it holds the blob, and `all` machines never drop blobs in use. A stale `files` map can't lead
+  a machine to drop the last copy.
 - **Verifiable:** a BLAKE3 hash names each blob, and BLAKE3's tree structure lets a machine check
   each chunk of a file as it arrives, so it can show a PDF's first pages before the rest arrives.
 - **Small documents:** the document holds a few hundred bytes per file, and no file's bytes.
