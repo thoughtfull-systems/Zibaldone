@@ -8,7 +8,8 @@ types. Types and fields join this list over time, and never leave it.
 ## `note`
 
 An ordinary note: every note the owner writes from scratch is a `note`. It has no fields: its body
-is all it holds, and its title is the body's first line, as for every type. It has no preview.
+is all it holds, and its title comes from the body's first line that isn't blank, as for every type.
+It has no preview.
 
 ## `file`
 

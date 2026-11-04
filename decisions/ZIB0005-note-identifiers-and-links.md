@@ -53,14 +53,14 @@ specification defines the exact syntax.
     edits no longer matches, so it stays from then on.
   - It saves by applying only the differences between the result and the stored text, so links the
     owner didn't touch cause no edits.
-- **Titles.** Every note has a title: the first line of its body, without the marks that make it a
-  heading. The title keeps the line's span formatting, such as bold, italic, highlights,
-  strikethrough, inline code, and inline math, and shows it wherever the app lists the note or shows
-  a link to it. Each link in the line becomes its text, its label or the title of its target when it
-  has none, so a title never holds a link of its own. A cycle of such links ends at the first note
-  it would repeat, which shows by its identifier. A note whose first line is empty shows as
-  untitled. Places that can show only plain text, such as a window's title or a filename, strip the
-  formatting too.
+- **Titles.** Every note has a title: the first line of its body that isn't blank, without its
+  leading white space or the marks that make it a heading. The title keeps the line's span
+  formatting, such as bold, italic, underlines, highlights, strikethrough, inline code, and inline
+  math, and shows it wherever the app lists the note or shows a link to it. Each link in the line
+  becomes its text, its label or the title of its target when it has none, so a title never holds a
+  link of its own. A cycle of such links ends at the first note it would repeat, which shows by its
+  identifier. A note whose body is blank shows as untitled. Places that can show only plain text,
+  such as a window's title or a filename, strip the formatting too.
 - **Embeds.** `![[id]]` shows the target in place, as its type defines: an `image` note shows its
   picture, and other types show their title and the preview their schema names, such as a book's
   cover. Body links to files always go through the note that holds them, never a hash, so a link

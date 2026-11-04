@@ -30,6 +30,7 @@ Pandoc('s)?
 Pango
 PDFs
 Rust
+setext
 SQLite
 Syncthing
 Tantivy

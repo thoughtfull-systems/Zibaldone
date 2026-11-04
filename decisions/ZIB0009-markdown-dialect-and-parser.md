@@ -35,15 +35,18 @@ text per cell, so a cell can't hold paragraphs or a list. It has no diagrams, an
 ## Decision
 
 Write note bodies in [CommonMark] with the [GitHub Flavored Markdown][gfm] (GFM) extensions for
-tables, task list items, strikethrough, and autolinks, plus Zib's own additions. Parse them in the
-core with the [pulldown-cmark] crate, and render diagrams and math in the core as Scalable Vector
-Graphics (SVG). A later specification defines the additions' exact syntax.
+tables, task list items, strikethrough, and autolinks, plus Zib's own additions, and without
+CommonMark's setext headings, which underline a heading with `=` or `-`. Headings use only `#`.
+Parse them in the core with the [pulldown-cmark] crate, and render diagrams and math in the core as
+Scalable Vector Graphics (SVG). A later specification defines the additions' exact syntax.
 
 - **Wikilinks and embeds.** `[[id]]`, `[[id|label]]`, and `![[id]]`, as decision ZIB0005 defines
   them, with backslashes that escape a backslash, a `]`, or a `|` inside a label.
 
-- **Highlights.** A pair of `==` marks highlights text, as in `==this==`. The marks pair within one
-  block the way `~~` does for strikethrough, and only a run of exactly two `=` counts.
+- **Underlines and highlights.** `=this=` underlines text, `==this==` highlights it, and
+  `===this===` does both. The marks pair as `*` does for emphasis, and `\=` writes a literal `=`.
+  Highlights follow the convention of Obsidian and Pandoc. Underlines have no common markdown
+  syntax, so other tools show them as plain `=` marks.
 
 - **List tables.** A fenced code block whose language is `table` holds a table as a list of rows.
   Each top-level item is a row, and each item nested under a row is a cell, which can hold any
@@ -82,19 +85,22 @@ Graphics (SVG). A later specification defines the additions' exact syntax.
   text and never render it.
 
 - **Parsing.** The core parses a body with pulldown-cmark's offset iterator, which gives each
-  element its range in the text. It finds wikilinks, embeds, and highlights in the text events
-  itself, outside code. pulldown-cmark doesn't detect bare web addresses, so the core also finds
-  them, following GFM's rules for extended autolinks. It parses the inside of a list table as
-  markdown of its own, and builds the tree that every app renders from those ranges.
+  element its range in the text. It finds wikilinks, embeds, underlines, and highlights in the text
+  events itself, outside code. pulldown-cmark doesn't detect bare web addresses, so the core also
+  finds them, following GFM's rules for extended autolinks. pulldown-cmark always reads setext
+  headings, so the core turns each one back into the paragraph and the underline that Zib reads in
+  its place. It parses the inside of a list table as markdown of its own, and builds the tree that
+  every app renders from those ranges.
 
 - **Rendering.** The core turns each diagram and each piece of math into SVG, and keeps the results
   in the cache directory, keyed by a hash of their source, so an unchanged diagram doesn't render
   again. The apps draw the SVG. A diagram or formula that fails to render shows its source and the
   error.
 
-- **Titles.** A note's title is its body's first line, parsed as inline markdown: heading marks
-  removed, span formatting kept, and each link replaced by its text, as decision ZIB0005 describes.
-  The core gives the apps both the formatted title and a plain-text form.
+- **Titles.** A note's title is the first line of its body that isn't blank, parsed as inline
+  markdown: leading white space and heading marks removed, span formatting kept, and each link
+  replaced by its text, as decision ZIB0005 describes. The core gives the apps both the formatted
+  title and a plain-text form.
 
 - **Writing.** The core never rewrites a body to normalize its markdown. An edit changes only the
   text the owner changed.
