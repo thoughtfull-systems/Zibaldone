@@ -49,9 +49,9 @@ defines the protocol.
   Security (TLS) 1.3 inside each connection, keyed by the two machines' key pairs, so each side
   proves it holds the secret key for its address.
 - **Members.** A root `machines` map in the space's document lists the space's machines, keyed by
-  the machine identifiers from decision 0003. Each entry holds the machine's public key and its
-  name. A machine names itself when it joins, and the owner can rename any machine from any machine
-  in the space.
+  the machine identifiers from decision 0003. Each entry holds the machine's public key, its name,
+  and its file policy from decision 0004. A machine names itself when it joins, and the owner can
+  rename any machine from any machine in the space.
 - **Trust.** A machine syncs a space only with machines that its own copy of the space lists in
   `machines`, and refuses any other connection for that space. Joining one space never grants access
   to another.
@@ -79,7 +79,8 @@ defines the protocol.
   arrives, so a machine can fetch part of a file, such as a PDF's first pages. A machine with the
   `all` policy fetches every blob in `files` that it lacks. A machine with the `on demand` policy
   fetches a blob when the owner opens it, from any holder that's online. Every machine fetches every
-  derived blob.
+  derived blob. Before a machine drops a blob, it asks an `all` holder over the same connection to
+  confirm that it holds the blob, as decision 0004 requires.
 - **Connections.** iroh connects through a relay first, tries a direct path with hole punching, and
   moves the connection there once it works. Machines find each other by public key, through iroh's
   address lookup and, on a local network, through multicast DNS, so members on one network connect
@@ -93,9 +94,14 @@ defines the protocol.
   after waking from sleep, and every 15 minutes. After a failed sync, it retries after 30 seconds,
   then doubles the wait each time, up to 10 minutes. On Android, a periodic background job syncs as
   often as Android allows. A browser syncs while the app is open.
+- **Sync status.** Every app shows an icon that marks whether the machine holds changes no other
+  machine has yet: one form while any change or file it created waits to sync, and another once
+  every one has reached another member of its space. A machine learns what each member holds from
+  the version vectors and holder entries it receives, so the icon changes as soon as a sync
+  completes. Opening the icon shows the state of each space and when it last synced.
 - **Always-on machines.** The `zib` command can run as a background service on a desktop or a small
-  server. It joins spaces as an ordinary member, with the `all` policy as a rule, so changes and
-  files pass between machines that rarely run at the same time.
+  server. It joins spaces as an ordinary member, with the `all` policy, so changes and files pass
+  between machines that rarely run at the same time.
 
 Against the criteria:
 
@@ -160,8 +166,8 @@ Against the criteria:
 - A removed machine keeps its copy of the space from before its removal. Removal stops future
   changes reaching it, but can't take back what it already has.
 - Each implementation needs screens to pair nearby machines, make and accept invites, name machines,
-  remove them, sync by hand, and set a relay. Android needs a camera to scan invites, and holds a
-  multicast lock while it listens for nearby machines.
+  remove them, sync by hand, show sync status, and set a relay. Android needs a camera to scan
+  invites, and holds a multicast lock while it listens for nearby machines.
 - A machine announces its public key on every local network it joins, so someone watching that
   network can tell when the same machine returns. Its name goes out only while the owner pairs.
 - Address lookup through n0 publishes each machine's current relay under its public key, but nothing

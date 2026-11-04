@@ -7,9 +7,9 @@ identifier and leaves its form to this decision. Notes link to each other inside
 bodies, and other software links to them too: a browser bookmark, a calendar entry, or a launcher on
 the desktop. A link has to keep working while the note it points to changes.
 
-Machines create notes offline, so identifiers can't come from a shared counter. Not every note has a
-title, and titles that exist change. A note can also move from one space to another, and a link from
-a note in one space can point to a note in another, on a machine that holds both.
+Machines create notes offline, so identifiers can't come from a shared counter. A note's title comes
+from its text, so it changes whenever the text does. A note can also move from one space to another,
+and a link from a note in one space can point to a note in another, on a machine that holds both.
 
 [Decision 0004](0004-storage-and-sync-of-files.md) gives every file a note of the `file` type. A
 note's body shows an image or links to a PDF through that note.
@@ -40,9 +40,12 @@ specification defines the exact syntax.
   in an editor opens a search, and picking a note inserts a link to its identifier. If the owner
   selected text first, the selection becomes the label.
 - **Labels only by choice.** A link stores a label only when the owner writes one. Every
-  implementation shows a link without a label by its target's current title, which each type
-  defines, such as a field or the body's first line. An editor that shows raw markdown fills in
-  titles as it loads a note and strips them again as it saves.
+  implementation shows a link without a label by its target's current title. An editor that shows
+  raw markdown fills in titles as it loads a note and strips them again as it saves.
+- **Titles.** Every note has a title: the first line of its body, without the marks that make it a
+  heading. If that line is a link, the title is the link's text: its label, or the title of its
+  target when it has none. A cycle of such links ends at the first note it would repeat, which shows
+  by its identifier. A note whose first line is empty shows as untitled.
 - **Embeds.** `![[id]]` shows the target in place: an image for a file note of an image, and a
   preview for other files and notes. Body links to files always go through the file's note, never
   its hash, so a link keeps working when the file's content changes.
@@ -79,7 +82,7 @@ Against the criteria:
 ## Rejected alternatives
 
 - **Links by title.** They're the quickest to type and the most readable, but they break when a
-  title changes, and they can't reach a note without a title. They fail the stable criterion.
+  title changes, and two notes can share a title. They fail the stable criterion.
 - **Titles copied into labels.** The raw text would read well, but a copied title goes stale when
   the target's title changes, and rewriting it on two machines at once doubles it. It fails the
   current titles and merge-safe criteria.
@@ -105,8 +108,7 @@ Against the criteria:
 - Decision 0004 refers to this decision for the syntax of links to files, which goes through file
   notes.
 - The specification for spaces needs a tombstone map for notes deleted for good.
-- Each type defines how a note of that type gets its title, and every implementation uses the same
-  rule.
+- Every implementation derives titles by the same rule, so the rule lives in shared code.
 - Raw text shows identifiers where titles would be, so an export to markdown files rewrites links to
   file names and fills in titles.
 - Search over raw text doesn't find a note by the titles of the notes it links to.

@@ -44,17 +44,19 @@ A later specification defines the exact encoding. In outline:
     matches, ranges, and sorting, and `none` leaves it out of the index.
   - A schema can mark a field as deprecated. Releases stop offering it for new values but keep
     reading, showing, and indexing the values that exist.
-- **Versions.** Each schema has a version number, starting at 1. A new version may only add fields,
-  add values to a choice, and deprecate fields. It never removes a field, renames one, or changes
-  its kind. A field that needs a new kind gets a new name. Once a release ships a version, its
-  content never changes.
-- **Storing schemas.** `schemas` maps each type name to a map from version number to schema. When a
-  release opens a space, it writes each version it knows that the space lacks. Two machines that
-  write the same version at once write identical content, so the merge makes no difference. Keying
-  by version keeps an older release from overwriting a newer schema.
-- **Reading notes.** A release reads every note against the highest version of its type in the
-  space, which contains every field any version defined. Notes record no version. Every field is
-  optional, so a note that lacks a field is valid in every version.
+- **Additive changes only.** A release may add types, add fields, add values to a choice, and
+  deprecate fields. It never removes a field, renames one, changes its kind, or changes what its
+  values mean. A field that needs a new kind or meaning gets a new name. Schemas carry no version
+  numbers, because no change ever breaks what an earlier release wrote.
+- **Storing schemas.** `schemas` maps each type name to a map from field name to the field's
+  definition. When a release opens a space, it writes each type, field, and choice value it knows
+  that the space lacks, and marks deprecated each field it knows as deprecated. It never rewrites a
+  definition the space already holds, so an older release can't undo a newer one's changes. Two
+  machines that add the same field at once write identical content, so the merge makes no
+  difference. Deprecation never gets undone.
+- **Reading notes.** A release reads every note against the space's schema for its type, which
+  contains every field any release defined. Notes record no schema version. Every field is optional,
+  so a note that lacks a field is always valid.
 - **Unknown types and fields.** A release shows a note of a type it doesn't know as a generic note:
   its body, and its fields as the space's schema describes them. It indexes those fields by their
   search mode, and edits them with a generic editor for their kind. It doesn't create notes of a
@@ -66,16 +68,16 @@ A later specification defines the exact encoding. In outline:
 Against the criteria:
 
 - **Backward compatible:** fields never disappear or change kind, so every value an older release
-  wrote still means what it did, and the newest schema still describes it.
+  wrote still means what it did, and the space's schema still describes it.
 - **Forward compatible:** an older release learns new types and fields from the space's schemas.
   Edits write single keys in the `fields` map, so editing one field never touches the fields the
   release doesn't know.
-- **Merge-safe:** schema versions never change once written, so concurrent writes agree. Notes merge
-  field by field as decision 0001 defines, whichever release made each edit.
+- **Merge-safe:** releases only add to schemas and never rewrite what's there, so concurrent writes
+  agree. Notes merge field by field as decision 0001 defines, whichever release made each edit.
 - **Searchable:** every field carries a kind and a search mode, which together tell the index what
   to do with it, even for fields the release has never seen.
-- **Low ceremony:** a new field is a new entry in the next schema version. No release rewrites
-  existing notes.
+- **Low ceremony:** a new field is a new entry in its type's schema, with no version to bump. No
+  release rewrites existing notes.
 - **Room for user-defined types:** schemas already live in the space as data. A later decision can
   let the owner write them, if the app grows an interface for it.
 
@@ -90,8 +92,12 @@ Against the criteria:
   rewrites would merge with edits from machines still on the old release, leaving a mix of old and
   new fields. It fails the merge-safe and low ceremony criteria, and an older release can't read
   migrated notes, which fails forward compatible.
+- **Versioned schemas.** Each type's schema could carry a version number, with each version stored
+  once and never changed. Versions would record when each field arrived, but the additive rule
+  already keeps every field's meaning fixed, so the space's schema describes every note without
+  them. They add bookkeeping to every release and fail the low ceremony criterion.
 - **A schema version on each note.** Readers would know which fields a note's writer understood. The
-  additive rule makes this unnecessary, because the newest schema describes every note, and a
+  additive rule makes this unnecessary, because the space's schema describes every note, and a
   version on each note would need a rule for merging two edits that write different versions.
 - **JSON Schema.** It's a standard with validators in many languages. But it describes the shape of
   values, not how to search them, so Zib would extend it anyway. It allows changes this decision
@@ -106,13 +112,15 @@ Against the criteria:
 
 ## Consequences
 
-- Every release carries the schemas of every type it knows, and writes any version a space lacks
-  each time it opens it.
+- Every release carries the schemas of every type it knows, and writes any type, field, or choice
+  value a space lacks each time it opens it.
 - Each implementation needs a generic view and editor for each kind, for types and fields it doesn't
   know.
 - A field's mistakes stay in the schema forever. A field with the wrong kind gets deprecated and
   replaced, so naming and kinds deserve care before a release ships them.
-- The `schemas` map grows by one entry for each version of each type, which stays small.
+- The `schemas` map grows by one entry for each field of each type, which stays small.
+- Nothing records which release added a field. A change that would break an earlier release's
+  reading of a field, however small, needs a new field instead.
 - Required fields can't exist, so every release handles a note that lacks any field.
 - A later specification defines the encoding of schemas and of each kind's values, and lists the
   built-in types.

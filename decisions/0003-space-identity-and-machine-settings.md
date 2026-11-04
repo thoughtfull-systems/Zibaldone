@@ -21,8 +21,8 @@ each note.
   no two spaces or machines share an identity.
 - **Self-contained.** A space's document carries everything needed to restore the space, its
   identity included, so a backup of the document is a backup of the space.
-- **Spaces can merge.** The owner can merge one space into another, and the result has one clear
-  identity.
+- **Spaces can merge.** The owner can merge one space into another, and the result keeps the
+  target's identity.
 - **Names stay local.** Each machine names each space as its owner likes, and renaming it never
   changes or conflicts with its name on another machine.
 - **Machine settings stay put.** A preference about one machine never reaches another.
@@ -36,15 +36,17 @@ space's pet name, and every machine setting, in a store that belongs to the mach
 
 - **Space identifiers.** Creating a space gives it a random 128-bit identifier, which the creating
   machine writes to the `id` key of a root `meta` map in the space's document. Nothing changes it
-  afterward, except a merge. Sync offers a space by its identifier, and a machine that receives one
-  learns it again from the document's first update. A later decision on sync defines the details.
+  afterward. Sync offers a space by its identifier, and a machine that receives one learns it again
+  from the document's first update. A later decision on sync defines the details.
 - **One document per identifier.** A machine holds at most one document for each identifier. A
   document it opens or receives with an identifier it already holds, such as a copy restored from a
   backup, is the same space, so the machine merges it into the one it has.
-- **Merging spaces.** Merging one space into another imports the source's changes into the target,
-  which brings the source's `id` along with the target's. The machine then writes the target's
-  identifier to `id` again. That write comes after both, so it wins on every machine, and the
-  machine removes the source.
+- **Merging spaces.** Merging one space into another happens on one machine. It fetches any of the
+  source's blobs it lacks, copies every note, file, and schema from the source into the target as
+  new changes, and then removes the source. The notes keep their identifiers, so links between them
+  still work. The target keeps its own identifier, settings, and machines, and keeps nothing of the
+  source's identifier or history. Other machines that hold the source keep it until the owner
+  removes it on each one, and changes they hadn't synced before the merge stay behind.
 - **Pet names.** Each machine stores its own name for each space. A machine asks for a name when it
   creates a space or receives one.
 - **Machine identifiers.** Each machine creates a random 128-bit identifier the first time it runs
@@ -68,8 +70,8 @@ Against the criteria:
   with no coordination.
 - **Self-contained:** the identifier lives in the document, so restoring a backup of the document
   restores the space, and it syncs with the machines that hold the space as before.
-- **Spaces can merge:** the target writes its own identifier after importing the source, so the
-  merged space has the target's identity on every machine.
+- **Spaces can merge:** a merge copies content into the target and never touches its identifier, so
+  the merged space has the target's identity on every machine.
 - **Names stay local:** names live only in machine stores.
 - **Machine settings stay put:** the store never syncs, and no space carries its preferences.
 - **Nothing to lose:** a machine that loses its store loses only its names and preferences. Its
@@ -79,16 +81,15 @@ Against the criteria:
 ## Rejected alternatives
 
 - **An identifier in each machine's store, outside the document.** A copy of a document would never
-  sync as the original, and a merge would have no identifiers to reconcile. But a document alone
-  wouldn't identify its space, so a backup would need the machine's store or a note of the
-  identifier beside it. It fails self-contained. Copying a document to start a new space, the case
-  it guards against, isn't a way the owner works.
+  sync as the original. But a document alone wouldn't identify its space, so a backup would need the
+  machine's store or a note of the identifier beside it. It fails self-contained. Copying a document
+  to start a new space, the case it guards against, isn't a way the owner works.
 - **A name inside the space's document.** It would sync, so a new machine would show the space's
   name without asking. But two machines that rename a space at once conflict, and every machine
   would have to use the same name. It fails names stay local.
 - **An identifier derived from the document, such as a hash of its first change.** It needs no
-  storage, but a new space has no changes until someone writes one, and after a merge, two first
-  changes compete. It depends on Loro's internals for no gain over storing the identifier.
+  storage, but a new space has no changes until someone writes one. It depends on Loro's internals
+  for no gain over storing the identifier.
 - **Loro's peer identifiers as machine identifiers.** Loro already tags each change with a peer
   identifier. But two processes on one machine, such as the app and the `zib` command, must not
   share a peer identifier, and Loro's peer identifiers can change, so they can't name a machine.
@@ -96,6 +97,11 @@ Against the criteria:
   format as everything else. But they'd need a document that sync must always skip, and Loro's
   merging adds nothing to settings that only one machine ever writes. It adds a special case without
   meeting any criterion better.
+- **Merging by importing the source's history.** The target would import the source's changes, keep
+  their history, and write its own identifier again to win over the source's. Every machine that
+  held both spaces would merge them too. But it needs a rule for competing identifiers, it brings
+  the source's settings and machines into the target, and it serves an operation the owner expects
+  to use rarely. Copying the content meets spaces can merge more simply.
 - **One format for every machine store.** A shared format would let any implementation read any
   store. But no store ever leaves its machine, so only implementations on the same machine need to
   agree, and they already do.
@@ -107,8 +113,11 @@ Against the criteria:
 - Decision 0001's outline gains a root `meta` map, which holds the space's identifier.
 - A copy of a space's document is the same space, not a new one. Starting a new space means creating
   one, and a feature that copies a space as a template would have to give the copy a new identifier.
-- Two documents that hold different identifiers after a merge, because a machine missed the final
-  write, settle on the same identifier once they sync, since the final write wins.
+- A merge loses the source's history and any changes to the source that other machines hadn't synced
+  to the merging machine. The owner removes the source from those machines by hand, and copies over
+  anything left behind.
+- Merging on a machine with the `on demand` policy from decision 0004 needs the source's files
+  available from another machine, since the merge fetches them all.
 - Each implementation needs a way to create, name, rename, and remove spaces, and to merge one space
   into another.
 - Notes record machine identifiers, not names. Showing which machine changed a note needs names for
