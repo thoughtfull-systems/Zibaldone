@@ -1,0 +1,9 @@
+[Desktop Entry]
+Categories=Office;Utility;
+Comment=The development build of Zibaldone, with data of its own
+Exec=zib-dev
+Icon=systems.thoughtfull.Zibaldone.Devel
+Name=Zibaldone Dev
+StartupWMClass=systems.thoughtfull.Zibaldone.Devel
+Terminal=false
+Type=Application

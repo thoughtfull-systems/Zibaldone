@@ -1,0 +1,10 @@
+[Desktop Entry]
+Categories=Office;Utility;
+Comment=A personal, local-first notebook
+Exec=zib %u
+Icon=systems.thoughtfull.Zibaldone
+MimeType=x-scheme-handler/zib;
+Name=Zibaldone
+StartupWMClass=systems.thoughtfull.Zibaldone
+Terminal=false
+Type=Application

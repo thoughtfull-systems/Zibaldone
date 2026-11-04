@@ -1,0 +1,20 @@
+[package]
+description = "Zibaldone on Linux: the instance and the zib command"
+edition.workspace = true
+name = "zib-linux"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+# Without this feature, the binaries run as the development channel, so a build from the source
+# tree never touches the production data.
+production = []
+
+[dependencies]
+ksni = "0.3.7"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+zib-core = { path = "../core" }
+
+[lints]
+workspace = true
