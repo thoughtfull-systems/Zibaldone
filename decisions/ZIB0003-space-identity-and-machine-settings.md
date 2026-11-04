@@ -34,11 +34,11 @@ changed each note.
 Store each space's identity in its document, so it syncs and backs up with the space. Keep each
 space's pet name, and every machine setting, in a store that belongs to the machine and never syncs.
 
-- **Space identifiers.** Creating a space gives it a random 128-bit identifier, which the creating
-  machine writes to the `id` key of a root `meta` map in the space's document. Nothing changes it
-  afterward. Sync offers a space by its identifier, and a machine that receives one learns it again
-  from the document's first update, as [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md)
-  describes.
+- **Space identifiers.** Creating a space gives it a version 7 Universally Unique Identifier (UUID),
+  which the creating machine writes to the `id` key of a root `meta` map in the space's document.
+  Nothing changes it afterward. Sync offers a space by its identifier, and a machine that receives
+  one learns it again from the document's first update, as
+  [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md) describes.
 - **One document per identifier.** A machine holds at most one document for each identifier. A
   document it opens or receives with an identifier it already holds, such as a copy restored from a
   backup, is the same space, so the machine merges it into the one it has.
@@ -50,9 +50,9 @@ space's pet name, and every machine setting, in a store that belongs to the mach
   removes it on each one, and changes they hadn't synced before the merge stay behind.
 - **Pet names.** Each machine stores its own name for each space. A machine asks for a name when it
   creates a space or receives one.
-- **Machine identifiers.** Each machine creates a random 128-bit identifier the first time it runs
-  and keeps it for as long as its store exists. The `meta` map of each note records it. A machine's
-  identifier stays the same across every space it holds.
+- **Machine identifiers.** Each machine creates a version 7 UUID as its identifier the first time it
+  runs and keeps it for as long as its store exists. The `meta` map of each note records it. A
+  machine's identifier stays the same across every space it holds.
 - **Machine settings.** The store holds the machine's preferences for each implementation, such as
   window sizes, whether each space shows, and the last space a note went into. Each implementation
   chooses the store's form, such as a file in the user's configuration directory on Linux or a
@@ -78,8 +78,10 @@ space's pet name, and every machine setting, in a store that belongs to the mach
 
 Against the criteria:
 
-- **Unique:** 128 random bits make a collision between any two identifiers vanishingly unlikely,
-  with no coordination.
+- **Unique:** a version 7 UUID combines a timestamp in milliseconds with 74 random bits, which makes
+  a collision between any two identifiers vanishingly unlikely, with no coordination. Every
+  identifier Zib generates is the same kind of value, as
+  [decision ZIB0005](ZIB0005-note-identifiers-and-links.md) chooses for notes.
 - **Self-contained:** the identifier lives in the document, so restoring a backup of the document
   restores the space, and it syncs with the machines that hold the space as before.
 - **Spaces can merge:** a merge copies content into the target and never touches its identifier, so
