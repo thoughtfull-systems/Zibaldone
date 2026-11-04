@@ -82,7 +82,7 @@ defines the protocol.
   entries from the `files` map. A machine that leaves a space on its own removes itself first.
 - **Documents.** A sync of a space is one exchange: each side sends its version vector, then the
   updates the other side lacks. Each side imports the updates into a copy first and checks them, so
-  updates from a newer format, or from a document that isn't this space, never reach the space.
+  updates from a document that isn't this space never reach the space.
 - **Files.** iroh-blobs fetches a blob by its hash and checks each chunk against BLAKE3's tree as it
   arrives, so a machine can fetch part of a file, such as a PDF's first pages. A machine with the
   `all` policy fetches every blob in `files` that it lacks. A machine with the `on demand` policy

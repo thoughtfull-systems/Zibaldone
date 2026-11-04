@@ -67,6 +67,12 @@ specification defines the exact containers and keys. In outline:
 Each key in either `settings` map starts with the name of the implementation that reads it and a
 period, such as `linux.` or `android.`, or with `zib.` for settings every implementation shares.
 
+The layout changes only by adding to it. A release may add root keys, keys in a note's map, and keys
+in any entry. It never removes a key, renames one, or changes what its value means, and it leaves
+keys it doesn't know untouched. Every release then reads what any other wrote, as with the schemas
+of [decision ZIB0002](ZIB0002-note-types-and-schemas.md), and the document carries no format
+version.
+
 Each implementation decides how to keep the document on its machine, as long as it can load it, save
 it, and exchange updates in Loro's encoding. A later decision defines identifiers for notes, how
 notes link to each other, and the sync transport.
@@ -95,34 +101,49 @@ Against the criteria:
   edit on two machines conflict, which fails attributes beside the text. A browser also can't open a
   folder on the machine without a server or an interface that only Chromium offers, which fails
   every platform.
+
 - **Markdown files as the source of truth, with a CRDT that tracks them.** The app would keep a CRDT
   for merging and write each note out as a file, so other tools could edit the files too. Edits made
   outside the app would then have to turn back into CRDT operations by comparing text, which loses
   intent and can't tell concurrent edits apart from sequential ones. It weakens lossless merging,
   and it doubles the storage. The export covers reading the notes without Zib.
+
 - **Automerge.** Automerge merges text and maps as well as Loro does, has a longer track record, and
   passes the lossless merging, attributes beside the text, no server, and durable criteria. It loads
   a whole document into memory to open it and has no equivalent of shallow snapshots, so it does
   worse on scales to a lifetime of notes. It also lacks a movable tree, which closes off nested
   notes or outlines later without a custom structure on top.
+
 - **Yjs or its Rust port, Yrs.** Yjs is mature and widely used, and it merges text well. It has no
   movable tree and no way to trim history, and its maps hold no typed values beyond JSON. It does
   worse than Loro on scales to a lifetime of notes for the same reasons as Automerge.
+
 - **SQLite with a CRDT extension, such as cr-sqlite.** Tables and queries suit typed fields and
   search well. But cr-sqlite merges rows and columns, not the characters of a text value, so two
   edits to the same note's body keep only one of them, which fails lossless merging. Its development
   has also slowed, and its browser build depends on a WebAssembly port of SQLite.
+
 - **A SQLite database with a custom sync protocol.** SQLite runs everywhere and queries fast, but
   merging rows that two machines changed needs a custom rule for every table, and merging text needs
   a CRDT anyway. It fails lossless merging unless Zib reinvents a CRDT.
+
 - **One Loro document per note.** Small documents load and sync on their own, and a machine could
   hold a subset of notes. But a change that spans notes, such as renaming a type's field across a
   space, has no atomic merge, and sync has to compare thousands of version vectors. Nothing so far
   requires a machine to hold only some of a space's notes, and files, the large items, can stay
   outside the document. It does worse on scales to a lifetime of notes.
 
+- **A format version.** A number in the document would let a release recognize a layout it can't
+  read and refuse to sync it. But additive changes never need it, and the owner runs a few machines
+  alone, so a rare change that can't be additive is easier to handle by hand than to build into
+  every release.
+
 ## Consequences
 
+- Every implementation preserves keys it doesn't know when it edits a note or an entry, and never
+  rewrites a whole map from what it understands.
+- A change that can't be additive falls outside these rules. The owner updates every machine and
+  migrates the spaces by hand, with a decision that records the change.
 - Every implementation depends on Loro, through its Rust crate, its JavaScript package, or bindings.
   A decision on languages and technologies needs to account for that.
 - Only one process at a time may write a space on a machine.
