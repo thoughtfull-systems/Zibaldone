@@ -41,10 +41,11 @@ specification defines the exact syntax.
   in an editor opens a search, and picking a note inserts a link to its identifier. If the owner
   selected text first, the selection becomes the label.
 - **Labels only by choice.** A link stores a label only when the owner writes one. Every
-  implementation shows a link without a label by its target's current title.
+  implementation shows a link without a label by its target's current title. A label can hold span
+  formatting too, which shows when the link does.
 - **Raw editors.** An editor that shows a note's raw markdown fills in and removes titles itself:
   - When the owner starts editing a note, the editor gives each link without a label its target's
-    title, and remembers each title it showed for each target.
+    title, as markdown with its span formatting, and remembers each title it showed for each target.
   - While the note is open, it updates the filled-in labels of links whose target's title changes,
     and remembers those titles too.
   - When it saves, it removes each label that matches its target's current title or any title it
@@ -53,9 +54,13 @@ specification defines the exact syntax.
   - It saves by applying only the differences between the result and the stored text, so links the
     owner didn't touch cause no edits.
 - **Titles.** Every note has a title: the first line of its body, without the marks that make it a
-  heading. If that line is a link, the title is the link's text: its label, or the title of its
-  target when it has none. A cycle of such links ends at the first note it would repeat, which shows
-  by its identifier. A note whose first line is empty shows as untitled.
+  heading. The title keeps the line's span formatting, such as bold, italic, highlights,
+  strikethrough, inline code, and inline math, and shows it wherever the app lists the note or shows
+  a link to it. Each link in the line becomes its text, its label or the title of its target when it
+  has none, so a title never holds a link of its own. A cycle of such links ends at the first note
+  it would repeat, which shows by its identifier. A note whose first line is empty shows as
+  untitled. Places that can show only plain text, such as a window's title or a filename, strip the
+  formatting too.
 - **Embeds.** `![[id]]` shows the target in place, as its type defines: an `image` note shows its
   picture, and other types show their title and the preview their schema names, such as a book's
   cover. Body links to files always go through the note that holds them, never a hash, so a link

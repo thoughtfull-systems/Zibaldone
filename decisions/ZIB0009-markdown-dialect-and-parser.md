@@ -92,8 +92,9 @@ Graphics (SVG). A later specification defines the additions' exact syntax.
   again. The apps draw the SVG. A diagram or formula that fails to render shows its source and the
   error.
 
-- **Titles.** A note's title is the plain text of its body's first line: heading marks, emphasis,
-  and other formatting removed, and each link replaced by its text, as decision ZIB0005 describes.
+- **Titles.** A note's title is its body's first line, parsed as inline markdown: heading marks
+  removed, span formatting kept, and each link replaced by its text, as decision ZIB0005 describes.
+  The core gives the apps both the formatted title and a plain-text form.
 
 - **Writing.** The core never rewrites a body to normalize its markdown. An edit changes only the
   text the owner changed.
