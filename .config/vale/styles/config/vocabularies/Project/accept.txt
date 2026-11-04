@@ -8,6 +8,7 @@ Automerge
 Crockford('s)?
 devenv
 gitlint
+iroh('s)?
 Loro('s)?
 mdformat
 MIT
