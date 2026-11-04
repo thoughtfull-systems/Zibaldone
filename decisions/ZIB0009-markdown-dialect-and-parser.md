@@ -156,8 +156,8 @@ Against the criteria:
 - HTML in a body never runs or renders, so pasted HTML shows as text.
 - A new syntax, such as footnotes, is an additive change to the dialect. A body that uses it shows
   as plain text on releases that don't know it.
-- Exports write CommonMark with GFM. They keep `mermaid` blocks and math unchanged, turn list tables
-  into HTML tables, and turn wikilinks, embeds, and highlights into their nearest standard form.
+- A later decision on exports settles how list tables, wikilinks, embeds, and highlights appear
+  outside Zib.
 - Printing gets its own decision.
 
 [commonmark]: https://spec.commonmark.org/

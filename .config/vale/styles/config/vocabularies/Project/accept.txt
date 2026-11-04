@@ -5,6 +5,7 @@
 [Zz]ib
 [Zz]ibaldone
 Adwaita
+Android
 Automerge
 Cairo
 CommonMark
@@ -15,9 +16,11 @@ Fontconfig
 FTS5
 GFM('s)?
 gitlint
+GLib('s)?
 GTK('s)?
 iroh('s)?
 Jetpack
+Kotlin
 Loro('s)?
 mdformat
 MIT
@@ -31,6 +34,7 @@ SQLite
 Syncthing
 Tantivy
 Tauri
+Tokio('s)?
 Typst
 UniFFI
 Yjs
