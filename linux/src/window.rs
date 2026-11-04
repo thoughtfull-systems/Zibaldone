@@ -47,7 +47,9 @@ pub struct Inner {
     generation: Cell<u64>,
     title: adw::WindowTitle,
     stack: gtk::Stack,
+    view: sourceview5::View,
     buffer: gtk::TextBuffer,
+    backlinks: gtk::MenuButton,
     preview_toggle: gtk::ToggleButton,
     preview: gtk::ScrolledWindow,
     open_file: gtk::Button,
@@ -147,6 +149,11 @@ impl Window {
         content_header.pack_start(&open_file);
         content_header.pack_end(&status);
         content_header.pack_end(&delete);
+        let backlinks = gtk::MenuButton::builder()
+            .icon_name("mail-reply-sender-symbolic")
+            .tooltip_text("Linked from")
+            .build();
+        content_header.pack_end(&backlinks);
         content_header.pack_end(&preview_toggle);
 
         let view = editor::new_view();
@@ -187,7 +194,9 @@ impl Window {
             generation: Cell::new(0),
             title,
             stack,
+            view: view.clone(),
             buffer,
+            backlinks,
             preview_toggle,
             preview,
             open_file,
@@ -252,6 +261,10 @@ impl Window {
         self.inner().preview_toggle.connect_toggled(move |_| w.show_mode());
         let w = self.clone();
         self.inner().buffer.connect_changed(move |_| w.edited());
+        let w = self.clone();
+        self.inner().buffer.connect_insert_text(move |_, at, text| w.maybe_pick_link(at, text));
+        let w = self.clone();
+        self.inner().backlinks.set_create_popup_func(move |button| w.show_backlinks(button));
         let w = self.clone();
         self.inner().buffer.connect_mark_set(move |_, _, mark| {
             if mark.name().as_deref() == Some("insert") {
@@ -983,13 +996,255 @@ impl Window {
         });
     }
 
+    /// Opens the link picker when the owner types `[[`, or wraps a selection in it, which then
+    /// becomes the label. Runs before the buffer inserts `text` at `at`.
+    fn maybe_pick_link(&self, at: &gtk::TextIter, text: &str) {
+        if self.inner().loading.get() || self.inner().editor.borrow().is_none() {
+            return;
+        }
+        let mut before = *at;
+        let typed = text == "[" && before.backward_char() && before.char() == '[';
+        let wrapped = text.len() > 4
+            && text.starts_with("[[")
+            && text.ends_with("]]")
+            && !text[2..text.len() - 2].contains('\n')
+            && body::wikilinks(text).is_empty();
+        if !typed && !wrapped {
+            return;
+        }
+        let start = if typed { at.offset() - 1 } else { at.offset() };
+        let end = at.offset() + i32::try_from(text.chars().count()).unwrap_or(0);
+        let label = wrapped.then(|| text[2..text.len() - 2].to_owned());
+        let w = self.clone();
+        // The picker works on the text after the buffer inserts it.
+        glib::idle_add_local_once(move || w.open_link_picker(start, end, label));
+    }
+
+    /// Shows a search for the note to link to, which replaces the characters from `start` to `end`
+    /// with a link to it.
+    fn open_link_picker(&self, start: i32, end: i32, label: Option<String>) {
+        let view = &self.inner().view;
+        let buffer = &self.inner().buffer;
+        let start = buffer.create_mark(None, &buffer.iter_at_offset(start), true);
+        let end = buffer.create_mark(None, &buffer.iter_at_offset(end), false);
+        let place = view.iter_location(&buffer.iter_at_mark(&end));
+        let (x, y) =
+            view.buffer_to_window_coords(gtk::TextWindowType::Widget, place.x(), place.y());
+        let popover = gtk::Popover::builder()
+            .pointing_to(&gdk::Rectangle::new(x, y, 1, place.height()))
+            .position(gtk::PositionType::Bottom)
+            .build();
+        popover.set_parent(view);
+        let entry = gtk::SearchEntry::builder().placeholder_text("Link to a note").build();
+        let list = gtk::ListBox::new();
+        list.add_css_class("navigation-sidebar");
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&list)
+            .min_content_width(360)
+            .max_content_height(320)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        content.append(&entry);
+        content.append(&scroll);
+        popover.set_child(Some(&content));
+        let found: Rc<RefCell<Vec<Id>>> = Rc::default();
+        let generation = Rc::new(Cell::new(0u64));
+        let fill = {
+            let (w, list, found) = (self.clone(), list.clone(), found.clone());
+            move |query: String| {
+                generation.set(generation.get() + 1);
+                let (w, list, found, generation, mine) =
+                    (w.clone(), list.clone(), found.clone(), generation.clone(), generation.get());
+                glib::spawn_future_local(async move {
+                    let notes = w.link_candidates(query).await;
+                    if generation.get() != mine {
+                        return;
+                    }
+                    list.remove_all();
+                    for (_, title, subtitle) in &notes {
+                        let row = adw::ActionRow::builder()
+                            .title(escape(title))
+                            .subtitle(escape(subtitle))
+                            .activatable(true)
+                            .build();
+                        list.append(&row);
+                    }
+                    if let Some(first) = list.row_at_index(0) {
+                        list.select_row(Some(&first));
+                    }
+                    *found.borrow_mut() = notes.into_iter().map(|(id, _, _)| id).collect();
+                });
+            }
+        };
+        fill(String::new());
+        let pick = {
+            let (w, popover, found) = (self.clone(), popover.clone(), found.clone());
+            let (start, end) = (start.clone(), end.clone());
+            move |index: i32| {
+                let target =
+                    usize::try_from(index).ok().and_then(|i| found.borrow().get(i).copied());
+                if let Some(target) = target {
+                    w.insert_link(&start, &end, target, label.clone());
+                }
+                popover.popdown();
+            }
+        };
+        let picked = pick.clone();
+        list.connect_row_activated(move |_, row| picked(row.index()));
+        let selected = list.clone();
+        entry.connect_activate(move |_| pick(selected.selected_row().map_or(0, |r| r.index())));
+        entry.connect_search_changed(move |entry| fill(entry.text().to_string()));
+        entry.add_controller(arrow_keys(&list));
+        let closing = popover.clone();
+        entry.connect_stop_search(move |_| closing.popdown());
+        let w = self.clone();
+        popover.connect_closed(move |popover| {
+            let buffer = &w.inner().buffer;
+            buffer.delete_mark(&start);
+            buffer.delete_mark(&end);
+            w.inner().view.grab_focus();
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        popover.popup();
+        entry.grab_focus();
+    }
+
+    /// The notes the picker offers for `query`, from every space: the newest notes of the spaces
+    /// that show when it's empty, or else search results. Each comes with its title and its space.
+    async fn link_candidates(&self, query: String) -> Vec<(Id, String, String)> {
+        let state = self.inner().state.clone();
+        let names: HashMap<Id, String> =
+            self.inner().spaces.borrow().iter().map(|(id, name, _)| (*id, name.clone())).collect();
+        let shown: Vec<Id> = self.shown_spaces().into_iter().map(|(id, _)| id).collect();
+        let open = self.inner().editor.borrow().as_ref().map(|e| e.note);
+        let found: Vec<(Id, Id, String)> = core(async move {
+            if query.trim().is_empty() {
+                let mut all = Vec::new();
+                for space in shown {
+                    let notes = state.notes(space).await.unwrap_or_default();
+                    all.extend(notes.into_iter().map(|n| (space, n)));
+                }
+                all.sort_by_key(|(_, note)| std::cmp::Reverse(note.updated));
+                all.into_iter().take(20).map(|(space, n)| (space, n.id, n.plain)).collect()
+            } else {
+                let hits = state.search(&query, 20);
+                hits.into_iter().map(|(space, hit)| (space, hit.id, hit.title)).collect()
+            }
+        })
+        .await;
+        found
+            .into_iter()
+            .filter(|(_, id, _)| Some(*id) != open)
+            .map(|(space, id, title)| {
+                let title = if title.trim().is_empty() { "Untitled".to_owned() } else { title };
+                (id, title, names.get(&space).cloned().unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// Replaces the text between two marks with a link to `target`. A link without a label the
+    /// owner chose shows its target's title, which the editor removes again when it commits.
+    fn insert_link(
+        &self,
+        start: &gtk::TextMark,
+        end: &gtk::TextMark,
+        target: Id,
+        label: Option<String>,
+    ) {
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        let (start, end) = (start.clone(), end.clone());
+        glib::spawn_future_local(async move {
+            let link = if let Some(label) = label {
+                body::wikilink(target, Some(&label))
+            } else {
+                let titles = core(async move { state.titles(&[target]).await }).await;
+                let title = titles.get(&target).cloned().unwrap_or_default();
+                if let Some(editor) = w.inner().editor.borrow_mut().as_mut() {
+                    editor.shown.remember(target, &title);
+                    editor.titles.insert(target, title.clone());
+                }
+                if title.is_empty() {
+                    body::wikilink(target, None)
+                } else {
+                    format!("[[{target}|{}]]", body::escape_label(&title))
+                }
+            };
+            let buffer = &w.inner().buffer;
+            if start.is_deleted() || end.is_deleted() {
+                return;
+            }
+            let mut from = buffer.iter_at_mark(&start);
+            let mut to = buffer.iter_at_mark(&end);
+            buffer.begin_user_action();
+            buffer.delete(&mut from, &mut to);
+            buffer.insert(&mut from, &link);
+            buffer.end_user_action();
+            buffer.place_cursor(&from);
+        });
+    }
+
+    /// Fills the popover of notes that link to the open note.
+    fn show_backlinks(&self, button: &gtk::MenuButton) {
+        let list = gtk::ListBox::new();
+        list.add_css_class("navigation-sidebar");
+        list.set_selection_mode(gtk::SelectionMode::None);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&list)
+            .min_content_width(320)
+            .max_content_height(400)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        let popover = gtk::Popover::builder().child(&scroll).build();
+        button.set_popover(Some(&popover));
+        let Some(note) = self.inner().editor.borrow().as_ref().map(|e| e.note) else { return };
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            let sources = core(async move {
+                let sources = state.backlinks(note);
+                let ids: Vec<Id> = sources.iter().map(|(_, id)| *id).collect();
+                let titles = state.titles(&ids).await;
+                sources
+                    .into_iter()
+                    .map(|(space, id)| {
+                        let title =
+                            titles.get(&id).map(|t| body::plain_text(t)).unwrap_or_default();
+                        (space, id, title)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            if sources.is_empty() {
+                list.append(
+                    &gtk::Label::builder()
+                        .label("No notes link here")
+                        .margin_top(12)
+                        .margin_bottom(12)
+                        .build(),
+                );
+                return;
+            }
+            for (space, id, title) in sources {
+                let title = if title.trim().is_empty() { "Untitled".to_owned() } else { title };
+                let row = adw::ActionRow::builder().title(escape(&title)).activatable(true).build();
+                let (w, popover) = (w.clone(), popover.clone());
+                row.connect_activated(move |_| {
+                    popover.popdown();
+                    w.open_note(space, id);
+                });
+                list.append(&row);
+            }
+        });
+    }
+
     /// Opens the wikilink or web link under a point in the editor. Returns whether there was one.
     fn open_link_at(&self, x: f64, y: f64) -> bool {
-        let Some(view) = self.inner().stack.child_by_name("editor").and_then(|scroll| {
-            scroll.downcast::<gtk::ScrolledWindow>().ok()?.child()?.downcast::<gtk::TextView>().ok()
-        }) else {
-            return false;
-        };
+        let view = &self.inner().view;
         #[allow(clippy::cast_possible_truncation)]
         let (bx, by) =
             view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
@@ -1099,4 +1354,23 @@ fn snippet_markup(snippet: &str) -> String {
         }
     }
     out
+}
+
+/// Lets Up and Down in a search entry move the selection in `list`.
+fn arrow_keys(list: &gtk::ListBox) -> gtk::EventControllerKey {
+    let list = list.clone();
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        let step = match key {
+            gdk::Key::Down => 1,
+            gdk::Key::Up => -1,
+            _ => return glib::Propagation::Proceed,
+        };
+        let at = list.selected_row().map_or(-1, |row| row.index()) + step;
+        if let Some(row) = list.row_at_index(at.max(0)) {
+            list.select_row(Some(&row));
+        }
+        glib::Propagation::Stop
+    });
+    keys
 }

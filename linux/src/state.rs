@@ -369,13 +369,15 @@ impl State {
         hits
     }
 
-    pub fn backlinks(&self, space: Id, note: Id) -> Vec<Id> {
-        self.indexes
-            .lock()
-            .expect("unpoisoned")
-            .get(&space)
-            .and_then(|i| i.backlinks(note).ok())
-            .unwrap_or_default()
+    /// The notes in any space that link to `note`, with their spaces.
+    pub fn backlinks(&self, note: Id) -> Vec<(Id, Id)> {
+        let indexes = self.indexes.lock().expect("unpoisoned");
+        let mut found = Vec::new();
+        for (space, index) in indexes.iter() {
+            let sources = index.backlinks(note).unwrap_or_default();
+            found.extend(sources.into_iter().filter(|source| *source != note).map(|s| (*space, s)));
+        }
+        found
     }
 
     /// Adds a file to a space as a note, and returns the note.
