@@ -6,13 +6,16 @@
 [Zz]ibaldone
 Adwaita
 Automerge
+Cairo
 CommonMark
 Crockford('s)?
 devenv
 Djot
+Fontconfig
 FTS5
 GFM('s)?
 gitlint
+GTK('s)?
 iroh('s)?
 Jetpack
 Loro('s)?
@@ -21,6 +24,7 @@ MIT
 Multiplatform
 Nygard
 Pandoc('s)?
+Pango
 PDFs
 Rust
 SQLite
