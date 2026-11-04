@@ -18,6 +18,8 @@ pub mod markup;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod pairing;
+#[cfg(feature = "print")]
+pub mod print;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod schema;

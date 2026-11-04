@@ -49,6 +49,14 @@ pub enum Request {
         #[serde(default)]
         limit: Option<u32>,
     },
+    /// Prints notes to a PDF file.
+    Print {
+        id: u64,
+        notes: Vec<Id>,
+        #[serde(default)]
+        linked: bool,
+        path: String,
+    },
 }
 
 impl Request {
@@ -59,7 +67,8 @@ impl Request {
             | Self::Stop { id }
             | Self::Spaces { id }
             | Self::CreateSpace { id, .. }
-            | Self::Search { id, .. } => *id,
+            | Self::Search { id, .. }
+            | Self::Print { id, .. } => *id,
         }
     }
 }

@@ -4,6 +4,7 @@
 use std::env;
 use std::process::{Command, ExitCode, Stdio};
 
+use zib_core::Id;
 use zib_core::channel::Dirs;
 use zib_core::instance::{Client, Reply, Request};
 use zib_core::search::{MATCH_END, MATCH_START};
@@ -16,6 +17,8 @@ Usage:
   zib spaces              List the spaces on this machine
   zib create-space NAME   Create a space
   zib search WORDS...     Search every space
+  zib print [--linked] -o FILE NOTE...
+                          Print notes to a PDF, with --linked adding what they link to
   zib stop                Quit Zib";
 
 fn main() -> ExitCode {
@@ -52,6 +55,7 @@ async fn run(args: Vec<String>) -> Result<ExitCode, String> {
         Some("search") if args.len() > 1 => {
             Request::Search { id, query: args[1..].join(" "), limit: None }
         }
+        Some("print") => print_request(id, &args[1..])?,
         Some("stop") => Request::Stop { id },
         Some(other) => return Err(format!("unknown command {other:?}\n{USAGE}")),
     };
@@ -89,4 +93,31 @@ fn start() -> std::io::Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+/// Reads `print`'s arguments: notes as identifiers or `zib:note/` URIs, `--linked`, and `-o` with
+/// the file to write, which the instance needs as an absolute path.
+fn print_request(id: u64, args: &[String]) -> Result<Request, String> {
+    let mut notes = Vec::new();
+    let mut linked = false;
+    let mut path = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--linked" => linked = true,
+            "-o" | "--output" => path = args.next().cloned(),
+            note => {
+                let text = note.strip_prefix("zib:note/").unwrap_or(note);
+                let text = text.split('#').next().unwrap_or(text);
+                let note = Id::parse(text).map_err(|_| format!("{note:?} doesn't name a note"))?;
+                notes.push(note);
+            }
+        }
+    }
+    let path = path.ok_or_else(|| format!("print needs -o FILE\n{USAGE}"))?;
+    if notes.is_empty() {
+        return Err(format!("print needs at least one note\n{USAGE}"));
+    }
+    let path = env::current_dir().map_err(|e| e.to_string())?.join(path);
+    Ok(Request::Print { id, notes, linked, path: path.to_string_lossy().into_owned() })
 }

@@ -426,6 +426,69 @@ impl State {
         Ok(Some((hash, media)))
     }
 
+    /// Prints notes to a PDF, as the instance specification's `print` request describes: each note
+    /// in order, and with `linked`, the notes each one links to, unless the PDF already holds them.
+    pub async fn print(&self, notes: &[Id], linked: bool) -> Result<Vec<u8>> {
+        let mut order: Vec<Id> = Vec::new();
+        let mut bodies = Vec::new();
+        for &note in notes {
+            let space = self
+                .find_note(note)
+                .await
+                .ok_or_else(|| Error::NotFound(format!("note {note}")))?;
+            let body = self.note(space, note).await?.body;
+            let mut more = Vec::new();
+            if linked {
+                for link in zib_core::body::wikilinks(&body).into_iter().filter(|l| !l.embed) {
+                    if !more.contains(&link.target) {
+                        more.push(link.target);
+                    }
+                }
+            }
+            if !order.contains(&note) {
+                order.push(note);
+                bodies.push(body);
+            }
+            for target in more {
+                if order.contains(&target) {
+                    continue;
+                }
+                let Some(space) = self.find_note(target).await else { continue };
+                if let Ok(note) = self.note(space, target).await {
+                    order.push(target);
+                    bodies.push(note.body);
+                }
+            }
+        }
+        let mut refs = zib_core::print::Refs::default();
+        let targets: Vec<Id> =
+            bodies.iter().flat_map(|body| zib_core::body::link_targets(body)).collect();
+        refs.titles = self.titles(&targets).await;
+        for body in &bodies {
+            for link in zib_core::body::wikilinks(body).into_iter().filter(|l| l.embed) {
+                if refs.images.contains_key(&link.target) {
+                    continue;
+                }
+                let Some(space) = self.find_note(link.target).await else { continue };
+                let Ok(Some((hash, media))) = self.note_file(space, link.target, "image").await
+                else {
+                    continue;
+                };
+                if let Ok(data) = self
+                    .blob_path(space, hash)
+                    .await
+                    .and_then(|path| std::fs::read(&path).map_err(|e| Error::io(path, e)))
+                {
+                    refs.images.insert(link.target, (data, media));
+                }
+            }
+        }
+        let page = self.store.lock().await.config.page.clone();
+        tokio::task::spawn_blocking(move || zib_core::print::pdf(&bodies, &refs, &page))
+            .await
+            .map_err(|e| Error::Render(e.to_string()))?
+    }
+
     /// Draws math or a diagram, from the cache when it's there.
     pub async fn render(&self, kind: Kind, source: String) -> Result<Image> {
         let renderer = self.renderer.clone();

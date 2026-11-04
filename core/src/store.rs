@@ -42,6 +42,25 @@ pub struct MachineConfig {
     /// The space that the owner last put a note into, where new notes go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_space: Option<Id>,
+    /// The page that notes print on, which depends on the printer at hand.
+    #[serde(default)]
+    pub page: Page,
+}
+
+/// The page that notes print on, a machine setting from decision ZIB0003.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Page {
+    /// A paper size by Typst's name for it, such as `a4` or `us-letter`.
+    pub paper: String,
+    /// The margin on every side, in millimetres.
+    pub margin: f64,
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Self { paper: "a4".into(), margin: 20.0 }
+    }
 }
 
 /// A space that the machine holds.
@@ -80,6 +99,7 @@ impl Store {
                     versions: BTreeMap::new(),
                     peers: BTreeMap::new(),
                     last_space: None,
+                    page: Page::default(),
                 };
                 write_atomic(&path, &serde_json::to_vec_pretty(&config).expect("serializable"))?;
                 config

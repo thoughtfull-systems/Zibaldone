@@ -149,6 +149,16 @@ impl Window {
         content_header.pack_start(&open_file);
         content_header.pack_end(&status);
         content_header.pack_end(&delete);
+        let print_menu = gio::Menu::new();
+        print_menu.append(Some("Print with linked notes…"), Some("win.print-linked"));
+        let print = adw::SplitButton::builder()
+            .icon_name("printer-symbolic")
+            .tooltip_text("Print")
+            .dropdown_tooltip("More ways to print")
+            .menu_model(&print_menu)
+            .action_name("win.print")
+            .build();
+        content_header.pack_end(&print);
         let backlinks = gtk::MenuButton::builder()
             .icon_name("mail-reply-sender-symbolic")
             .tooltip_text("Linked from")
@@ -300,6 +310,8 @@ impl Window {
             ("new-space", Self::new_space as fn(&Self)),
             ("rename-space", Self::rename_space as fn(&Self)),
             ("add-machine", Self::add_machine as fn(&Self)),
+            ("print", |w: &Self| w.print(false)),
+            ("print-linked", |w: &Self| w.print(true)),
         ] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
@@ -982,6 +994,47 @@ impl Window {
             let state = w.inner().state.clone();
             let _ = core(async move { state.rename_space(space, &name).await }).await;
             w.reload_spaces();
+        });
+    }
+
+    /// Prints the open note, and with `linked`, the notes it links to, through GTK's print dialog,
+    /// which sends the PDF to a printer or saves it.
+    fn print(&self, linked: bool) {
+        let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
+        if let Some(timer) = pending {
+            timer.remove();
+            self.commit();
+        }
+        let Some(note) = self.inner().editor.borrow().as_ref().map(|e| e.note) else { return };
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        self.toast("Preparing to print…");
+        glib::spawn_future_local(async move {
+            let path = state.dirs.cache.join(format!("print-{note}.pdf"));
+            let written = {
+                let path = path.clone();
+                core(async move {
+                    let pdf = state.print(&[note], linked).await?;
+                    std::fs::write(&path, pdf).map_err(|e| zib_core::Error::io(path, e))
+                })
+                .await
+            };
+            if let Err(error) = written {
+                w.toast(&format!("Couldn't print: {error}"));
+                return;
+            }
+            let dialog = gtk::PrintDialog::new();
+            let file = gio::File::for_path(&path);
+            let printed = dialog
+                .print_file_future(Some(&w.inner().window), None::<&gtk::PrintSetup>, &file)
+                .await;
+            if let Err(error) = printed
+                && !error.matches(gtk::DialogError::Dismissed)
+                && !error.matches(gtk::DialogError::Cancelled)
+            {
+                w.toast(&format!("Couldn't print: {error}"));
+            }
+            let _ = std::fs::remove_file(&path);
         });
     }
 

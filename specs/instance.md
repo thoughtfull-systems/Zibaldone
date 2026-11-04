@@ -83,6 +83,22 @@ The first requests:
 The commands that the `zib` command offers, such as searching, creating notes, or printing, each add
 a request here, as the core's operations become available to it.
 
+- **`spaces`:** lists the machine's spaces. The result holds `spaces`, a list of maps, each with
+  `id`, the space's identifier as text, and `name`, its pet name.
+- **`create-space`,** with `name`, a text pet name: creates a space. The result holds `spaces`, with
+  the new space alone.
+- **`search`,** with `query`, the text to find, and an optional `limit`, an integer that defaults to
+  20: searches every space. The result holds `hits`, a list of maps, best matches first, each with
+  `space` and `note`, identifiers as text, `title`, the note's title as plain text, and `snippet`,
+  words around the matches, with each match between the characters U+0002 and U+0003.
+- **`print`,** with `notes`, a list of note identifiers as text, `linked`, a Boolean that defaults
+  to false, and `path`, the absolute path of a file: prints the notes, in order, to a PDF at that
+  path, each note starting on a new page. With `linked`, each note comes with the notes it links to,
+  in the order its links first name them, unless the PDF already holds them. The result holds
+  nothing, and the error code is `not-found` when this machine holds none of a note.
+
+A result leaves out a list that would be empty.
+
 ## Platforms
 
 - **Linux.** This specification applies to the Linux app and the `zib` command, on sway with a

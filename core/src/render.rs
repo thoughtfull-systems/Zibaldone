@@ -22,7 +22,8 @@ impl Kind {
         match self {
             Self::InlineMath => "inline-math",
             Self::DisplayMath => "display-math",
-            Self::Mermaid => "mermaid",
+            // Diagrams drawn before their labels became SVG text lack labels, so they cache anew.
+            Self::Mermaid => "mermaid-2",
         }
     }
 }
@@ -96,8 +97,16 @@ pub fn math_svg(source: &str, display: bool) -> Result<String> {
 /// A Mermaid diagram as SVG.
 pub fn mermaid_svg(source: &str) -> Result<String> {
     use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SvgRequest};
+    // Labels as SVG text, not HTML, which neither resvg nor Typst draws. Front matter has to come
+    // first, so a diagram that has some keeps Mermaid's defaults.
+    let plain = "%%{init: {\"htmlLabels\": false, \"flowchart\": {\"htmlLabels\": false}}}%%\n";
+    let source = if source.trim_start().starts_with("---") {
+        source.to_owned()
+    } else {
+        format!("{plain}{source}")
+    };
     let output = Renderer::new()
-        .render(RenderRequest::svg(source, OperationControl::new(), SvgRequest::default()))
+        .render(RenderRequest::svg(&source, OperationControl::new(), SvgRequest::default()))
         .map_err(|e| Error::Render(e.to_string()))?;
     match output {
         RenderOutput::Svg(Some(svg)) => Ok(svg.svg().to_owned()),

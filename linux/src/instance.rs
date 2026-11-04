@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use zib_core::instance::{self, Handler, HitInfo, Lock, Reply, Request, SpaceInfo};
-use zib_core::{Channel, Result};
+use zib_core::{Channel, Error, Result};
 
 use crate::state::{State, UiEvent};
 use crate::tray;
@@ -54,7 +54,11 @@ fn handler(state: Arc<State>) -> Handler {
             let id = request.id();
             match answer(&state, request).await {
                 Ok(reply) => reply,
-                Err(error) => Reply::Error { id, reason: error.to_string(), code: "failed".into() },
+                Err(error) => {
+                    let code =
+                        if matches!(error, Error::NotFound(_)) { "not-found" } else { "failed" };
+                    Reply::Error { id, reason: error.to_string(), code: code.into() }
+                }
             }
         })
     })
@@ -92,6 +96,11 @@ async fn answer(state: &State, request: Request) -> Result<Reply> {
                 })
                 .collect();
             Reply::Result { id, spaces: Vec::new(), hits }
+        }
+        Request::Print { id, notes, linked, path } => {
+            let pdf = state.print(&notes, linked).await?;
+            std::fs::write(&path, pdf).map_err(|e| Error::io(path, e))?;
+            Reply::done(id)
         }
     })
 }

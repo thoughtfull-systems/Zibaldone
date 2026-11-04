@@ -12,6 +12,8 @@ bundled-sqlite = ["rusqlite/bundled"]
 default = ["net", "render"]
 # Connections between machines over iroh, which most tests of the core don't need.
 net = ["dep:futures-util", "dep:iroh", "dep:iroh-mdns-address-lookup"]
+# Printing notes to PDF with Typst, which only the Linux app turns on, as ZIB0010 describes.
+print = ["dep:typst", "dep:typst-kit", "dep:typst-layout", "dep:typst-pdf", "render"]
 # Math and diagrams drawn as images, which most tests of the core don't need.
 render = [
   "dep:merman",
@@ -56,6 +58,13 @@ tokio = { version = "1.54.1", features = [
   "sync",
   "time",
 ] }
+typst = { version = "0.15.1", optional = true }
+typst-kit = { version = "0.15.1", default-features = false, features = [
+  "embedded-fonts",
+  "scan-fonts",
+], optional = true }
+typst-layout = { version = "0.15.1", optional = true }
+typst-pdf = { version = "0.15.1", optional = true }
 uuid = { version = "1.29.0", features = ["v7"] }
 
 [dev-dependencies]
