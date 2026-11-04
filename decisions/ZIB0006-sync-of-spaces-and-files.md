@@ -77,9 +77,12 @@ defines the protocol.
   inviting machine adds the new one to `machines` and sends it the space.
 - **After pairing.** The new machine's owner gives each space a pet name, and from then on, the new
   machine syncs with every member of those spaces.
-- **Removing a machine.** Any member can remove another from `machines`. Once the removal syncs, the
-  remaining members refuse the removed machine, and each one deletes the removed machine's holder
-  entries from the `files` map. A machine that leaves a space on its own removes itself first.
+- **Removing a machine.** Any member can remove another. Removal marks the machine's entry in
+  `machines` as removed instead of deleting it, and nothing ever clears the mark. Once the removal
+  syncs, members refuse the removed machine's key, even if that machine later writes to its entry
+  again, and each member deletes the removed machine's holder entries from the `files` map. A
+  machine that leaves a space on its own removes itself first. To rejoin, a removed machine pairs
+  again as a new machine, which makes a fresh identifier and key pair.
 - **Documents.** A sync of a space is one exchange: each side sends its version vector, then the
   updates the other side lacks. Each side imports the updates into a copy first and checks them, so
   updates from a document that isn't this space never reach the space.
@@ -119,7 +122,7 @@ Against the criteria:
   middle of nearby pairing has one chance in a million of matching codes, and only one try before
   the two screens show different codes.
 - **Per-space membership:** a machine syncs a space only with the keys its own copy of that space
-  lists.
+  lists. A removed machine stays removed, because no write clears the mark.
 - **Self-contained:** `machines` lives in the document, so a restored backup knows its members, and
   a new member learns every one of them with the space.
 - **Reachable:** relays reach every machine that can make an outgoing connection, browsers included,
@@ -158,6 +161,10 @@ Against the criteria:
 - **A virtual private network, such as Tailscale.** It solves reaching machines, but the owner has
   to run it on every machine, Android allows one virtual private network at a time, and a browser
   can't join one. It fails the reachable and no server to run criteria.
+- **Deleting a removed machine's entry.** It keeps `machines` small, but the last write to each key
+  wins, so a removed machine that syncs with a member that hasn't heard of its removal writes its
+  entry again, and that write can spread to every member. It fails the per-space membership
+  criterion.
 - **Nearby pairing without a code.** Picking a machine from the list would be enough, but anyone on
   the same network, such as a café's, could announce a machine with a familiar name. Comparing codes
   proves the two screens show the same pair of keys. It fails the private criterion.
