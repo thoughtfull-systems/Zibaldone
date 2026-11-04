@@ -41,8 +41,17 @@ specification defines the exact syntax.
   in an editor opens a search, and picking a note inserts a link to its identifier. If the owner
   selected text first, the selection becomes the label.
 - **Labels only by choice.** A link stores a label only when the owner writes one. Every
-  implementation shows a link without a label by its target's current title. An editor that shows
-  raw markdown fills in titles as it loads a note and strips them again as it saves.
+  implementation shows a link without a label by its target's current title.
+- **Raw editors.** An editor that shows a note's raw markdown fills in and removes titles itself:
+  - When the owner starts editing a note, the editor gives each link without a label its target's
+    title, and remembers each title it showed for each target.
+  - While the note is open, it updates the filled-in labels of links whose target's title changes,
+    and remembers those titles too.
+  - When it saves, it removes each label that matches its target's current title or any title it
+    showed for that target, and keeps every other label as one the owner chose. A label the owner
+    edits no longer matches, so it stays from then on.
+  - It saves by applying only the differences between the result and the stored text, so links the
+    owner didn't touch cause no edits.
 - **Titles.** Every note has a title: the first line of its body, without the marks that make it a
   heading. If that line is a link, the title is the link's text: its label, or the title of its
   target when it has none. A cycle of such links ends at the first note it would repeat, which shows
@@ -120,6 +129,9 @@ Against the criteria:
 - A move writes two documents. If the app stops between them, the note exists in both spaces, and
   the owner deletes one copy.
 - Every implementation derives titles by the same rule, so the rule lives in shared code.
+- A filled-in title has to come back from the text exactly, or the save can't recognize it, so the
+  wikilink syntax lets a backslash escape a backslash, a `]`, or a `|` inside a label, and writers
+  escape all three.
 - Raw text shows identifiers where titles would be, so an export to markdown files rewrites links to
   file names and fills in titles.
 - Search over raw text doesn't find a note by the titles of the notes it links to.
