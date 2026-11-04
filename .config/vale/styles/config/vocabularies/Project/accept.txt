@@ -12,4 +12,5 @@ mdformat
 MIT
 Nygard
 PDFs
+Syncthing
 Yjs

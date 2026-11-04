@@ -64,6 +64,8 @@ specification defines the exact containers and keys. In outline:
 - **`schemas`** holds the definitions of the note types that the space uses.
 - **`meta`** holds the space's identifier, as
   [decision 0003](0003-space-identity-and-machine-settings.md) defines it.
+- **`files`** holds an entry for each file in the space, as
+  [decision 0004](0004-storage-and-sync-of-files.md) defines it.
 
 Each key in either `settings` map starts with the name of the implementation that reads it and a
 period, such as `linux.` or `android.`, or with `zib.` for settings every implementation shares.

@@ -37,8 +37,9 @@ A later specification defines the exact encoding. In outline:
 - **Schemas.** A schema lists the type's fields. Each field has a name, which follows the same rules
   as type names, a kind, and a search mode.
   - **Kinds:** text, integer, decimal, boolean, date, time of day, date and time, a link to a note,
-    a choice from a fixed set of values, and a list of any of these. A time of day has no date or
-    time zone, so a journal prompt set for 07:00 comes up at 07:00 wherever the owner is.
+    a file, as [decision 0004](0004-storage-and-sync-of-files.md) defines it, a choice from a fixed
+    set of values, and a list of any of these. A time of day has no date or time zone, so a journal
+    prompt set for 07:00 comes up at 07:00 wherever the owner is.
   - **Search modes:** `text` indexes the value for full-text search, `filter` indexes it for exact
     matches, ranges, and sorting, and `none` leaves it out of the index.
   - A schema can mark a field as deprecated. Releases stop offering it for new values but keep
