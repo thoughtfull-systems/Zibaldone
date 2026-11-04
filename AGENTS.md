@@ -34,6 +34,20 @@ hooks.
 - `devenv.yaml` pins the inputs, and `devenv.lock` records their versions.
 - `.pre-commit-config.yaml` is a generated file. Don't edit or commit it.
 
+## Building and testing
+
+The Rust workspace holds `core`, the `zib-core` crate that every app builds on, and `linux`, the
+`zib-linux` crate with the `zib` command and the `zibaldone` instance.
+[Decision ZIB0014](decisions/ZIB0014-building-testing-and-packaging.md) explains the setup.
+
+- Run the tests with `devenv shell -- cargo nextest run --workspace`.
+- Builds from the source tree are the development channel, which keeps its data apart from
+  production, as [decision ZIB0013](decisions/ZIB0013-development-and-production-channels.md)
+  describes. Don't turn on the `production` feature to try a change.
+- Build the packages with `nix build .#zibaldone-dev` and `nix build .#zibaldone`, and run the tests
+  in Nix with `nix flake check`.
+- `flake.nix` and `nix/packages.nix` define the packages. `flake.lock` pins their inputs.
+
 ## Tool configuration
 
 Keep configuration for tooling in `.config/`, not in the repository root. Most tools don't look
@@ -42,6 +56,8 @@ only from the root, so it stays there.
 
 - `.config/gitlint`: commit message rules.
 - `.config/markdownlint.yaml`: markdown structure rules.
+- `.config/rustfmt.toml`: formatting for Rust. Clippy's lints live in the workspace's `Cargo.toml`.
+- `.config/taplo.toml`: formatting for `.toml` files.
 - `.config/vale/vale.ini`: prose linting for markdown.
 - `.config/vale/styles/config/vocabularies/Project/`: accepted and rejected terms.
 - `.config/vale/styles/Google/`: the vendored Google style. Don't edit these files by hand. Run
@@ -72,9 +88,10 @@ Some hooks fix files in place and then fail: trailing whitespace, final newlines
 formatting, and sorted files. Review the change, stage it, and commit again. Don't bypass the hooks
 with `--no-verify`.
 
-The hooks cover only the file types the repository has, so Rust, Kotlin, `.toml`, and GitHub Actions
-workflows have none yet. When you add the first file of a new type, add hooks that format and lint
-it in the same commit.
+The hooks cover only the file types the repository has, so Kotlin and GitHub Actions workflows have
+none yet. Rust has `rustfmt` and `clippy`, with every warning denied, and `.toml` files have
+`taplo`. When you add the first file of a new type, add hooks that format and lint it in the same
+commit.
 
 ## Line length
 

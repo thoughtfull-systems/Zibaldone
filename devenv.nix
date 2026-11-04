@@ -12,7 +12,13 @@ in
   # keep-sorted start block=yes newline_separated=yes
   cachix.enable = false;
 
-  env.VALE_CONFIG_PATH = "${config.devenv.root}/.config/vale/vale.ini";
+  env = {
+    # keep-sorted start block=yes
+    # mold links far faster than the default linker, which dominates incremental builds and tests.
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+    VALE_CONFIG_PATH = "${config.devenv.root}/.config/vale/vale.ini";
+    # keep-sorted end
+  };
 
   git-hooks.hooks = {
     # keep-sorted start block=yes
@@ -23,6 +29,14 @@ in
     check-shebang-scripts-are-executable.enable = true;
     check-symlinks.enable = true;
     check-vcs-permalinks.enable = true;
+    clippy = {
+      enable = true;
+      settings = {
+        # keep-sorted start
+        denyWarnings = true;
+        # keep-sorted end
+      };
+    };
     deadnix.enable = true;
     detect-private-keys.enable = true;
     editorconfig-checker = {
@@ -111,6 +125,10 @@ in
       settings.width = 100;
     };
     ripsecrets.enable = true;
+    rustfmt = {
+      enable = true;
+      settings.config-path = ".config/rustfmt.toml";
+    };
     sort-file-contents = {
       enable = true;
       files = lib.concatStrings [
@@ -120,6 +138,13 @@ in
       settings.ignore-case = true;
     };
     statix.enable = true;
+    taplo = {
+      args = [
+        "--config"
+        ".config/taplo.toml"
+      ];
+      enable = true;
+    };
     trim-trailing-whitespace = {
       args = [ "--markdown-linebreak-ext=md" ];
       enable = true;
@@ -185,6 +210,16 @@ in
     # keep-sorted end
   };
 
-  packages = [ pkgs.vale ];
+  languages.rust.enable = true;
+
+  packages = [
+    # keep-sorted start
+    pkgs.cargo-nextest
+    pkgs.mold
+    pkgs.pkg-config
+    pkgs.sqlite
+    pkgs.vale
+    # keep-sorted end
+  ];
   # keep-sorted end
 }

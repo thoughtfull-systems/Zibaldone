@@ -8,6 +8,7 @@ Adwaita
 Android
 Automerge
 Cairo
+Clippy('s)?
 CommonMark
 Crockford('s)?
 devenv
@@ -25,12 +26,15 @@ Loro('s)?
 mdformat
 MIT
 Multiplatform
+nextest
+nixpkgs
 Nygard
 Pandoc('s)?
 Pango
 PDFs
 responder('s)?
 Rust
+sccache
 setext
 SQLite
 Syncthing
