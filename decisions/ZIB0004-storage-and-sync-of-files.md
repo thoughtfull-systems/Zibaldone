@@ -40,17 +40,20 @@ machines transfer blobs.
 - **Where blobs live.** Each machine keeps the blobs of each space apart from its other spaces, in a
   place the implementation chooses: a directory on Linux, the app's private storage on Android, and
   the Origin Private File System (OPFS) in a browser.
-- **Notes for files.** Every file has a note of the built-in `file` type, with a field of a new
-  kind, a file, whose value is the blob's hash. The note's body starts with the file's name, which
-  serves as its title, and goes on to describe the file. Other types can hold files in fields of the
-  same kind, and a note's body can show or link to a file through its note, as
-  [decision ZIB0005](ZIB0005-note-identifiers-and-links.md) defines.
+- **Notes for files.** Every file belongs to a note, in a field of the file kind from
+  [decision ZIB0002](ZIB0002-note-types-and-schemas.md), whose value is the blob's hash. Types made
+  for a kind of file hold it in fields of their own: a `book` holds its PDF and the PDF's text, an
+  `image` holds its picture and a thumbnail, and types such as `article` and `webcomic` hold theirs.
+  The built-in `file` type holds any file that has no more specific type. A note links to or embeds
+  a file only through the note that holds it, as
+  [decision ZIB0005](ZIB0005-note-identifiers-and-links.md) defines. When Zib creates a note from a
+  file, the note's body starts with the file's name, which serves as its title until the owner
+  changes it.
 - **The `files` map.** A root `files` map in the space's document holds an entry for each blob,
-  keyed by its hash: its size, its media type, the hashes of its derived blobs, and the machines
-  that hold it. Each machine adds its own identifier, from
-  [decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md), once it holds the whole blob
-  and has checked its hash, and removes it when it drops the blob. Each machine writes only its own
-  key, so these writes never conflict.
+  keyed by its hash: its size, its media type, and the machines that hold it. Each machine adds its
+  own identifier, from [decision ZIB0003](ZIB0003-space-identity-and-machine-settings.md), once it
+  holds the whole blob and has checked its hash, and removes it when it drops the blob. Each machine
+  writes only its own key, so these writes never conflict.
 - **What a machine keeps.** Each machine has a fixed policy, which its implementation sets and which
   never changes. The space's document records it in the machine's entry in the `machines` map, as
   [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md) defines it, so every machine knows which
@@ -67,14 +70,15 @@ machines transfer blobs.
   online, the machine keeps the blob and asks again later, even when its cache overflows.
 - **New blobs.** A blob created on a machine with the `on demand` policy stays there until a machine
   with the `all` policy confirms it holds the blob, whatever the cache's size.
-- **Derived blobs.** The first machine that can read a file's text writes it to a blob of its own,
-  and the first that can draw a small preview image writes that too. Every machine fetches every
-  derived blob, whatever its policy, so it can search and preview every file. Each machine indexes
-  the text as [decision ZIB0002](ZIB0002-note-types-and-schemas.md) indexes `text` fields.
-- **Blobs in use.** A blob is in use while a note in the space refers to it, or while the entry of a
-  blob in use lists it as a derived blob. Derived blobs have entries of their own in the `files`
-  map, with holders like any other blob, so they stay in use exactly as long as the file they come
-  from.
+- **Derived files.** Derived fields from decision ZIB0002 hold files that a machine made from
+  another of the note's files, such as a PDF's text or an image's thumbnail. Every machine fetches
+  the blob of every derived field, whatever its policy, so it can search and preview every file
+  without holding it.
+- **Blobs in use.** A blob is in use while a file field of a note in the space holds its hash. The
+  fields of the space's notes are the only roots: a book's PDF and its text stay in use through the
+  book's own fields, and its cover through the field of the `image` note that the book links to.
+  Replacing a file or deleting its note takes its blob out of use, and replacing it clears the
+  fields derived from it, which takes their blobs out of use too.
 - **Collecting garbage.** A machine deletes a blob, and removes its own identifier from the blob's
   entry, once the blob hasn't been in use in its copy of the space for 30 days. The wait gives
   machines that haven't synced yet time to add a reference back. An entry for a blob not in use,
@@ -90,8 +94,8 @@ Against the criteria:
 - **Verifiable:** a BLAKE3 hash names each blob, and BLAKE3's tree structure lets a machine check
   each chunk of a file as it arrives, so it can show a PDF's first pages before the rest arrives.
 - **Small documents:** the document holds a few hundred bytes per file, and no file's bytes.
-- **Searchable without the bytes:** derived blobs hold the text and a preview of each file, and
-  every machine keeps them.
+- **Searchable without the bytes:** derived fields hold each file's text and thumbnail, and every
+  machine keeps their blobs.
 - **Every platform:** each platform stores blobs with its own storage, and BLAKE3 has a Rust crate
   that builds for every target, the browser through WebAssembly included.
 - **No server:** blobs travel over the same sync between machines as the documents.
@@ -125,7 +129,12 @@ Against the criteria:
   files criterion.
 - **Derived text inside the document.** Every machine would get every file's text with the notes,
   but long texts would swell the document and its history. It does worse on small documents, and a
-  derived blob gives the same result.
+  derived field gives the same result.
+- **A `file` note for every file, with derived blobs listed in the `files` map.** Each file would
+  have one generic note, and a book would link to the note of its PDF. But a book would need two
+  notes for one thing, its fields couldn't hold the PDF's text, and each derived blob would need a
+  role and a rule of its own for staying in use. Fields of the file kind on any type give derived
+  files a name and make the notes the only roots for garbage collection.
 
 ## Consequences
 
@@ -150,8 +159,12 @@ Against the criteria:
   it.
 - An `on demand` machine that drops a blob, then stays offline for more than 30 days before adding a
   reference to it, finds that the `all` machines collected the blob as garbage.
-- Each implementation needs text extractors and preview renderers for the media types it supports,
-  and a machine without one leaves the work to another.
+- Each implementation needs the derivations that its types define, such as text extractors and
+  thumbnail renderers, and a machine without one leaves the work to another.
+- Replacing a file clears its derived fields, so search and previews miss the new version until a
+  machine that can derive them runs.
+- Types for kinds of files live in code like every type, so a new kind of file with fields of its
+  own needs a release. Until then, its files use the `file` type.
 - Spaces never share blobs, so a file in two spaces takes space twice on a machine that holds both.
 
 [blake3]: https://github.com/BLAKE3-team/BLAKE3

@@ -86,9 +86,9 @@ defines the protocol.
 - **Files.** iroh-blobs fetches a blob by its hash and checks each chunk against BLAKE3's tree as it
   arrives, so a machine can fetch part of a file, such as a PDF's first pages. A machine with the
   `all` policy fetches every blob in `files` that it lacks. A machine with the `on demand` policy
-  fetches a blob when the owner opens it, from any holder that's online. Every machine fetches every
-  derived blob. Before a machine drops a blob, it asks an `all` holder over the same connection to
-  confirm that it holds the blob, as decision ZIB0004 requires.
+  fetches a blob when the owner opens it, from any holder that's online. Every machine fetches the
+  blob of every derived field. Before a machine drops a blob, it asks an `all` holder over the same
+  connection to confirm that it holds the blob, as decision ZIB0004 requires.
 - **Connections.** iroh connects through a relay first, tries a direct path with hole punching, and
   moves the connection there once it works. Machines find each other by public key, through iroh's
   address lookup and, on a local network, through multicast DNS, so members on one network connect

@@ -37,11 +37,23 @@ A later specification defines the exact encoding. In outline:
 - **Schemas.** A schema lists the type's fields. Each field has a name, which follows the same rules
   as type names, a kind, and a search mode.
   - **Kinds:** text, integer, decimal, boolean, date, time of day, date and time, a link to a note,
-    a file, as [decision ZIB0004](ZIB0004-storage-and-sync-of-files.md) defines it, a choice from a
-    fixed set of values, and a list of any of these. A time of day has no date or time zone, so a
-    journal prompt set for 07:00 comes up at 07:00 wherever the owner is.
+    a file, which holds a blob's hash as [decision ZIB0004](ZIB0004-storage-and-sync-of-files.md)
+    defines it, a choice from a fixed set of values, and a list of any of these. A time of day has
+    no date or time zone, so a journal prompt set for 07:00 comes up at 07:00 wherever the owner is.
   - **Search modes:** `text` indexes the value for full-text search, `filter` indexes it for exact
     matches, ranges, and sorting, and `none` leaves it out of the index.
+  - **Derived fields:** a field of the file kind can derive from another file field of the same
+    note, through a named derivation, such as extracting the text of a PDF or drawing a small
+    thumbnail of an image. The first machine that can run the derivation stores the result as a blob
+    and sets the field. A machine that changes the source field clears every field derived from it
+    in the same change, and the first machine that can run the derivation fills it again. If two
+    machines derive at once, the last write wins, and the other blob falls out of use. A release
+    that doesn't know a derivation leaves the field alone.
+  - **Previews:** a schema can name the field that previews a note of its type: a derived thumbnail,
+    or a link to a note whose own preview stands in, such as a book's `cover` link to an `image`
+    note.
+  - **Files in search:** a file field with the `text` search mode indexes its blob's contents as
+    text, so a search that matches a PDF's extracted text finds the note that holds the field.
   - A schema can mark a field as deprecated. Releases stop offering it for new values but keep
     reading, showing, and indexing the values that exist.
 - **Additive changes only.** A release may add types, add fields, add values to a choice, and

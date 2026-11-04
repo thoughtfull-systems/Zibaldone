@@ -11,8 +11,9 @@ Machines create notes offline, so identifiers can't come from a shared counter. 
 from its text, so it changes whenever the text does. A note can also move from one space to another,
 and a link from a note in one space can point to a note in another, on a machine that holds both.
 
-[Decision ZIB0004](ZIB0004-storage-and-sync-of-files.md) gives every file a note of the `file` type.
-A note's body shows an image or links to a PDF through that note.
+[Decision ZIB0004](ZIB0004-storage-and-sync-of-files.md) keeps every file in a field of a note, such
+as a book's PDF or an image's picture. A note's body shows an image or links to a PDF through the
+note that holds it.
 
 ## Criteria
 
@@ -46,9 +47,10 @@ specification defines the exact syntax.
   heading. If that line is a link, the title is the link's text: its label, or the title of its
   target when it has none. A cycle of such links ends at the first note it would repeat, which shows
   by its identifier. A note whose first line is empty shows as untitled.
-- **Embeds.** `![[id]]` shows the target in place: an image for a file note of an image, and a
-  preview for other files and notes. Body links to files always go through the file's note, never
-  its hash, so a link keeps working when the file's content changes.
+- **Embeds.** `![[id]]` shows the target in place, as its type defines: an `image` note shows its
+  picture, and other types show their title and the preview their schema names, such as a book's
+  cover. Body links to files always go through the note that holds them, never a hash, so a link
+  keeps working when the file's content changes.
 - **Fragments.** The specification reserves `[[id#fragment]]` for links to a part of a note, such as
   a heading or a page of a PDF, and leaves the fragment's meaning for a later version.
 - **Missing and deleted targets.** A link whose target the machine doesn't hold, because it lives in
@@ -97,8 +99,8 @@ Against the criteria:
   `[label](zib:note/<id>)` is longer to type and to read than `[[<id>|label]]`, and an empty label
   isn't valid markdown. It fails the quick to write and readable text criteria as the main syntax,
   so it stays as a second form.
-- **Body links to a file's hash.** A link could name a blob directly, with no file note between. But
-  a new version of the file has a new hash, so every link to it would break or need rewriting. It
+- **Body links to a file's hash.** A link could name a blob directly, with no note between. But a
+  new version of the file has a new hash, so every link to it would break or need rewriting. It
   fails the stable criterion.
 
 ## Consequences
