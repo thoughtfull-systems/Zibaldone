@@ -16,6 +16,17 @@ The directory belongs to the user, and only the user may read, write, or enter i
   ends.
 - **`instance.sock`:** the Unix socket the instance listens on. Only the user may read or write it.
 
+## Isolated development instances
+
+The development build reads the environment variable `ZIB_DEV_ROOT`, as
+[decision ZIB0015](../decisions/ZIB0015-isolated-development-instances.md) describes. When it's set
+and not empty, the instance and the `zib` command keep their files under that directory, made
+absolute from the current directory, instead of the base directories: data in `data`, the cache in
+`cache`, and the lock and socket in `run`. The `run` directory takes the place of the `zibaldone`
+directory under `$XDG_RUNTIME_DIR`, so each root runs an instance of its own. The window's title and
+the tray icon's title and tooltip add the root's last path component to the name, such as "Zibaldone
+Dev (a)". The production build never reads the variable.
+
 ## Starting
 
 The app's own executable only ever runs the instance. People and launchers start Zib through the

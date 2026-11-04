@@ -85,7 +85,7 @@ impl Window {
     pub fn new(app: &adw::Application, state: Arc<State>) -> Self {
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title(state.channel.display_name())
+            .title(state.channel.title())
             .default_width(1100)
             .default_height(760)
             .build();

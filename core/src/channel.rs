@@ -2,9 +2,13 @@
 //! describes.
 
 use std::env;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
+
+/// The variable that gives a development instance a root directory of its own.
+pub const ROOT_VAR: &str = "ZIB_DEV_ROOT";
 
 /// Which build of Zib is running.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +60,33 @@ impl Channel {
         }
     }
 
+    /// The directory that holds every file of an isolated development instance, from `ROOT_VAR`, as
+    /// decision ZIB0015 describes. Production never reads the variable.
+    pub fn root(self) -> Option<PathBuf> {
+        match self {
+            Self::Production => None,
+            Self::Development => root_from(env::var_os(ROOT_VAR)),
+        }
+    }
+
+    /// The name for the window and tray, with an isolated instance's root after it.
+    pub fn title(self) -> String {
+        self.title_with(self.root().as_deref())
+    }
+
+    fn title_with(self, root: Option<&Path>) -> String {
+        match root {
+            Some(root) => {
+                let name = root.file_name().map_or_else(
+                    || root.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                format!("{} ({name})", self.display_name())
+            }
+            None => self.display_name().into(),
+        }
+    }
+
     /// The color that marks the channel in icons, as `0xRRGGBB`.
     pub const fn accent(self) -> u32 {
         match self {
@@ -78,8 +109,11 @@ pub struct Dirs {
 
 impl Dirs {
     /// The channel's directories under the XDG base directories, as the instance specification
-    /// defines them.
+    /// defines them, or under the root of an isolated development instance.
     pub fn for_channel(channel: Channel) -> Result<Self> {
+        if let Some(root) = channel.root() {
+            return Ok(Self::under(root));
+        }
         let home = || {
             env::var_os("HOME")
                 .map(PathBuf::from)
@@ -110,6 +144,13 @@ impl Dirs {
     }
 }
 
+/// A root from the variable's value, made absolute so the `zib` command and the instance it starts
+/// agree on it. An empty value counts as none.
+fn root_from(value: Option<OsString>) -> Option<PathBuf> {
+    let value = value.filter(|v| !v.is_empty())?;
+    Some(std::path::absolute(&value).unwrap_or_else(|_| value.into()))
+}
+
 /// The user's numeric identifier, from the owner of the home directory's runtime files.
 fn user_id() -> u32 {
     use std::os::unix::fs::MetadataExt;
@@ -128,5 +169,19 @@ mod tests {
         assert_ne!(production.app_id(), development.app_id());
         assert_ne!(production.command(), development.command());
         assert_ne!(production.accent(), development.accent());
+    }
+
+    #[test]
+    fn isolated_instances_have_roots_of_their_own() {
+        assert_eq!(Channel::Production.root(), None);
+        assert_eq!(root_from(None), None);
+        assert_eq!(root_from(Some("".into())), None);
+        let root = root_from(Some("/tmp/zib/a".into())).unwrap();
+        assert_eq!(root, Path::new("/tmp/zib/a"));
+        assert_eq!(root_from(Some("a".into())).unwrap(), env::current_dir().unwrap().join("a"));
+        let dirs = Dirs::under(&root);
+        assert_eq!(dirs.runtime, Path::new("/tmp/zib/a/run"));
+        assert_eq!(Channel::Development.title_with(Some(&root)), "Zibaldone Dev (a)");
+        assert_eq!(Channel::Development.title_with(None), "Zibaldone Dev");
     }
 }

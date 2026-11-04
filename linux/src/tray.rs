@@ -26,7 +26,7 @@ impl ksni::Tray for Tray {
     }
 
     fn title(&self) -> String {
-        self.channel.display_name().into()
+        self.channel.title()
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
@@ -41,7 +41,7 @@ impl ksni::Tray for Tray {
     }
 
     fn tool_tip(&self) -> ToolTip {
-        ToolTip { title: self.channel.display_name().into(), ..ToolTip::default() }
+        ToolTip { title: self.channel.title(), ..ToolTip::default() }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -51,7 +51,7 @@ impl ksni::Tray for Tray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
             StandardItem {
-                label: format!("Open {}", self.channel.display_name()),
+                label: format!("Open {}", self.channel.title()),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.events.send(Event::Activate);
                 }),
