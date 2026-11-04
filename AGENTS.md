@@ -16,6 +16,14 @@ sets a guideline for languages or technologies, or would be hard to reverse.
 [Decision ZIB0000](decisions/ZIB0000-record-decisions.md) describes when to write a decision, the
 format, and the process.
 
+## Specifications
+
+Exact formats and protocols live in `specs/`, one file for each area. Read the specification for an
+area before changing code that reads or writes it, change the two in the same commit, and change a
+specification only by adding to it.
+[Decision ZIB0012](decisions/ZIB0012-specifications-and-how-they-change.md) describes what belongs
+in a specification and how to write one.
+
 ## Environment
 
 The development environment comes from [devenv](https://devenv.sh). Run commands inside it with
