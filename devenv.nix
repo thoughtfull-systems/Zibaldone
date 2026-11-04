@@ -6,16 +6,24 @@
 }:
 
 let
+  gtkSchemas = "${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}";
   vendored = "^\\.config/vale/styles/(Google|write-good)/";
 in
 {
   # keep-sorted start block=yes newline_separated=yes
   cachix.enable = false;
 
+  # Nix builds wrap GTK apps to find GSettings schemas; apps run from the shell need them here.
+  enterShell = "export XDG_DATA_DIRS=${gtkSchemas}:$XDG_DATA_DIRS";
+
   env = {
     # keep-sorted start block=yes
+    # Eight compilers at once fill memory and push the desktop into swap, so build with four.
+    CARGO_BUILD_JOBS = "4";
     # mold links far faster than the default linker, which dominates incremental builds and tests.
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+    # Compilers run at low priority, so the desktop stays responsive while they work.
+    RUSTC_WRAPPER = "${pkgs.coreutils}/bin/nice";
     VALE_CONFIG_PATH = "${config.devenv.root}/.config/vale/vale.ini";
     # keep-sorted end
   };
@@ -215,8 +223,12 @@ in
   packages = [
     # keep-sorted start
     pkgs.cargo-nextest
+    pkgs.gtk4
+    pkgs.gtksourceview5
+    pkgs.libadwaita
     pkgs.mold
     pkgs.pkg-config
+    pkgs.poppler-utils
     pkgs.sqlite
     pkgs.vale
     # keep-sorted end

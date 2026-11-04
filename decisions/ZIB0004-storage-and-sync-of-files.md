@@ -143,8 +143,8 @@ Against the criteria:
 
 - Decision ZIB0001's outline gains the root `files` map, and decision ZIB0002's kinds gain the file
   kind.
-- Sync transfers blobs as well as document updates, verifies them as they arrive, and fetches from
-  whichever machine holds a blob. Decision ZIB0006 does this with [iroh-blobs], which uses BLAKE3.
+- Sync transfers blobs as well as document updates, verifies them against their BLAKE3 hashes, and
+  fetches from whichever machine holds a blob, as decision ZIB0006 describes.
 - The `files` map can list a machine that no longer exists, so a file can look safer than it really
   is. Removing a machine from a space needs to remove it from every entry.
 - On a machine with the `on demand` policy, a file that no other machine is online to send can't
@@ -170,4 +170,3 @@ Against the criteria:
 - Spaces never share blobs, so a file in two spaces takes space twice on a machine that holds both.
 
 [blake3]: https://github.com/BLAKE3-team/BLAKE3
-[iroh-blobs]: https://github.com/n0-computer/iroh-blobs

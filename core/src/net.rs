@@ -2,19 +2,21 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::timeout;
 
 use crate::address::{Address, MachineKey};
+use crate::files::Blobs;
 use crate::pairing::{self, Invite, Invites, Paired, Party};
 use crate::space::{FileHash, Policy};
-use crate::sync::{self, Exchanged, Message};
+use crate::sync::{self, Exchanged, LiveEvent, Message, Selection};
 use crate::{Error, Id, Result, Space};
 
 /// How long a machine waits for another to answer a connection.
@@ -51,6 +53,60 @@ pub struct Node {
     me: Party,
     spaces: Spaces,
     invites: Arc<std::sync::Mutex<Invites>>,
+    /// The directory that holds each space's directory, with its blobs.
+    spaces_dir: std::sync::Mutex<Option<PathBuf>>,
+    /// The notes open for editing on this machine, by space and note.
+    live: std::sync::Mutex<HashMap<(Id, Id), Live>>,
+}
+
+/// What a live session needs from an open note: its local changes, its cursors, and where its
+/// events go.
+type LiveParts = (
+    broadcast::Receiver<Vec<u8>>,
+    broadcast::Receiver<(Id, Vec<Selection>)>,
+    mpsc::Sender<LiveEvent>,
+);
+
+/// A note open for editing, which live sessions with other machines share.
+struct Live {
+    local: broadcast::Sender<Vec<u8>>,
+    cursors: broadcast::Sender<(Id, Vec<Selection>)>,
+    events: mpsc::Sender<LiveEvent>,
+    _subscription: loro::Subscription,
+}
+
+/// A note this machine has open for editing: its cursor goes out through `cursors`, and the other
+/// machines' changes and cursors come in through `events`.
+pub struct OpenNote {
+    pub cursors: broadcast::Sender<(Id, Vec<Selection>)>,
+    pub events: mpsc::Receiver<LiveEvent>,
+}
+
+/// A machine that announces itself nearby while its owner adds a machine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NearbyMachine {
+    pub address: Address,
+    pub name: String,
+}
+
+/// What the nearby listing reports.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NearbyEvent {
+    Found(NearbyMachine),
+    Lost(crate::address::MachineKey),
+}
+
+/// Announces this machine nearby, until it's dropped.
+pub struct Nearby {
+    _lookup: MdnsAddressLookup,
+    pub events: mpsc::Receiver<NearbyEvent>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Nearby {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl Node {
@@ -94,7 +150,25 @@ impl Node {
             policy,
             key: MachineKey(*endpoint.id().as_bytes()),
         };
-        Ok(Self { endpoint, me, spaces: Arc::default(), invites: Arc::default() })
+        Ok(Self {
+            endpoint,
+            me,
+            spaces: Arc::default(),
+            invites: Arc::default(),
+            spaces_dir: std::sync::Mutex::new(None),
+            live: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Sets the directory that holds each space's directory, as the machine store lays it out.
+    pub fn set_spaces_dir(&self, dir: PathBuf) {
+        *self.spaces_dir.lock().expect("unpoisoned") = Some(dir);
+    }
+
+    /// The blobs of a space on this machine.
+    pub fn blobs(&self, space: Id) -> Option<Blobs> {
+        let dir = self.spaces_dir.lock().expect("unpoisoned").clone()?;
+        Some(Blobs::new(dir.join(space.to_string()).join("blobs")))
     }
 
     /// This machine, as pairing describes it.
@@ -162,6 +236,41 @@ impl Node {
                             .is_some_and(|f| f.holders.contains_key(&space.machine()))
                     });
                 sync::answer_hold(&mut send, &hash, self.me.policy, holds).await?;
+            }
+            Message::Fetch { space, machine, hash } => {
+                let found = self.spaces.lock().await.get(&space).cloned();
+                let member = match &found {
+                    Some(found) => sync::is_member(&*found.lock().await, machine, &peer),
+                    None => false,
+                };
+                let path = <[u8; 32]>::try_from(hash.as_slice())
+                    .ok()
+                    .and_then(|h| self.blobs(space).map(|b| b.path(FileHash(h))))
+                    .filter(|p| p.is_file());
+                match path {
+                    Some(path) if member => sync::send_blob(&mut send, &path).await?,
+                    _ => {
+                        sync::send(&mut send, &Message::Error { reason: "no such blob".into() })
+                            .await?;
+                    }
+                }
+            }
+            Message::Watch { space, machine, note, version } => {
+                let found = self.spaces.lock().await.get(&space).cloned();
+                let Some(found) = found else {
+                    return Err(Error::NotFound(format!("space {space}")));
+                };
+                let member = sync::is_member(&*found.lock().await, machine, &peer);
+                let open = self.live_receivers(space, note);
+                let Some((local, cursors, events)) = open.filter(|_| member) else {
+                    sync::send(&mut send, &Message::Error { reason: "not open here".into() })
+                        .await?;
+                    return Ok(());
+                };
+                let ours = found.lock().await.version();
+                sync::send(&mut send, &Message::Watching { note, version: ours }).await?;
+                let stream = tokio::io::join(recv, send);
+                return sync::live(stream, &found, machine, &version, local, cursors, events).await;
             }
             other => {
                 let reason = format!("unexpected {other:?}");
@@ -266,6 +375,206 @@ impl Node {
         }
         self.spaces.lock().await.insert(space, copy.clone());
         Ok(copy)
+    }
+
+    fn live_receivers(&self, space: Id, note: Id) -> Option<LiveParts> {
+        let live = self.live.lock().expect("unpoisoned");
+        let open = live.get(&(space, note))?;
+        Some((open.local.subscribe(), open.cursors.subscribe(), open.events.clone()))
+    }
+
+    /// Opens a note for editing: syncs its space with every member at once, and starts live
+    /// sessions with each member that has the same note open.
+    pub async fn open_note(self: &Arc<Self>, space_id: Id, note: Id) -> Result<OpenNote> {
+        let space = self.spaces.lock().await.get(&space_id).cloned();
+        let space = space.ok_or_else(|| Error::NotFound(format!("space {space_id}")))?;
+        let (local, _) = broadcast::channel(256);
+        let (cursors, _) = broadcast::channel(64);
+        let (events, receiver) = mpsc::channel(256);
+        let sender = local.clone();
+        let subscription =
+            space.lock().await.doc().subscribe_local_update(Box::new(move |bytes| {
+                let _ = sender.send(bytes.clone());
+                true
+            }));
+        self.live.lock().expect("unpoisoned").insert(
+            (space_id, note),
+            Live { local, cursors: cursors.clone(), events, _subscription: subscription },
+        );
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _ = this.sync_all(&space).await;
+            let members = {
+                let space = space.lock().await;
+                space.members().into_iter().filter(|m| m.id != space.machine()).collect::<Vec<_>>()
+            };
+            for member in members {
+                let this = this.clone();
+                let space = space.clone();
+                tokio::spawn(async move {
+                    let _ = this
+                        .watch(
+                            &space,
+                            space_id,
+                            note,
+                            member.id,
+                            &Address { key: member.key, hints: Vec::new() },
+                        )
+                        .await;
+                });
+            }
+        });
+        Ok(OpenNote { cursors, events: receiver })
+    }
+
+    async fn watch(
+        &self,
+        space: &Arc<Mutex<Space>>,
+        space_id: Id,
+        note: Id,
+        peer: Id,
+        address: &Address,
+    ) -> Result<()> {
+        let connection = self.connect(address, sync::ALPN).await?;
+        let (mut send, mut recv) =
+            connection.open_bi().await.map_err(|e| Error::Protocol(e.to_string()))?;
+        let version = space.lock().await.version();
+        sync::send(
+            &mut send,
+            &Message::Watch { space: space_id, machine: self.me.machine, note, version },
+        )
+        .await?;
+        let Message::Watching { version: theirs, .. } = sync::receive(&mut recv).await? else {
+            return Err(Error::Protocol("expected watching".into()));
+        };
+        let Some((local, cursors, events)) = self.live_receivers(space_id, note) else {
+            return Ok(());
+        };
+        let result =
+            sync::live(tokio::io::join(recv, send), space, peer, &theirs, local, cursors, events)
+                .await;
+        connection.close(0u32.into(), b"done");
+        result
+    }
+
+    /// Closes a note, which ends its live sessions.
+    pub fn close_note(&self, space: Id, note: Id) {
+        self.live.lock().expect("unpoisoned").remove(&(space, note));
+    }
+
+    /// Fetches a blob of a space from any holder that answers.
+    pub async fn fetch_blob(&self, space_id: Id, hash: FileHash) -> Result<()> {
+        let blobs =
+            self.blobs(space_id).ok_or_else(|| Error::NotFound("the spaces directory".into()))?;
+        if blobs.has(hash) {
+            return Ok(());
+        }
+        let space = self.spaces.lock().await.get(&space_id).cloned();
+        let space = space.ok_or_else(|| Error::NotFound(format!("space {space_id}")))?;
+        let holders = {
+            let space = space.lock().await;
+            let holders = space.file(hash).map(|f| f.holders).unwrap_or_default();
+            space
+                .members()
+                .into_iter()
+                .filter(|m| holders.contains_key(&m.id) && m.id != space.machine())
+                .collect::<Vec<_>>()
+        };
+        let mut last = Error::NotFound(format!("a holder of {hash}"));
+        for holder in holders {
+            let address = Address { key: holder.key, hints: Vec::new() };
+            let fetched = async {
+                let connection = self.connect(&address, sync::ALPN).await?;
+                let (send, recv) =
+                    connection.open_bi().await.map_err(|e| Error::Protocol(e.to_string()))?;
+                let result = sync::fetch_blob(
+                    tokio::io::join(recv, send),
+                    space_id,
+                    self.me.machine,
+                    hash,
+                    &blobs,
+                )
+                .await;
+                connection.close(0u32.into(), b"done");
+                result
+            };
+            match fetched.await {
+                Ok(()) => {
+                    space.lock().await.set_holding(hash, true)?;
+                    return Ok(());
+                }
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
+    /// Fetches every blob in use that this machine lacks, as the `all` policy asks, and returns
+    /// how many arrived.
+    pub async fn fetch_missing(&self, space_id: Id) -> usize {
+        let Some(blobs) = self.blobs(space_id) else { return 0 };
+        let space = self.spaces.lock().await.get(&space_id).cloned();
+        let Some(space) = space else { return 0 };
+        let missing: Vec<FileHash> =
+            space.lock().await.files_in_use().into_iter().filter(|h| !blobs.has(*h)).collect();
+        let mut fetched = 0;
+        for hash in missing {
+            if self.fetch_blob(space_id, hash).await.is_ok() {
+                fetched += 1;
+            }
+        }
+        fetched
+    }
+
+    /// Announces this machine nearby under the pairing service, with its name, and lists the
+    /// other machines that do, until the result is dropped.
+    pub async fn announce_nearby(&self, name: &str) -> Result<Nearby> {
+        use futures_util::StreamExt;
+        use iroh::address_lookup::AddressLookup;
+        use iroh::endpoint_info::{EndpointData, UserData};
+        let lookup = MdnsAddressLookup::builder()
+            .service_name(pairing::SERVICE)
+            .build(self.endpoint.id())
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let own = self.endpoint.addr();
+        let mut data =
+            EndpointData::new(own.ip_addrs().copied().map(iroh::TransportAddr::Ip).collect());
+        if let Ok(user) = name.parse::<UserData>() {
+            data = data.with_user_data(user);
+        }
+        lookup.publish(&data);
+        let mut stream = lookup.subscribe().await;
+        let (sender, events) = mpsc::channel(32);
+        let own_key = self.endpoint.id();
+        let task = tokio::spawn(async move {
+            while let Some(event) = stream.next().await {
+                let message = match event {
+                    iroh_mdns_address_lookup::DiscoveryEvent::Discovered {
+                        endpoint_info, ..
+                    } => {
+                        if endpoint_info.endpoint_id == own_key {
+                            continue;
+                        }
+                        let key = crate::address::MachineKey(*endpoint_info.endpoint_id.as_bytes());
+                        let name = endpoint_info
+                            .data
+                            .user_data()
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
+                        let hints = endpoint_info.data.ip_addrs().copied().collect();
+                        NearbyEvent::Found(NearbyMachine { address: Address { key, hints }, name })
+                    }
+                    iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id } => {
+                        NearbyEvent::Lost(crate::address::MachineKey(*endpoint_id.as_bytes()))
+                    }
+                    _ => continue,
+                };
+                if sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Nearby { _lookup: lookup, events, task })
     }
 
     /// Asks the holder at `address` whether it holds a blob, before this machine drops it.
@@ -445,6 +754,121 @@ mod tests {
         let paired =
             a.pair(&b.address(), async |_: &Party, _: &str| Some(Vec::new())).await.unwrap();
         assert_eq!(paired.peer.machine, b.me().machine);
+        a.close().await;
+        b.close().await;
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::schema;
+
+    struct Refusing;
+
+    impl Pairing for Refusing {
+        fn accepting(&self) -> bool {
+            false
+        }
+        fn confirm(&self, _: &Party, _: &str) -> impl Future<Output = Option<Vec<Id>>> + Send {
+            std::future::ready(None)
+        }
+        fn paired(&self, _: Paired) -> impl Future<Output = ()> + Send {
+            std::future::ready(())
+        }
+    }
+
+    async fn node(dir: &std::path::Path) -> Arc<Node> {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).unwrap();
+        let node = Arc::new(
+            Node::bind(secret, Id::generate(), "test", Policy::All, Network::Loopback)
+                .await
+                .unwrap(),
+        );
+        node.set_spaces_dir(dir.to_path_buf());
+        tokio::spawn(node.clone().serve(Arc::new(Refusing)));
+        node
+    }
+
+    /// Two nodes that share a space, each knowing the other's loopback address as a hint.
+    async fn shared(
+        dir: &std::path::Path,
+    ) -> (Arc<Node>, Arc<Node>, Id, Arc<Mutex<Space>>, Arc<Mutex<Space>>) {
+        let (a, b) = (node(&dir.join("a")).await, node(&dir.join("b")).await);
+        let mut space = Space::create(a.me().machine).unwrap();
+        space.add_machine(a.me().machine, a.me().key, "A", Policy::All).unwrap();
+        space.add_machine(b.me().machine, b.me().key, "B", Policy::All).unwrap();
+        let id = space.id().unwrap();
+        let copy = Space::open(&space.snapshot().unwrap(), b.me().machine).unwrap();
+        let (space, copy) = (Arc::new(Mutex::new(space)), Arc::new(Mutex::new(copy)));
+        a.spaces().lock().await.insert(id, space.clone());
+        b.spaces().lock().await.insert(id, copy.clone());
+        (a, b, id, space, copy)
+    }
+
+    #[tokio::test]
+    async fn fetches_blobs_from_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, id, space, copy) = shared(dir.path()).await;
+        let blobs = a.blobs(id).unwrap();
+        let hash = blobs.add_bytes(b"a file's bytes").unwrap();
+        let note =
+            crate::files::add_file_note(&mut *space.lock().await, hash, 14, "f.txt", "text/plain")
+                .unwrap();
+        b.sync(&copy, &a.address()).await.unwrap();
+        assert!(copy.lock().await.note(note).is_ok());
+        // B finds A through the hint its address carries; a real network looks the key up.
+        let holder_hint = a.address();
+        let connection = b.connect(&holder_hint, sync::ALPN).await.unwrap();
+        let (send, recv) = connection.open_bi().await.unwrap();
+        sync::fetch_blob(
+            tokio::io::join(recv, send),
+            id,
+            b.me().machine,
+            hash,
+            &b.blobs(id).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.blobs(id).unwrap().read(hash).unwrap(), b"a file's bytes");
+        a.close().await;
+        b.close().await;
+    }
+
+    #[tokio::test]
+    async fn edits_live_between_open_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, id, space, copy) = shared(dir.path()).await;
+        let note = space.lock().await.create_note(schema::NOTE, "shared").unwrap();
+        b.sync(&copy, &a.address()).await.unwrap();
+        let mut b_open = b.open_note(id, note).await.unwrap();
+        let _a_open = a.open_note(id, note).await.unwrap();
+        // A opens second, so it watches B directly, through B's loopback hint.
+        let watch_space = space.clone();
+        let (a2, b_address, b_machine) = (a.clone(), b.address(), b.me().machine);
+        tokio::spawn(async move { a2.watch(&watch_space, id, note, b_machine, &b_address).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let mut space = space.lock().await;
+            space.insert_text(note, 6, " live").unwrap();
+            space.commit();
+        }
+        let changed = timeout(Duration::from_secs(5), async {
+            loop {
+                match b_open.events.recv().await {
+                    Some(LiveEvent::Changed)
+                        if copy.lock().await.note(note).unwrap().body == "shared live" =>
+                    {
+                        return true;
+                    }
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        })
+        .await;
+        assert_eq!(changed, Ok(true));
         a.close().await;
         b.close().await;
     }

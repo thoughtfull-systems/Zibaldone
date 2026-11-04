@@ -1,9 +1,16 @@
-//! Zibaldone on Linux: the instance that holds the machine's spaces, its tray icon, and the `zib`
-//! command that talks to it, as the instance specification defines them.
+//! Zibaldone on Linux: the instance that holds the machine's spaces, its window and tray icon, and
+//! the `zib` command that talks to it, as the instance specification defines them.
 
+pub mod adding;
+pub mod app;
+pub mod derive;
+pub mod editor;
 pub mod icon;
 pub mod instance;
+pub mod preview;
+pub mod state;
 pub mod tray;
+pub mod window;
 
 use zib_core::Channel;
 

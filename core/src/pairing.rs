@@ -293,6 +293,13 @@ impl Invite {
     }
 }
 
+/// An invite link as a QR code: its width in modules, and whether each module, row by row, is dark.
+pub fn qr_modules(text: &str) -> Option<(usize, Vec<bool>)> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let dark = code.to_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect();
+    Some((code.width(), dark))
+}
+
 /// The invites a member made and hasn't seen used.
 #[derive(Debug, Default)]
 pub struct Invites(Vec<(Invite, Instant)>);

@@ -9,18 +9,39 @@ version.workspace = true
 [features]
 # SQLite built from source, for platforms without a system SQLite that has FTS5, such as Android.
 bundled-sqlite = ["rusqlite/bundled"]
-default = ["net"]
+default = ["net", "render"]
 # Connections between machines over iroh, which most tests of the core don't need.
-net = ["dep:iroh", "dep:iroh-mdns-address-lookup"]
+net = ["dep:futures-util", "dep:iroh", "dep:iroh-mdns-address-lookup"]
+# Math and diagrams drawn as images, which most tests of the core don't need.
+render = [
+  "dep:merman",
+  "dep:ratex-layout",
+  "dep:ratex-parser",
+  "dep:ratex-svg",
+  "dep:ratex-types",
+  "dep:resvg",
+]
 
 [dependencies]
 blake3 = "1.8.7"
 ciborium = "0.2.2"
+futures-util = { version = "0.3.31", default-features = false, optional = true }
 getrandom = "0.3.4"
 iroh = { version = "1.4.1", optional = true }
 iroh-mdns-address-lookup = { version = "0.6.1", optional = true }
 loro = "1.17.1"
+merman = { version = "0.9.3", default-features = false, features = [
+  "all-diagrams",
+  "layout-cytoscape",
+  "svg",
+], optional = true }
 pulldown-cmark = { version = "0.13.6", default-features = false }
+qrcode = { version = "0.14.1", default-features = false }
+ratex-layout = { version = "0.1.15", optional = true }
+ratex-parser = { version = "0.1.15", optional = true }
+ratex-svg = { version = "0.1.15", features = ["embed-fonts"], optional = true }
+ratex-types = { version = "0.1.15", optional = true }
+resvg = { version = "0.47.0", optional = true }
 rusqlite = "0.41.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11.19"

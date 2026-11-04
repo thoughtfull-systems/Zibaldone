@@ -12,7 +12,7 @@ library:
 
 - [Loro](ZIB0001-storage-format-for-spaces.md), for the spaces' documents.
 - [BLAKE3](ZIB0004-storage-and-sync-of-files.md), the hash that names each file.
-- [iroh and iroh-blobs](ZIB0006-sync-of-spaces-and-files.md), for sync.
+- [iroh](ZIB0006-sync-of-spaces-and-files.md), for sync.
 
 Beyond those libraries, a lot of logic doesn't depend on the platform: the schema rules of
 [decision ZIB0002](ZIB0002-note-types-and-schemas.md), the identifiers and wikilink parser of

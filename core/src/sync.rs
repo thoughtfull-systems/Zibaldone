@@ -69,16 +69,36 @@ pub enum Message {
         space: Id,
         machine: Id,
         note: Id,
+        #[serde(with = "serde_bytes")]
+        version: Vec<u8>,
     },
     Watching {
         note: Id,
+        #[serde(with = "serde_bytes")]
+        version: Vec<u8>,
     },
     Unwatch,
     Cursor {
         note: Id,
         selections: Vec<Selection>,
     },
+    Fetch {
+        space: Id,
+        machine: Id,
+        #[serde(with = "serde_bytes")]
+        hash: Vec<u8>,
+    },
+    Blob {
+        size: u64,
+    },
+    Chunk {
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
 }
+
+/// The most a `chunk` message holds.
+pub const CHUNK: usize = 1 << 18;
 
 /// A cursor or selection in a note's body, as Loro encodes positions.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -285,7 +305,7 @@ pub async fn live<S>(
     peer: Id,
     peer_version: &[u8],
     mut local: broadcast::Receiver<Vec<u8>>,
-    mut cursors: mpsc::Receiver<(Id, Vec<Selection>)>,
+    mut cursors: broadcast::Receiver<(Id, Vec<Selection>)>,
     events: mpsc::Sender<LiveEvent>,
 ) -> Result<()>
 where
@@ -311,13 +331,16 @@ where
                     break Ok(());
                 }
             },
-            cursor = cursors.recv() => {
-                let Some((note, selections)) = cursor else {
+            cursor = cursors.recv() => match cursor {
+                Ok((note, selections)) => {
+                    send(&mut writer, &Message::Cursor { note, selections }).await?;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => {
                     let _ = send(&mut writer, &Message::Unwatch).await;
                     break Ok(());
-                };
-                send(&mut writer, &Message::Cursor { note, selections }).await?;
-            }
+                }
+            },
             message = frame::read::<_, Message>(&mut reader, MAX_FRAME) => match message? {
                 Some(Message::Updates { updates }) => {
                     space.lock().await.import_checked(&updates)?;
@@ -333,6 +356,68 @@ where
     };
     let _ = events.send(LiveEvent::Ended).await;
     result
+}
+
+/// Sends a blob in answer to `fetch`, after the caller checked membership.
+pub async fn send_blob<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    path: &std::path::Path,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await.map_err(|e| Error::io(path, e))?;
+    let size = file.metadata().await.map_err(|e| Error::io(path, e))?.len();
+    send(writer, &Message::Blob { size }).await?;
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let read = file.read(&mut buffer).await.map_err(|e| Error::io(path, e))?;
+        if read == 0 {
+            break;
+        }
+        send(writer, &Message::Chunk { data: buffer[..read].to_vec() }).await?;
+    }
+    send(writer, &Message::Done).await
+}
+
+/// Fetches a blob from a holder into `blobs`, and keeps it only if its bytes match the hash.
+pub async fn fetch_blob<S>(
+    stream: S,
+    space: Id,
+    machine: Id,
+    hash: FileHash,
+    blobs: &crate::files::Blobs,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::io::Write;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    send(&mut writer, &Message::Fetch { space, machine, hash: hash.0.to_vec() }).await?;
+    let Message::Blob { size } = receive(&mut reader).await? else {
+        return Err(Error::Protocol("expected blob".into()));
+    };
+    let (path, mut file) = blobs.incoming()?;
+    let mut received = 0u64;
+    loop {
+        match receive(&mut reader).await? {
+            Message::Chunk { data } => {
+                received += data.len() as u64;
+                if received > size {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(Error::Protocol("the blob is longer than announced".into()));
+                }
+                file.write_all(&data).map_err(|e| Error::io(&path, e))?;
+            }
+            Message::Done => break,
+            other => return Err(Error::Protocol(format!("unexpected {other:?}"))),
+        }
+    }
+    file.sync_all().map_err(|e| Error::io(&path, e))?;
+    drop(file);
+    if blobs.finish_incoming(&path, hash)? {
+        Ok(())
+    } else {
+        Err(Error::Protocol("the blob doesn't match its hash".into()))
+    }
 }
 
 /// How far this machine's changes and files have reached the other members.
@@ -464,8 +549,8 @@ mod tests {
         let (one, two) = tokio::io::duplex(1 << 16);
         let (a_tx, a_rx) = broadcast::channel(16);
         let (b_tx, b_rx) = broadcast::channel::<Vec<u8>>(16);
-        let (_a_cursor_tx, a_cursor_rx) = mpsc::channel(4);
-        let (b_cursor_tx, b_cursor_rx) = mpsc::channel(4);
+        let (_a_cursor_tx, a_cursor_rx) = broadcast::channel(4);
+        let (b_cursor_tx, b_cursor_rx) = broadcast::channel(4);
         let (a_events_tx, mut a_events) = mpsc::channel(16);
         let (b_events_tx, mut b_events) = mpsc::channel(16);
         let (a, b) = (p.a.clone(), p.b.clone());
@@ -493,7 +578,7 @@ mod tests {
         assert_eq!(p.b.lock().await.note(note).unwrap().body, "shared!");
         // B's cursor reaches A.
         let selection = Selection { anchor: vec![1], head: vec![1] };
-        b_cursor_tx.send((note, vec![selection.clone()])).await.unwrap();
+        b_cursor_tx.send((note, vec![selection.clone()])).unwrap();
         loop {
             match a_events.recv().await.unwrap() {
                 LiveEvent::Cursor { selections, .. } => {
@@ -506,6 +591,7 @@ mod tests {
         }
         // B closes the note.
         drop(b_tx);
+        drop(b_cursor_tx);
         b_session.await.unwrap().unwrap();
         a_session.await.unwrap().unwrap();
     }

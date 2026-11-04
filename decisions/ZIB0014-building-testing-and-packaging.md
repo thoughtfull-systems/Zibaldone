@@ -67,6 +67,9 @@ Against the criteria:
 
 ## Consequences
 
+- The Linux app depends on GTK 4, libadwaita, and GtkSourceView, which the development environment
+  and the packages provide. It reads PDFs with the `pdftotext` and `pdftoppm` tools, which the
+  packages put on the app's path.
 - `flake.lock` pins nixpkgs and crane for the packages, apart from `devenv.lock`, which pins the
   development environment.
 - The first commit with Rust and TOML files adds their hooks, as AGENTS.md requires.

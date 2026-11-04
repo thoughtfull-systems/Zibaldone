@@ -35,6 +35,13 @@ pub struct MachineConfig {
     /// member, for sync status and smaller exchanges.
     #[serde(default)]
     pub versions: BTreeMap<Id, BTreeMap<Id, Vec<u8>>>,
+    /// The Loro peers this machine has written each space with, which sync status compares
+    /// against what other members hold.
+    #[serde(default)]
+    pub peers: BTreeMap<Id, Vec<u64>>,
+    /// The space that the owner last put a note into, where new notes go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_space: Option<Id>,
 }
 
 /// A space that the machine holds.
@@ -42,6 +49,9 @@ pub struct MachineConfig {
 pub struct SpaceEntry {
     /// The pet name that this machine's owner gave the space.
     pub name: String,
+    /// Whether the owner hid the space's notes from the window.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 /// The machine's store in one channel's data directory.
@@ -68,6 +78,8 @@ impl Store {
                     relay: None,
                     spaces: BTreeMap::new(),
                     versions: BTreeMap::new(),
+                    peers: BTreeMap::new(),
+                    last_space: None,
                 };
                 write_atomic(&path, &serde_json::to_vec_pretty(&config).expect("serializable"))?;
                 config
@@ -120,7 +132,7 @@ impl Store {
     pub fn create_space(&mut self, name: &str) -> Result<Space> {
         let space = Space::create(self.config.id)?;
         let id = space.id()?;
-        self.config.spaces.insert(id, SpaceEntry { name: name.to_owned() });
+        self.config.spaces.insert(id, SpaceEntry { name: name.to_owned(), hidden: false });
         self.save_space(&space)?;
         self.save()?;
         Ok(space)
@@ -141,9 +153,56 @@ impl Store {
         write_atomic(&dir.join(DOCUMENT), &space.snapshot()?)
     }
 
+    /// Records the Loro peer that this process writes `space` with, so sync status can tell this
+    /// machine's changes apart.
+    pub fn record_peer(&mut self, space: &Space) -> Result<()> {
+        let peers = self.config.peers.entry(space.id()?).or_default();
+        let peer = space.doc().peer_id();
+        if !peers.contains(&peer) {
+            peers.push(peer);
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// The blobs of a space on this machine.
+    pub fn blobs(&self, space: Id) -> crate::files::Blobs {
+        crate::files::Blobs::new(self.space_dir(space).join("blobs"))
+    }
+
+    /// The directory that holds each space's directory.
+    pub fn spaces_dir(&self) -> PathBuf {
+        self.dir.join(SPACES)
+    }
+
+    /// Renames a space on this machine.
+    pub fn rename_space(&mut self, space: Id, name: &str) -> Result<()> {
+        if let Some(entry) = self.config.spaces.get_mut(&space) {
+            name.clone_into(&mut entry.name);
+        }
+        self.save()
+    }
+
+    /// Shows or hides a space's notes in the window.
+    pub fn set_hidden(&mut self, space: Id, hidden: bool) -> Result<()> {
+        if let Some(entry) = self.config.spaces.get_mut(&space) {
+            entry.hidden = hidden;
+        }
+        self.save()
+    }
+
+    /// Records the space the owner last put a note into.
+    pub fn set_last_space(&mut self, space: Id) -> Result<()> {
+        if self.config.last_space == Some(space) {
+            return Ok(());
+        }
+        self.config.last_space = Some(space);
+        self.save()
+    }
+
     /// Records a space that arrived through pairing, with the pet name its owner gave it.
     pub fn add_space(&mut self, space: &Space, name: &str) -> Result<()> {
-        self.config.spaces.insert(space.id()?, SpaceEntry { name: name.to_owned() });
+        self.config.spaces.insert(space.id()?, SpaceEntry { name: name.to_owned(), hidden: false });
         self.save_space(space)?;
         self.save()
     }

@@ -530,6 +530,56 @@ pub fn fill_labels(
     out
 }
 
+/// Like `fill_labels`, and also returns where each label went: its position in the stored text and
+/// its length, both in Unicode characters, so an editor can map positions between the two texts.
+pub fn fill_labels_mapped(
+    body: &str,
+    title: &mut dyn FnMut(Id) -> Option<String>,
+    shown: &mut ShownTitles,
+) -> (String, Vec<(usize, usize)>) {
+    let mut out = String::with_capacity(body.len());
+    let mut insertions = Vec::new();
+    let mut last = 0;
+    for link in wikilinks(body) {
+        if link.label.is_some() {
+            continue;
+        }
+        let Some(text) = title(link.target) else { continue };
+        let insert_at = link.range.end - 2;
+        out.push_str(&body[last..insert_at]);
+        let label = format!("|{}", escape_label(&text));
+        insertions.push((body[..insert_at].chars().count(), label.chars().count()));
+        out.push_str(&label);
+        last = insert_at;
+        shown.remember(link.target, &text);
+    }
+    out.push_str(&body[last..]);
+    (out, insertions)
+}
+
+/// Maps a position in the stored text to the editor's text, which has `insertions`.
+pub fn stored_to_shown(position: usize, insertions: &[(usize, usize)]) -> usize {
+    position
+        + insertions.iter().filter(|(at, _)| *at <= position).map(|(_, len)| len).sum::<usize>()
+}
+
+/// Maps a position in the editor's text, which has `insertions`, to the stored text. A position
+/// inside a filled-in label maps to where the label starts.
+pub fn shown_to_stored(position: usize, insertions: &[(usize, usize)]) -> usize {
+    let mut shift = 0;
+    for (at, len) in insertions {
+        let start = at + shift;
+        if position < start {
+            break;
+        }
+        if position < start + len {
+            return *at;
+        }
+        shift += len;
+    }
+    position - shift
+}
+
 /// Removes each label that equals its target's current title or a title the editor showed for it,
 /// so the stored text keeps only labels the owner chose.
 pub fn strip_labels(
@@ -672,5 +722,28 @@ mod tests {
         assert_eq!(wikilink(id(A), Some("a|b]\\c\nd")), format!("[[{A}|a\\|b\\]\\\\c d]]"));
         let link = &wikilinks(&wikilink(id(A), Some("a|b]\\c")))[0];
         assert_eq!(link.label.as_deref(), Some("a|b]\\c"));
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    #[test]
+    fn maps_positions_between_stored_and_shown_text() {
+        let a = "01k97krzh1fcx9rk9fhsgt1de7";
+        let stored = format!("x [[{a}]] y");
+        let mut shown = ShownTitles::default();
+        let (text, insertions) =
+            fill_labels_mapped(&stored, &mut |_| Some("Tí".to_owned()), &mut shown);
+        assert_eq!(text, format!("x [[{a}|Tí]] y"));
+        let close = stored.find("]]").unwrap();
+        assert_eq!(insertions, vec![(close, 3)]);
+        let y_stored = stored.chars().count() - 1;
+        let y_shown = text.chars().count() - 1;
+        assert_eq!(stored_to_shown(y_stored, &insertions), y_shown);
+        assert_eq!(shown_to_stored(y_shown, &insertions), y_stored);
+        assert_eq!(shown_to_stored(close + 1, &insertions), close);
+        assert_eq!(shown_to_stored(0, &insertions), 0);
     }
 }

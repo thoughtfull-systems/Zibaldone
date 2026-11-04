@@ -7,7 +7,14 @@ let
   root = ../.;
   common = {
     # keep-sorted start block=yes
-    buildInputs = [ pkgs.sqlite ];
+    buildInputs = [
+      # keep-sorted start
+      pkgs.gtk4
+      pkgs.gtksourceview5
+      pkgs.libadwaita
+      pkgs.sqlite
+      # keep-sorted end
+    ];
     # mold links far faster than the default linker.
     env.RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
     inherit ((lib.importTOML (root + "/Cargo.toml")).workspace.package) version;
@@ -66,6 +73,7 @@ let
           platforms = lib.platforms.linux;
           # keep-sorted end
         };
+        nativeBuildInputs = common.nativeBuildInputs ++ [ pkgs.wrapGAppsHook4 ];
         postInstall = lib.concatLines (
           rename
           ++ [
@@ -73,6 +81,8 @@ let
             "install -Dm644 ${data}/icons/${appId}.svg -t $out/share/icons/hicolor/scalable/apps"
           ]
         );
+        # The app reads PDFs with the command-line tools from poppler.
+        preFixup = "gappsWrapperArgs+=(--prefix PATH : ${lib.makeBinPath [ pkgs.poppler-utils ]})";
         # keep-sorted end
       }
     );

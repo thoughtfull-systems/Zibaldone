@@ -171,10 +171,10 @@ text without them:
   with the new title, and remembers that title too.
 - **On saving.** The editor removes each label that equals its target's current title or any title
   it gave that target, and keeps every other label as one the owner chose.
-- **Edits.** The editor turns each keystroke into the matching edit of the stored text, with the
-  filled-in labels left out, so links the owner didn't touch cause no edits. For a change it can't
-  map that way, such as a paste over filled-in labels, it applies only the differences between its
-  text, with labels removed, and the stored text.
+- **Edits.** When it commits, the editor removes the filled-in labels from its text and applies only
+  the differences between the result and the stored text, so links the owner didn't touch cause no
+  edits. An editor may instead turn each keystroke into the matching edit of the stored text, which
+  leads to the same changes.
 
 When an editor inserts a wikilink, it stores `[[<id>]]` with the target's canonical identifier. If
 the owner selected text first, it stores the text as the label, with each line break replaced by a

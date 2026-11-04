@@ -30,6 +30,9 @@ pub enum Error {
     /// The search index failed.
     #[error("search index: {0}")]
     Search(#[from] rusqlite::Error),
+    /// Math or a diagram couldn't be drawn.
+    #[error("render: {0}")]
+    Render(String),
     /// A space's document breaks a rule of the space document specification.
     #[error("space: {0}")]
     Space(String),

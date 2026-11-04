@@ -12,11 +12,10 @@ files, and confirm before one drops a file. It follows
 - **Endpoints.** Each running instance has one [iroh] endpoint, whose secret key is the machine's
   Ed25519 secret key, kept in its machine store. Its public key is the `key` in the machine's entry
   in `machines`.
-- **Protocols.** An endpoint accepts three protocols, each named by the string that the two sides
+- **Protocols.** An endpoint accepts two protocols, each named by the string that the two sides
   agree on when a connection opens:
-  - `zib/sync` for exchanging a space's changes and asking about files, as this specification
-    defines;
-  - the [iroh-blobs] protocol, under the string iroh-blobs defines, for transferring blobs;
+  - `zib/sync` for exchanging a space's changes, transferring files, and asking about them, as this
+    specification defines;
   - `zib/pair` for pairing, as the pairing specification defines.
 - **Finding machines.** A machine finds a member by its public key, through iroh's address lookup
   and, on a local network, through multicast Domain Name System (DNS). Outside pairing, a machine
@@ -78,11 +77,14 @@ status and to send only what the other lacks next time.
 
 ## Files
 
-- **Serving.** A machine serves a blob over iroh-blobs only to a machine that's a member of a space
-  whose `files` map lists the blob's hash, and only while it holds the blob whole.
-- **Fetching.** A machine fetches a blob from any holder that's online, and verifies each chunk
-  against the hash as it arrives. Once it holds the whole blob, it adds itself to the blob's
-  `holders`.
+- **Fetching.** A machine fetches a blob on its own `zib/sync` stream, from any holder that's
+  online. It sends `fetch`, with `space`, its own `machine` identifier, and `hash`, the blob's
+  32-byte hash. The holder checks membership as for syncing, and that it holds the blob whole, and
+  replies `error` if either fails. Otherwise it sends `blob`, with `size`, the blob's length in
+  bytes, then the bytes in `chunk` messages, each with `data` of at most 262,144 bytes, then `done`.
+- **Checking.** The fetching machine writes the chunks to a file of its own, stops if they run past
+  `size`, and keeps the file only if its BLAKE3 hash matches. Once it holds the whole blob, it adds
+  itself to the blob's `holders`.
 - **What to fetch.** A machine with the `all` policy fetches every blob in use that it lacks. A
   machine with the `on-demand` policy fetches a blob when the owner opens it, and fetches every blob
   of a derived field, as decision ZIB0004 requires.
@@ -120,10 +122,12 @@ While two machines have the same note open for editing, each sends the other eve
 note's space as it happens.
 
 - **Watching.** When the owner opens a note to edit, the machine opens a stream to each member of
-  the space it can reach, and sends `watch`, with `space`, its own `machine` identifier, and `note`,
-  the note's identifier. The other machine checks membership as for syncing.
+  the space it can reach, and sends `watch`, with `space`, its own `machine` identifier, `note`, the
+  note's identifier, and `version`, its version vector of the space. The other machine checks
+  membership as for syncing.
 - **Joining.** A machine that has the same note open for editing, or opens it later, replies on that
-  stream with `watching`, with the same `note`. From then on, the stream is live in both directions.
+  stream with `watching`, with the same `note` and its own `version`. From then on, the stream is
+  live in both directions.
 - **Changes.** On a live stream, each side sends `updates` with each local change to the space as
   soon as it commits it, gathering changes for at most 50 milliseconds. The editor commits the
   owner's edits to the document as the owner types, at least that often.
@@ -170,4 +174,3 @@ state of each space and when each member last synced.
 
 [cbor]: https://www.rfc-editor.org/rfc/rfc8949
 [iroh]: https://www.iroh.computer/
-[iroh-blobs]: https://github.com/n0-computer/iroh-blobs

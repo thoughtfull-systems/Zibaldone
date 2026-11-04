@@ -21,8 +21,7 @@ The sync library from [decision ZIB0006](ZIB0006-sync-of-spaces-and-files.md), i
   heavy work.
 - **One model.** Every app calls the core and hears from it the same way, so concurrency rules live
   in the core, not in each app.
-- **Fits the libraries.** The model works with iroh and iroh-blobs without adapters between
-  runtimes.
+- **Fits the libraries.** The model works with iroh without adapters between runtimes.
 - **Natural in each language.** Kotlin and the GTK app each use the core through their own idioms
   for asynchronous work.
 - **Room for a browser.** The choice doesn't rule out a WebAssembly build later.
@@ -59,7 +58,7 @@ Against the criteria:
   interface thread only starts calls and receives results.
 - **One model:** the core decides where every piece of work runs, and the apps only await calls and
   receive changes.
-- **Fits the libraries:** iroh and iroh-blobs run on Tokio, the same runtime as everything else.
+- **Fits the libraries:** iroh runs on Tokio, the same runtime as everything else.
 - **Natural in each language:** Kotlin gets `suspend` functions and flows, and Rust's GTK bindings
   await futures on the main loop.
 - **Room for a browser:** the runtime sits behind one module that a browser build can replace.
@@ -85,6 +84,6 @@ Against the criteria:
 - Work for one space runs in order on its task, so a slow operation on a space delays the next one
   on that space. Slow work moves to the blocking pool and reports back when it finishes.
 - A browser build needs its own version of the runtime module, and sync in a browser waits on iroh
-  and iroh-blobs supporting WebAssembly.
+  supporting WebAssembly in full.
 
 [tokio]: https://tokio.rs/

@@ -43,8 +43,8 @@ A work machine shares the work space and must never receive the personal one.
 ## Decision
 
 Sync over [iroh], a Rust library that dials encrypted connections by public key, and transfer files
-with [iroh-blobs]. Record each space's machines in the space's document. A later specification
-defines the protocol.
+over the same protocol as the space's changes. Record each space's machines in the space's document.
+A later specification defines the protocol.
 
 - **Machine keys.** Each machine makes an Ed25519 key pair the first time it syncs and keeps the
   secret key in its own store. The public key is the machine's address. iroh runs Transport Layer
@@ -94,12 +94,12 @@ defines the protocol.
 - **Documents.** A sync of a space is one exchange: each side sends its version vector, then the
   updates the other side lacks. Each side imports the updates into a copy first and checks them, so
   updates from a document that isn't this space never reach the space.
-- **Files.** iroh-blobs fetches a blob by its hash and checks each chunk against BLAKE3's tree as it
-  arrives, so a machine can fetch part of a file, such as a PDF's first pages. A machine with the
-  `all` policy fetches every blob in `files` that it lacks. A machine with the `on demand` policy
-  fetches a blob when the owner opens it, from any holder that's online. Every machine fetches the
-  blob of every derived field. Before a machine drops a blob, it asks an `all` holder over the same
-  connection to confirm that it holds the blob, as decision ZIB0004 requires.
+- **Files.** A machine fetches a blob by its hash from a holder, which serves it only to members of
+  a space that lists it, and checks the whole blob against its BLAKE3 hash before it keeps it. A
+  machine with the `all` policy fetches every blob in `files` that it lacks. A machine with the
+  `on demand` policy fetches a blob when the owner opens it, from any holder that's online. Every
+  machine fetches the blob of every derived field. Before a machine drops a blob, it asks an `all`
+  holder over the same connection to confirm that it holds the blob, as decision ZIB0004 requires.
 - **Connections.** iroh connects through a relay first, tries a direct path with hole punching, and
   moves the connection there once it works. Machines find each other by public key, through iroh's
   address lookup and, on a local network, through multicast DNS, so members on one network connect
@@ -146,8 +146,8 @@ Against the criteria:
   and hole punching makes most other connections direct.
 - **No server to run:** n0's public relays work out of the box, and the owner can switch to their
   own. An always-on machine is optional.
-- **Files on demand:** iroh-blobs fetches single blobs by hash from any holder and verifies them as
-  they stream.
+- **Files on demand:** a machine fetches single blobs by hash from any holder and verifies them
+  before it keeps them.
 - **Simple pairing:** machines on one network pair with a tap and a glance at two codes. Elsewhere,
   a phone joins by scanning a code, and other machines by opening a link, or, where multicast DNS
   fails, by pasting an address. Every member then syncs with the new one, with no pairing between
@@ -155,6 +155,12 @@ Against the criteria:
 
 ## Rejected alternatives
 
+- **iroh-blobs for files.** It checks each chunk of a file against BLAKE3's tree as it arrives, so a
+  machine could show a PDF's first pages before the rest. But its server answers for one store of
+  blobs per connection, before it knows which space a request is for, so it can't keep each space's
+  blobs apart or serve a blob only to members of the space that lists it. It fails per-space
+  membership. Fetching on `zib/sync` checks membership for each blob, and checks the whole blob
+  against its hash before keeping it.
 - **Trust between each pair of machines, with share identifiers in machine stores.** It keeps
   membership out of the document, but a backup then loses who shares the space, and each new machine
   has to pair with every other one. It fails the self-contained and simple pairing criteria.
@@ -197,7 +203,7 @@ Against the criteria:
 ## Consequences
 
 - Decision ZIB0001's outline gains the root `machines` map.
-- Every implementation reaches iroh and iroh-blobs through the core, on the Tokio runtime that
+- Every implementation reaches iroh through the core, on the Tokio runtime that
   [decision ZIB0011](ZIB0011-concurrency-in-the-core.md) chooses. They add a few megabytes to each
   build.
 - Two machines sync only while both run. Without an always-on machine, a phone with the `on demand`
@@ -220,4 +226,3 @@ Against the criteria:
   machine.
 
 [iroh]: https://www.iroh.computer/
-[iroh-blobs]: https://github.com/n0-computer/iroh-blobs

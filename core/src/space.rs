@@ -451,6 +451,19 @@ impl Space {
         Ok(())
     }
 
+    /// Encodes a position in a note's body, in Unicode characters, as a Loro cursor that stays with
+    /// the same characters as the text around them changes.
+    pub fn cursor_at(&self, id: Id, position: usize) -> Option<Vec<u8>> {
+        let text = self.body(id).ok()?;
+        text.get_cursor(position, loro::cursor::Side::Middle).map(|cursor| cursor.encode())
+    }
+
+    /// The position in Unicode characters that an encoded Loro cursor points to now.
+    pub fn cursor_position(&self, bytes: &[u8]) -> Option<usize> {
+        let cursor = loro::cursor::Cursor::decode(bytes).ok()?;
+        self.doc.get_cursor_pos(&cursor).ok().map(|found| found.current.pos)
+    }
+
     /// Deletes a note for good, leaving a tombstone with its title, in one commit.
     pub fn delete_note(&mut self, id: Id) -> Result<()> {
         let note = self.note(id)?;
