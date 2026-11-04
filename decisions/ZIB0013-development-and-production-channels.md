@@ -63,7 +63,8 @@ Against the criteria:
 
 - **One build with a setting or environment variable for the data directory.** It needs one build
   only, but a forgotten variable runs a development change on production data. It fails safe by
-  default.
+  default. [Decision ZIB0015](ZIB0015-isolated-development-instances.md) adds a variable that only
+  the development build reads, which can't reach production data.
 - **Separate user accounts for development.** They keep data apart, but the owner would switch
   accounts to try a change, and the tray of one account doesn't show the other. It fails side by
   side.
