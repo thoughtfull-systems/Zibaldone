@@ -85,6 +85,13 @@ impl Writer<'_> {
             "#set par(justify: true)\n",
             "#show raw: set text(font: \"DejaVu Sans Mono\", size: 0.9em)\n",
             "#show heading: set block(above: 1.4em, below: 0.8em)\n",
+            // The colors the Linux editor gives headings on a light background.
+            "#show heading.where(level: 1): set text(fill: rgb(\"#813d9c\"))\n",
+            "#show heading.where(level: 2): set text(fill: rgb(\"#1a5fb4\"))\n",
+            "#show heading.where(level: 3): set text(fill: rgb(\"#26a269\"))\n",
+            "#show heading.where(level: 4): set text(fill: rgb(\"#c64600\"))\n",
+            "#show heading.where(level: 5): set text(fill: rgb(\"#c64600\"))\n",
+            "#show heading.where(level: 6): set text(fill: rgb(\"#c64600\"))\n",
             "#show link: set text(fill: rgb(\"#1a5fb4\"))\n\n",
         ));
     }
@@ -438,7 +445,7 @@ mod tests {
     fn prints_notes_to_pdf() {
         let target = Id::generate();
         let body = [
-            "# Title *with* emphasis\n\n",
+            "# Title *with* emphasis\n\n## Second\n\n#### Fourth\n\n",
             "Some **strong** text, ==highlight==, `code`, and $x^2$.\n\n",
             &format!("See [[{target}]] and [[{target}|a label]].\n\n"),
             "- [x] done\n- [ ] todo\n\n",

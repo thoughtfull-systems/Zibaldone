@@ -1,5 +1,4 @@
-//! The main window: the spaces that show, one list of their notes, search, and the note editor
-//! and its preview.
+//! The main window: the spaces that show, one list of their notes, search, and the note editor.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -11,12 +10,14 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use zib_core::body::{self, ShownTitles};
-use zib_core::editing::{LinkTarget, link_at};
+use zib_core::editing::{Drawing, LinkTarget, link_at};
+use zib_core::render::Kind;
 use zib_core::search::{MATCH_END, MATCH_START};
 use zib_core::sync::{LiveEvent, Selection, SyncState};
 use zib_core::{Channel, Id};
 
 use crate::app::core;
+use crate::drawings::Draw;
 use crate::editor;
 use crate::state::State;
 
@@ -50,8 +51,11 @@ pub struct Inner {
     view: sourceview5::View,
     buffer: gtk::TextBuffer,
     backlinks: gtk::MenuButton,
-    preview_toggle: gtk::ToggleButton,
-    preview: gtk::ScrolledWindow,
+    /// The notes opened before the open one, the latest last, and those to go forward to again.
+    back: RefCell<Vec<(Id, Id)>>,
+    forward: RefCell<Vec<(Id, Id)>>,
+    back_button: gtk::Button,
+    forward_button: gtk::Button,
     open_file: gtk::Button,
     status: gtk::Button,
     editor: RefCell<Option<Editor>>,
@@ -68,6 +72,8 @@ struct Editor {
     shown: ShownTitles,
     insertions: Vec<(usize, usize)>,
     titles: HashMap<Id, String>,
+    /// Link targets whose titles the editor asked for, so it asks once.
+    asked: std::collections::HashSet<Id>,
     timer: Option<glib::SourceId>,
     live: Cell<bool>,
     cursors: Option<tokio::sync::broadcast::Sender<(Id, Vec<Selection>)>>,
@@ -138,14 +144,16 @@ impl Window {
         let open_file = gtk::Button::from_icon_name("document-open-symbolic");
         open_file.set_tooltip_text(Some("Open the file"));
         open_file.set_visible(false);
-        let preview_toggle = gtk::ToggleButton::builder()
-            .icon_name("view-reveal-symbolic")
-            .tooltip_text("Preview")
-            .build();
+        let back_button = gtk::Button::from_icon_name("go-previous-symbolic");
+        back_button.set_tooltip_text(Some("Back"));
+        let forward_button = gtk::Button::from_icon_name("go-next-symbolic");
+        forward_button.set_tooltip_text(Some("Forward"));
         let delete = gtk::Button::from_icon_name("user-trash-symbolic");
         delete.set_tooltip_text(Some("Delete the note"));
         let status = gtk::Button::from_icon_name("emblem-synchronizing-symbolic");
         status.add_css_class("flat");
+        content_header.pack_start(&back_button);
+        content_header.pack_start(&forward_button);
         content_header.pack_start(&open_file);
         content_header.pack_end(&status);
         content_header.pack_end(&delete);
@@ -164,12 +172,17 @@ impl Window {
             .tooltip_text("Linked from")
             .build();
         content_header.pack_end(&backlinks);
-        content_header.pack_end(&preview_toggle);
 
-        let view = editor::new_view();
+        let draw: Draw = {
+            let state = state.clone();
+            Rc::new(move |drawing, done| {
+                let (state, drawing) = (state.clone(), drawing.clone());
+                glib::spawn_future_local(async move { done(draw(state, drawing).await) });
+            })
+        };
+        let view = editor::new_view(draw);
         let buffer = view.buffer();
         let editor_scroll = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
-        let preview = gtk::ScrolledWindow::builder().vexpand(true).build();
         let empty = adw::StatusPage::builder()
             .icon_name("accessories-text-editor-symbolic")
             .title(state.channel.display_name())
@@ -178,7 +191,6 @@ impl Window {
         let stack = gtk::Stack::new();
         stack.add_named(&empty, Some("empty"));
         stack.add_named(&editor_scroll, Some("editor"));
-        stack.add_named(&preview, Some("preview"));
         let content = adw::ToolbarView::new();
         content.add_top_bar(&content_header);
         content.set_content(Some(&stack));
@@ -207,14 +219,17 @@ impl Window {
             view: view.clone(),
             buffer,
             backlinks,
-            preview_toggle,
-            preview,
+            back: RefCell::default(),
+            forward: RefCell::default(),
+            back_button,
+            forward_button,
             open_file,
             status,
             editor: RefCell::default(),
             loading: Cell::new(false),
         }));
         this.connect(&new_note, &add_file, &delete, &view);
+        this.update_history();
         this.reload_spaces();
         this.watch_status();
         this
@@ -268,7 +283,9 @@ impl Window {
         let w = self.clone();
         self.inner().open_file.connect_clicked(move |_| w.open_file());
         let w = self.clone();
-        self.inner().preview_toggle.connect_toggled(move |_| w.show_mode());
+        self.inner().back_button.connect_clicked(move |_| w.go(true));
+        let w = self.clone();
+        self.inner().forward_button.connect_clicked(move |_| w.go(false));
         let w = self.clone();
         self.inner().buffer.connect_changed(move |_| w.edited());
         let w = self.clone();
@@ -328,6 +345,61 @@ impl Window {
         });
         actions.add_action(&new_note_in);
         self.inner().window.insert_action_group("win", Some(&actions));
+        self.connect_history();
+    }
+
+    /// Lets Alt+Left and Alt+Right, and a mouse's back and forward buttons, walk the history.
+    fn connect_history(&self) {
+        // The capture phase sees Alt+Left and Alt+Right before the editor, which would move by
+        // words.
+        let keys = gtk::EventControllerKey::builder()
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let w = self.clone();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            let modifiers = modifiers & gtk::accelerator_get_default_mod_mask();
+            if modifiers != gdk::ModifierType::ALT_MASK {
+                return glib::Propagation::Proceed;
+            }
+            match key {
+                gdk::Key::Left | gdk::Key::KP_Left => w.go(true),
+                gdk::Key::Right | gdk::Key::KP_Right => w.go(false),
+                _ => return glib::Propagation::Proceed,
+            }
+            glib::Propagation::Stop
+        });
+        self.inner().window.add_controller(keys);
+        // A mouse's back and forward buttons.
+        let buttons = gtk::GestureClick::builder()
+            .button(0)
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let w = self.clone();
+        buttons.connect_pressed(move |gesture, _, _, _| match gesture.current_button() {
+            8 => w.go(true),
+            9 => w.go(false),
+            _ => {}
+        });
+        self.inner().window.add_controller(buttons);
+    }
+
+    /// Opens the note before the open one in the history, or with `back` false, the one after.
+    fn go(&self, back: bool) {
+        let inner = self.inner();
+        let (from, to) =
+            if back { (&inner.back, &inner.forward) } else { (&inner.forward, &inner.back) };
+        let Some(next) = from.borrow_mut().pop() else { return };
+        if let Some(open) = inner.editor.borrow().as_ref().map(|e| (e.space, e.note)) {
+            to.borrow_mut().push(open);
+        }
+        self.update_history();
+        self.load_note(next.0, next.1);
+    }
+
+    fn update_history(&self) {
+        let inner = self.inner();
+        inner.back_button.set_sensitive(!inner.back.borrow().is_empty());
+        inner.forward_button.set_sensitive(!inner.forward.borrow().is_empty());
     }
 
     /// The space that new notes and files go into: the one the owner last used, if it shows, or
@@ -503,7 +575,6 @@ impl Window {
             if let Ok(note) = core(async move { state.create_note(space, "").await }).await {
                 w.reload_notes();
                 w.open_note(space, note);
-                w.inner().preview_toggle.set_active(false);
             }
         });
     }
@@ -526,14 +597,34 @@ impl Window {
                 return;
             }
             w.close_editor();
+            for history in [&w.inner().back, &w.inner().forward] {
+                history.borrow_mut().retain(|&(_, id)| id != note);
+            }
+            w.update_history();
             let _ = core(async move { state.delete_note(space, note).await }).await;
             w.inner().stack.set_visible_child_name("empty");
             w.reload_notes();
         });
     }
 
-    /// Opens a note in the editor: syncs its space, starts live sessions, and fills in labels.
+    /// Opens a note in the editor, and adds the open one to the history.
     pub fn open_note(&self, space: Id, note: Id) {
+        let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
+        if let Some(open) = open.filter(|&(_, open)| open != note) {
+            let mut back = self.inner().back.borrow_mut();
+            back.push(open);
+            // The history stops growing at a length nobody walks back through.
+            if back.len() > 100 {
+                back.remove(0);
+            }
+            self.inner().forward.borrow_mut().clear();
+        }
+        self.update_history();
+        self.load_note(space, note);
+    }
+
+    /// Loads a note into the editor: syncs its space, starts live sessions, and fills in labels.
+    fn load_note(&self, space: Id, note: Id) {
         self.close_editor();
         let w = self.clone();
         let state = self.inner().state.clone();
@@ -566,6 +657,7 @@ impl Window {
                 shown,
                 insertions,
                 titles,
+                asked: std::collections::HashSet::new(),
                 timer: None,
                 live: Cell::new(false),
                 cursors: None,
@@ -621,8 +713,8 @@ impl Window {
         if self.inner().loading.get() {
             return;
         }
-        let mut editor = self.inner().editor.borrow_mut();
-        let Some(editor) = editor.as_mut() else { return };
+        let mut open = self.inner().editor.borrow_mut();
+        let Some(editor) = open.as_mut() else { return };
         if let Some(timer) = editor.timer.take() {
             timer.remove();
         }
@@ -634,6 +726,69 @@ impl Window {
             }
             w.commit();
         }));
+        drop(open);
+        self.fill_new_labels();
+    }
+
+    /// Gives links the owner wrote without a label their target's title, as links show when a
+    /// note opens, asking the core for titles the editor lacks.
+    fn fill_new_labels(&self) {
+        let text = editor::text(&self.inner().buffer);
+        let links = body::wikilinks(&text);
+        let (note, wanted) = {
+            let mut editor = self.inner().editor.borrow_mut();
+            let Some(editor) = editor.as_mut() else { return };
+            let wanted: Vec<Id> = links
+                .iter()
+                .filter(|link| link.label.is_none() && !editor.titles.contains_key(&link.target))
+                .map(|link| link.target)
+                .filter(|target| editor.asked.insert(*target))
+                .collect();
+            (editor.note, wanted)
+        };
+        if wanted.is_empty() {
+            // After the buffer finishes reporting the change that called this.
+            let w = self.clone();
+            glib::idle_add_local_once(move || w.insert_labels());
+            return;
+        }
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            let titles = core(async move { state.titles(&wanted).await }).await;
+            if let Some(editor) = w.inner().editor.borrow_mut().as_mut().filter(|e| e.note == note)
+            {
+                editor.titles.extend(titles);
+            }
+            w.insert_labels();
+        });
+    }
+
+    /// Puts the title the editor knows into each link without a label, except a link the cursor is
+    /// in, which the owner may still be writing.
+    fn insert_labels(&self) {
+        let buffer = &self.inner().buffer;
+        let text = editor::text(buffer);
+        let cursor = editor::byte_at(&text, buffer.cursor_position());
+        let mut labels = Vec::new();
+        {
+            let mut editor = self.inner().editor.borrow_mut();
+            let Some(editor) = editor.as_mut() else { return };
+            for link in body::wikilinks(&text) {
+                let typing = link.range.start < cursor && cursor < link.range.end;
+                let title = editor.titles.get(&link.target).filter(|title| !title.is_empty());
+                let Some(title) = title.filter(|_| link.label.is_none() && !typing) else {
+                    continue;
+                };
+                editor.shown.remember(link.target, title);
+                let at = text[..link.range.end - 2].chars().count();
+                labels.push((at, format!("|{}", body::escape_label(title))));
+            }
+        }
+        // From the end, so each insertion leaves the offsets before it as they were.
+        for (at, label) in labels.into_iter().rev() {
+            buffer.insert(&mut buffer.iter_at_offset(i32::try_from(at).unwrap_or(0)), &label);
+        }
     }
 
     /// Stores the editor's text without filled-in labels, applying only the differences.
@@ -646,15 +801,16 @@ impl Window {
             let titles = editor.titles.clone();
             let stripped =
                 body::strip_labels(&text, &mut |id| titles.get(&id).cloned(), &editor.shown);
-            if stripped == editor.stored {
-                return;
-            }
-            editor.stored.clone_from(&stripped);
-            // Labels the owner kept, and new links, change where filled-in labels sit.
+            // Labels the owner kept, and new links and their filled-in labels, change where
+            // filled-in labels sit, even when the stored text stays the same.
             let mut shown = editor.shown.clone();
             let (_, insertions) =
                 body::fill_labels_mapped(&stripped, &mut |id| titles.get(&id).cloned(), &mut shown);
             editor.insertions = insertions;
+            if stripped == editor.stored {
+                return;
+            }
+            editor.stored.clone_from(&stripped);
             (editor.space, editor.note, stripped)
         };
         self.update_title();
@@ -761,9 +917,6 @@ impl Window {
             w.set_text(&text);
             buffer.place_cursor(&buffer.iter_at_offset(cursor.min(buffer.char_count())));
             w.update_title();
-            if w.inner().preview_toggle.is_active() {
-                w.show_mode();
-            }
         });
     }
 
@@ -841,34 +994,10 @@ impl Window {
         });
     }
 
-    /// Shows the editor or the preview.
+    /// Shows the editor, or the empty page when no note is open.
     fn show_mode(&self) {
-        // The preview shows what's stored, so typing that waits to commit goes first.
-        if self.inner().preview_toggle.is_active() {
-            let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
-            if let Some(timer) = pending {
-                timer.remove();
-                self.commit();
-            }
-        }
-        let open = self
-            .inner()
-            .editor
-            .borrow()
-            .as_ref()
-            .map(|e| (e.space, e.stored.clone(), e.titles.clone()));
-        let Some((space, stored, titles)) = open else {
-            self.inner().stack.set_visible_child_name("empty");
-            return;
-        };
-        if self.inner().preview_toggle.is_active() {
-            let preview =
-                crate::preview::build(&self.0.state, space, &stored, &titles, self.clone());
-            self.inner().preview.set_child(Some(&preview));
-            self.inner().stack.set_visible_child_name("preview");
-        } else {
-            self.inner().stack.set_visible_child_name("editor");
-        }
+        let open = self.inner().editor.borrow().is_some();
+        self.inner().stack.set_visible_child_name(if open { "editor" } else { "empty" });
     }
 
     fn pick_files(&self) {
@@ -1091,9 +1220,11 @@ impl Window {
         let entry = gtk::SearchEntry::builder().placeholder_text("Link to a note").build();
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
+        // A minimum height keeps several notes in view when the popover has little room.
         let scroll = gtk::ScrolledWindow::builder()
             .child(&list)
             .min_content_width(360)
+            .min_content_height(240)
             .max_content_height(320)
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1132,13 +1263,18 @@ impl Window {
             }
         };
         fill(String::new());
+        // Whether the owner picked a note. The link goes in once its title arrives, so the marks
+        // outlive the popover.
+        let chosen = Rc::new(Cell::new(false));
         let pick = {
             let (w, popover, found) = (self.clone(), popover.clone(), found.clone());
-            let (start, end) = (start.clone(), end.clone());
+            let (start, end, chosen) = (start.clone(), end.clone(), chosen.clone());
             move |index: i32| {
                 let target =
                     usize::try_from(index).ok().and_then(|i| found.borrow().get(i).copied());
-                if let Some(target) = target {
+                if let Some(target) = target
+                    && !chosen.replace(true)
+                {
                     w.insert_link(&start, &end, target, label.clone());
                 }
                 popover.popdown();
@@ -1154,9 +1290,11 @@ impl Window {
         entry.connect_stop_search(move |_| closing.popdown());
         let w = self.clone();
         popover.connect_closed(move |popover| {
-            let buffer = &w.inner().buffer;
-            buffer.delete_mark(&start);
-            buffer.delete_mark(&end);
+            if !chosen.get() {
+                let buffer = &w.inner().buffer;
+                buffer.delete_mark(&start);
+                buffer.delete_mark(&end);
+            }
             w.inner().view.grab_focus();
             let popover = popover.clone();
             glib::idle_add_local_once(move || popover.unparent());
@@ -1198,8 +1336,9 @@ impl Window {
             .collect()
     }
 
-    /// Replaces the text between two marks with a link to `target`. A link without a label the
-    /// owner chose shows its target's title, which the editor removes again when it commits.
+    /// Replaces the text between two marks with a link to `target`, and deletes the marks. A link
+    /// without a label the owner chose shows its target's title, which the editor removes again
+    /// when it commits.
     fn insert_link(
         &self,
         start: &gtk::TextMark,
@@ -1210,6 +1349,7 @@ impl Window {
         let w = self.clone();
         let state = self.inner().state.clone();
         let (start, end) = (start.clone(), end.clone());
+        let open = self.inner().editor.borrow().as_ref().map(|e| e.note);
         glib::spawn_future_local(async move {
             let link = if let Some(label) = label {
                 body::wikilink(target, Some(&label))
@@ -1227,11 +1367,14 @@ impl Window {
                 }
             };
             let buffer = &w.inner().buffer;
-            if start.is_deleted() || end.is_deleted() {
-                return;
-            }
             let mut from = buffer.iter_at_mark(&start);
             let mut to = buffer.iter_at_mark(&end);
+            buffer.delete_mark(&start);
+            buffer.delete_mark(&end);
+            // Another note took the editor while the title loaded.
+            if w.inner().editor.borrow().as_ref().map(|e| e.note) != open {
+                return;
+            }
             buffer.begin_user_action();
             buffer.delete(&mut from, &mut to);
             buffer.insert(&mut from, &link);
@@ -1426,4 +1569,56 @@ fn arrow_keys(list: &gtk::ListBox) -> gtk::EventControllerKey {
         glib::Propagation::Stop
     });
     keys
+}
+
+/// Draws math, a diagram, or an embedded image for the editor, at its natural size. Math that
+/// can't be drawn keeps its source in the line; a block that can't shows its source and the error.
+async fn draw(state: Arc<State>, drawing: Drawing) -> Option<gtk::Widget> {
+    let (kind, source) = match drawing {
+        Drawing::InlineMath(source) => (Kind::InlineMath, source),
+        Drawing::DisplayMath(source) => (Kind::DisplayMath, source),
+        Drawing::Diagram(source) => (Kind::Mermaid, source),
+        Drawing::Embed(target) => return embedded_image(state, target).await,
+    };
+    let shown = source.clone();
+    match core(async move { state.render(kind, source).await }).await {
+        Ok(image) => {
+            let texture = gdk::Texture::from_bytes(&glib::Bytes::from(&image.png)).ok()?;
+            let picture = gtk::Picture::for_paintable(&texture);
+            picture.set_can_shrink(true);
+            picture.set_size_request(
+                i32::try_from(image.width).unwrap_or(1),
+                i32::try_from(image.height).unwrap_or(1),
+            );
+            Some(picture.upcast())
+        }
+        Err(_) if kind == Kind::InlineMath => None,
+        Err(error) => {
+            let label = gtk::Label::builder()
+                .label(format!("{}\n{error}", shown.trim()))
+                .xalign(0.0)
+                .build();
+            label.add_css_class("error");
+            label.add_css_class("monospace");
+            Some(label.upcast())
+        }
+    }
+}
+
+/// The picture of an image note, for an embed of it. Embeds of other notes stay links.
+async fn embedded_image(state: Arc<State>, target: Id) -> Option<gtk::Widget> {
+    let path = core(async move {
+        let space = state.find_note(target).await?;
+        if state.note(space, target).await.ok()?.type_name != "image" {
+            return None;
+        }
+        let (hash, _) = state.note_file(space, target, "image").await.ok()??;
+        state.blob_path(space, hash).await.ok()
+    })
+    .await?;
+    let texture = gdk::Texture::from_filename(&path).ok()?;
+    let picture = gtk::Picture::for_paintable(&texture);
+    picture.set_can_shrink(true);
+    picture.set_size_request(texture.width(), texture.height());
+    Some(picture.upcast())
 }

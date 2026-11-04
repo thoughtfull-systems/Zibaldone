@@ -2,6 +2,7 @@
 //! Mermaid diagrams, and resvg to turn their SVG into PNG for the apps. Results stay in the cache
 //! directory, keyed by a hash of their source.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -23,7 +24,7 @@ impl Kind {
             Self::InlineMath => "inline-math",
             Self::DisplayMath => "display-math",
             // Diagrams drawn before their labels became SVG text lack labels, so they cache anew.
-            Self::Mermaid => "mermaid-2",
+            Self::Mermaid => "mermaid-3",
         }
     }
 }
@@ -109,9 +110,80 @@ pub fn mermaid_svg(source: &str) -> Result<String> {
         .render(RenderRequest::svg(&source, OperationControl::new(), SvgRequest::default()))
         .map_err(|e| Error::Render(e.to_string()))?;
     match output {
-        RenderOutput::Svg(Some(svg)) => Ok(svg.svg().to_owned()),
+        RenderOutput::Svg(Some(svg)) => Ok(foreign_labels(svg.svg())),
         _ => Err(Error::Render("no Mermaid diagram found".into())),
     }
+}
+
+/// Replaces the HTML labels that some diagrams, such as mind maps, draw whatever the settings say,
+/// with SVG text centered where they were. Labels inside a `<switch>` already have SVG text to fall
+/// back to, and stay.
+fn foreign_labels(svg: &str) -> String {
+    const OPEN: &str = "<foreignObject";
+    const CLOSE: &str = "</foreignObject>";
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(start) = rest.find(OPEN) {
+        let Some(end) = rest[start..].find(CLOSE).map(|i| start + i + CLOSE.len()) else { break };
+        let before = &rest[..start];
+        out.push_str(before);
+        let element = &rest[start..end];
+        if before.trim_end().ends_with("<switch>") {
+            out.push_str(element);
+        } else {
+            out.push_str(&label_text(element));
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// SVG text for the content of a `<foreignObject>`, a line for each paragraph or line break.
+fn label_text(element: &str) -> String {
+    let tag_end = element.find('>').map_or(element.len(), |i| i + 1);
+    let number = |name: &str| attribute(&element[..tag_end], name).unwrap_or(0.0);
+    let (x, y) = (number("x") + number("width") / 2.0, number("y") + number("height") / 2.0);
+    let mut lines = vec![String::new()];
+    let mut inside = &element[tag_end..];
+    while !inside.is_empty() {
+        if let Some(tag) = inside.strip_prefix('<') {
+            let close = tag.find('>').map_or(tag.len(), |i| i + 1);
+            let breaks = tag.starts_with("br") || tag.starts_with("/p>");
+            if breaks && !lines.last().is_some_and(String::is_empty) {
+                lines.push(String::new());
+            }
+            inside = &tag[close..];
+        } else {
+            let text_end = inside.find('<').unwrap_or(inside.len());
+            if let Some(line) = lines.last_mut() {
+                line.push_str(&inside[..text_end]);
+            }
+            inside = &inside[text_end..];
+        }
+    }
+    let lines: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    // Lines sit 1.5em apart, as Mermaid's labels do, centered on the label's middle.
+    #[allow(clippy::cast_precision_loss)]
+    let first = -0.75 * (lines.len() - 1) as f64;
+    let mut text =
+        format!("<text x=\"{x}\" y=\"{y}\" text-anchor=\"middle\" dominant-baseline=\"central\">");
+    for (i, line) in lines.iter().enumerate() {
+        let dy = if i == 0 { first } else { 1.5 };
+        let _ = write!(text, "<tspan x=\"{x}\" dy=\"{dy}em\">{line}</tspan>");
+    }
+    text.push_str("</text>");
+    text
+}
+
+/// The number in an attribute of an element's start tag.
+fn attribute(start_tag: &str, name: &str) -> Option<f64> {
+    let at = start_tag.find(&format!(" {name}=\""))? + name.len() + 3;
+    let value = &start_tag[at..];
+    value[..value.find('"')?].parse().ok()
 }
 
 /// The system's fonts, loaded once, for the text in diagrams.
@@ -171,5 +243,20 @@ mod tests {
             renderer.image(Kind::Mermaid, "flowchart LR\n  idea --> draft --> note").unwrap();
         assert!(diagram.width > 20);
         assert!(renderer.image(Kind::Mermaid, "not a diagram at all").is_err());
+    }
+
+    #[test]
+    fn draws_html_labels_as_svg_text() {
+        let svg = mermaid_svg("mindmap\n  root((Root))\n    Child one").unwrap();
+        assert!(!svg.contains("<foreignObject"));
+        assert!(svg.contains(">Root</tspan>") && svg.contains(">Child one</tspan>"));
+        let label = label_text(concat!(
+            "<foreignObject x=\"10\" width=\"40\" height=\"20\"><div><p>One &amp; two</p>",
+            "<p>three<br/>four</p></div></foreignObject>"
+        ));
+        assert_eq!(label.matches("<tspan x=\"30\"").count(), 3);
+        assert!(label.contains("y=\"10\"") && label.contains(">One &amp; two</tspan>"));
+        let kept = "<switch><foreignObject width=\"1\"><div>a</div></foreignObject><text>a</text>";
+        assert_eq!(foreign_labels(kept), kept);
     }
 }

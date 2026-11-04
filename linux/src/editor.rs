@@ -9,8 +9,10 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, glib, pango};
 use sourceview5::prelude::*;
-use zib_core::editing::{Span, Style, spans, toggle_checkbox};
+use zib_core::editing::{Drawn, Span, Style, drawings as find_drawings, spans, toggle_checkbox};
 use zib_core::lists::{ListKey, list_edit};
+
+use crate::drawings::{Draw, Drawings};
 
 const CODE_BLOCK_SHADE: &str = "markup-code-block-shade";
 /// The colors of headings' text, kept apart from the heading tags so a heading's markers keep the
@@ -35,7 +37,7 @@ pub const REMOTE: &str = "remote";
 const SYNTAX: &str = "markup-syntax";
 
 /// Creates the editor view. Its colors follow the system's light or dark preference.
-pub fn new_view() -> sourceview5::View {
+pub fn new_view(draw: Draw) -> sourceview5::View {
     let buffer = sourceview5::Buffer::new(None);
     buffer.set_highlight_matching_brackets(false);
     let style_manager = adw::StyleManager::default();
@@ -61,7 +63,7 @@ pub fn new_view() -> sourceview5::View {
     view.set_left_margin(24);
     view.set_right_margin(24);
     view.set_vexpand(true);
-    attach_preview(&buffer);
+    attach_preview(&buffer, Drawings::new(view.upcast_ref(), draw, HIDDEN));
     // A tag's margin replaces the view's margin rather than adding to it, so the quote margin
     // follows the view's.
     let indent_quotes = |view: &sourceview5::View| {
@@ -248,6 +250,9 @@ struct Preview {
     /// Whether each span's syntax is showing.
     revealed: Vec<bool>,
     spans: Vec<Span>,
+    /// The math, diagrams, and embeds drawn over their source, and whether each source shows.
+    drawn: Vec<Drawn>,
+    drawn_revealed: Vec<bool>,
 }
 
 impl Preview {
@@ -421,17 +426,19 @@ const STYLES: [Style; 18] = [
     Style::Underline,
 ];
 
-fn attach_preview(buffer: &sourceview5::Buffer) {
+fn attach_preview(buffer: &sourceview5::Buffer, drawings: Rc<Drawings>) {
     let preview = Rc::new(RefCell::new(Preview::default()));
     buffer.connect_changed({
-        let preview = preview.clone();
+        let (preview, drawings) = (preview.clone(), drawings.clone());
         move |buffer| {
-            contain_panic(|| restyle(buffer.upcast_ref(), &mut preview.borrow_mut()));
+            contain_panic(|| {
+                restyle(buffer.upcast_ref(), &mut preview.borrow_mut(), &drawings);
+            });
         }
     });
     buffer.connect_mark_set(move |buffer, _, mark| {
         if *mark == buffer.get_insert() || *mark == buffer.selection_bound() {
-            contain_panic(|| reveal(buffer.upcast_ref(), &mut preview.borrow_mut()));
+            contain_panic(|| reveal(buffer.upcast_ref(), &mut preview.borrow_mut(), &drawings));
         }
     });
 }
@@ -444,7 +451,7 @@ fn contain_panic(f: impl FnOnce()) {
 }
 
 /// Styles every span from scratch, after the text changes.
-fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview) {
+fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings) {
     let (start, end) = buffer.bounds();
     let names = [CODE_BLOCK_SHADE, HIDDEN, QUOTE_MARGIN, SYNTAX]
         .into_iter()
@@ -504,10 +511,21 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview) {
             }
         }
     }
+    // After the spans, whose hidden syntax a drawing's source can hold.
+    preview.drawn = find_drawings(&body);
+    preview.drawn_revealed = preview.drawn.iter().map(|drawn| drawn.touches(&selection)).collect();
+    let found = preview
+        .drawn
+        .iter()
+        .zip(&preview.drawn_revealed)
+        .map(|(drawn, &revealed)| (drawn.clone(), preview.chars(&drawn.range), revealed))
+        .collect();
+    drawings.update(buffer, found);
 }
 
-/// Shows the syntax of spans the cursor now touches, and hides it for spans it left.
-fn reveal(buffer: &gtk::TextBuffer, preview: &mut Preview) {
+/// Shows the syntax of spans the cursor now touches, and hides it for spans it left, and does the
+/// same for the source of drawings.
+fn reveal(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings) {
     // Marks can move before the buffer reports a change, while the spans are stale.
     if preview.char_bytes.len() != usize::try_from(buffer.char_count()).unwrap_or(0) + 1 {
         return;
@@ -528,6 +546,13 @@ fn reveal(buffer: &gtk::TextBuffer, preview: &mut Preview) {
             } else {
                 buffer.apply_tag_by_name(HIDDEN, &start, &end);
             }
+        }
+    }
+    for i in 0..preview.drawn.len() {
+        let revealed = preview.drawn[i].touches(&selection);
+        if revealed != preview.drawn_revealed[i] {
+            preview.drawn_revealed[i] = revealed;
+            drawings.reveal(buffer, i, revealed);
         }
     }
 }

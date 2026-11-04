@@ -164,6 +164,89 @@ pub fn spans(body: &str) -> Vec<Span> {
     spans
 }
 
+/// What an editor draws in place of an element's source while the cursor is away from it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum Drawing {
+    InlineMath(String),
+    DisplayMath(String),
+    Diagram(String),
+    Embed(Id),
+}
+
+/// An element that an editor draws.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Drawn {
+    /// Byte range of the element's source, which ends before any line break that follows it.
+    pub range: Range<usize>,
+    pub drawing: Drawing,
+    /// Whether the source fills its lines, so the drawing takes their place, rather than sitting
+    /// inside a line of text.
+    pub block: bool,
+}
+
+impl Drawn {
+    /// Whether the cursor or selection `range` touches the element, so its source should show.
+    pub fn touches(&self, range: &Range<usize>) -> bool {
+        self.range.start <= range.end && range.start <= self.range.end
+    }
+}
+
+/// Finds the math, diagrams, and embeds of `body` that an editor draws, ordered by where they
+/// start.
+pub fn drawings(body: &str) -> Vec<Drawn> {
+    let fills_lines = |range: &Range<usize>| {
+        let line_start = body[..range.start].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = body[range.end..].find('\n').map_or(body.len(), |i| range.end + i);
+        body[line_start..range.start].trim().is_empty()
+            && body[range.end..line_end].trim().is_empty()
+    };
+    let mut drawn = Vec::new();
+    let mut code: Option<(Range<usize>, String, String)> = None;
+    for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+        match event {
+            Event::InlineMath(source) => drawn.push(Drawn {
+                range,
+                drawing: Drawing::InlineMath(source.into_string()),
+                block: false,
+            }),
+            Event::DisplayMath(source) => {
+                let block = fills_lines(&range);
+                drawn.push(Drawn {
+                    range,
+                    drawing: Drawing::DisplayMath(source.into_string()),
+                    block,
+                });
+            }
+            Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(language))) => {
+                let language = language.split_whitespace().next().unwrap_or("").to_owned();
+                code = Some((range, language, String::new()));
+            }
+            Event::Text(text) => {
+                if let Some((_, _, source)) = code.as_mut() {
+                    source.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                let Some((range, language, source)) = code.take() else { continue };
+                let drawing = match language.as_str() {
+                    "math" => Drawing::DisplayMath(source),
+                    "mermaid" => Drawing::Diagram(source),
+                    _ => continue,
+                };
+                let end = range.start + body[range.clone()].trim_end_matches(['\n', '\r']).len();
+                drawn.push(Drawn { range: range.start..end, drawing, block: true });
+            }
+            _ => {}
+        }
+    }
+    for link in body::wikilinks(body).into_iter().filter(|link| link.embed) {
+        let block = fills_lines(&link.range);
+        drawn.push(Drawn { range: link.range, drawing: Drawing::Embed(link.target), block });
+    }
+    drawn.sort_by_key(|drawn| drawn.range.start);
+    drawn
+}
+
 /// Where a link points.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LinkTarget {
@@ -381,6 +464,33 @@ mod tests {
             .into_iter()
             .map(|span| (span.style, span.syntax.iter().map(|r| &body[r.clone()]).collect()))
             .collect()
+    }
+
+    #[test]
+    fn finds_drawings() {
+        let target = Id::generate();
+        let body = [
+            "Inline $x^2$ here.\n\n$$\na + b\n$$\n\n",
+            "```mermaid\nflowchart LR\n  a --> b\n```\n\n```rust\nfn main() {}\n```\n\n",
+            &format!("![[{target}]]\n\nSee ![[{target}]] inline."),
+        ]
+        .concat();
+        let found: Vec<(&str, Drawing, bool)> =
+            drawings(&body).into_iter().map(|d| (&body[d.range], d.drawing, d.block)).collect();
+        assert_eq!(
+            found,
+            [
+                ("$x^2$", Drawing::InlineMath("x^2".into()), false),
+                ("$$\na + b\n$$", Drawing::DisplayMath("\na + b\n".into()), true),
+                (
+                    "```mermaid\nflowchart LR\n  a --> b\n```",
+                    Drawing::Diagram("flowchart LR\n  a --> b\n".into()),
+                    true
+                ),
+                (&format!("![[{target}]]"), Drawing::Embed(target), true),
+                (&format!("![[{target}]]"), Drawing::Embed(target), false),
+            ]
+        );
     }
 
     #[test]
