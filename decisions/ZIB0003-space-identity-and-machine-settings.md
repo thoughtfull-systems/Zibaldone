@@ -66,11 +66,12 @@ space's pet name, and every machine setting, in a store that belongs to the mach
 - **One instance per machine.** On each machine, one instance of Zib runs at a time, and only it
   loads and writes the spaces' documents, stores their blobs, and syncs them. It takes a lock when
   it starts, which the operating system releases if it dies.
-  - **Linux.** Starting the app while an instance runs brings that instance's window to the front,
-    and the new process exits. The `zib` command never opens a space itself: it sends each command
-    to the running instance over a Unix socket, and starts the instance first if none runs. On a
-    machine without a desktop, such as a small server, the instance runs without a window, as a
-    background service.
+  - **Linux.** The owner starts Zib through the `zib` command, which never opens a space itself: it
+    sends each command to the running instance over a Unix socket, and starts the instance first if
+    none runs. With no command, it opens the instance's window, so the desktop entry runs `zib`. The
+    instance starts with only an icon in the system tray, opens its window when asked, keeps running
+    when the window closes, and quits only when the owner chooses to. On a machine without a
+    desktop, such as a small server, it runs with neither tray icon nor window.
   - **Browser.** Each tab runs the app, so the first tab takes the lock through the Web Locks
     interface and holds the spaces. Other tabs read and change them through that tab, over a
     broadcast channel. When it closes, another tab takes the lock.
@@ -125,9 +126,9 @@ Against the criteria:
 - **Separate machine identities for the Linux app and the `zib` command.** Neither would wait for
   the other. But one computer would hold two copies of every space and its files, sync with itself,
   and show as two machines.
-- **A lock that makes a second instance fail.** It's the simplest rule, but a second launch of the
-  app would show an error instead of the window, and a second browser tab couldn't show the space at
-  all.
+- **A lock alone, with no way to reach the instance.** It's the simplest rule, but launching Zib
+  again couldn't bring up the window, the `zib` command couldn't work while the app runs, and a
+  second browser tab couldn't show the space at all.
 
 ## Consequences
 

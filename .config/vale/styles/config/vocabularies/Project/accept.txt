@@ -39,4 +39,5 @@ Tauri
 Tokio('s)?
 Typst
 UniFFI
+Waybar('s)?
 Yjs
