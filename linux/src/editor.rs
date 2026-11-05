@@ -7,9 +7,11 @@ use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::{gdk, glib, pango};
+use gtk::{gdk, glib, graphene, pango};
 use sourceview5::prelude::*;
-use zib_core::editing::{Drawn, Span, Style, drawings as find_drawings, spans, toggle_checkbox};
+use zib_core::editing::{
+    Drawn, Span, Style, drawings as find_drawings, spans, table_cell_in_body, toggle_checkbox,
+};
 use zib_core::lists::{ListKey, list_edit};
 
 use crate::drawings::{Draw, Drawings};
@@ -451,6 +453,7 @@ fn attach_preview(view: &sourceview5::View, drawings: Rc<Drawings>) {
     let buffer = view.buffer();
     let preview = Rc::new(RefCell::new(Preview::default()));
     let pressed = Rc::new(Cell::new(false));
+    attach_block_entry(view, &preview, &drawings);
     buffer.connect_changed({
         let (preview, drawings) = (preview.clone(), drawings.clone());
         move |buffer| {
@@ -478,11 +481,12 @@ fn attach_preview(view: &sourceview5::View, drawings: Rc<Drawings>) {
         buffer,
         #[upgrade_or]
         glib::Propagation::Proceed,
-        move |_, event| {
+        move |controller, event| {
             match event.event_type() {
                 gdk::EventType::ButtonPress => pressed.set(true),
                 gdk::EventType::ButtonRelease if pressed.replace(false) => {
-                    place_click(&buffer, &preview.borrow());
+                    let point = controller.widget().and_then(|view| view_point(&view, event));
+                    place_click(&buffer, &preview.borrow(), &drawings, point.as_ref());
                     contain_panic(|| reveal(&buffer, &mut preview.borrow_mut(), &drawings));
                 }
                 _ => {}
@@ -493,6 +497,17 @@ fn attach_preview(view: &sourceview5::View, drawings: Rc<Drawings>) {
     view.add_controller(buttons);
 }
 
+/// Where a pointer event happened, in `view`'s coordinates. Events carry their position on the
+/// window's surface.
+fn view_point(view: &gtk::Widget, event: &gdk::Event) -> Option<graphene::Point> {
+    let native = view.native()?;
+    let (x, y) = event.position()?;
+    let (left, top) = native.surface_transform();
+    #[allow(clippy::cast_possible_truncation)]
+    let point = graphene::Point::new((x - left) as f32, (y - top) as f32);
+    native.compute_point(view, &point)
+}
+
 /// Puts a cursor that a click left at hidden syntax beside the shown character the owner clicked.
 /// GTK finds that character, but then counts the side of it the click fell on in the buffer's
 /// characters, hidden ones included. A click before the first character after hidden syntax lands
@@ -501,7 +516,12 @@ fn attach_preview(view: &sourceview5::View, drawings: Rc<Drawings>) {
 /// lands in the source it covers, and goes to the start of that source, or for a block, such as
 /// display math or a diagram, to the start of its second line, just inside its opening `$$` or
 /// fence. A click on a block lands on its last line, where its room is, so at the end of its range.
-fn place_click(buffer: &gtk::TextBuffer, preview: &Preview) {
+fn place_click(
+    buffer: &gtk::TextBuffer,
+    preview: &Preview,
+    drawings: &Drawings,
+    point: Option<&graphene::Point>,
+) {
     let Some(hidden) = buffer.tag_table().lookup(HIDDEN) else { return };
     if buffer.has_selection() {
         return;
@@ -510,11 +530,21 @@ fn place_click(buffer: &gtk::TextBuffer, preview: &Preview) {
     // The drawings are stale while the text changes before the buffer reports it.
     if preview.char_bytes.len() == usize::try_from(buffer.char_count()).unwrap_or(0) + 1 {
         let clicked = usize::try_from(at.offset()).unwrap_or(0);
-        let drawn = preview.drawn.iter().zip(&preview.drawn_revealed);
-        for (drawn, _) in drawn.filter(|(_, revealed)| !**revealed) {
+        let drawn = preview.drawn.iter().zip(&preview.drawn_revealed).enumerate();
+        for (index, (drawn, _)) in drawn.filter(|(_, (_, revealed))| !**revealed) {
             let chars = preview.chars(&drawn.range);
             let on = if drawn.block { chars.end >= clicked } else { chars.end > clicked };
             if chars.start <= clicked && on {
+                // A click on a table's cell selects the cell's source, to type over it.
+                let cell = point.and_then(|point| drawings.table_cell_at(index, point));
+                let source = cell.and_then(|(row, column, nested)| {
+                    table_cell_in_body(&text(buffer), drawn.range.clone(), row, column, &nested)
+                });
+                if let Some(source) = source {
+                    let at = |byte: usize| buffer.iter_at_offset(offset(preview.byte_chars[byte]));
+                    buffer.select_range(&at(source.end), &at(source.start));
+                    return;
+                }
                 let mut start = buffer.iter_at_offset(offset(chars.start));
                 let mut inside = start;
                 if drawn.block && inside.forward_line() && inside.offset() < offset(chars.end) {
@@ -551,6 +581,91 @@ fn clicked_place(at: &gtk::TextIter, hidden: &gtk::TextTag) -> Option<gtk::TextI
         placed.forward_char();
     }
     Some(placed)
+}
+
+/// Puts the cursor at the start of a hidden block, such as a table or a diagram, when a key moves
+/// it into the block from above. GTK skips hidden lines, so Down would land on the block's last
+/// line, the one that stays to hold the drawing's room. A move that extends the selection shows a
+/// block it heads into first.
+/// Where the cursor was, and the character ranges of the blocks that were hidden, before a move.
+struct BeforeMove {
+    cursor: usize,
+    hidden: Vec<Range<usize>>,
+}
+
+fn attach_block_entry(
+    view: &sourceview5::View,
+    preview: &Rc<RefCell<Preview>>,
+    drawings: &Rc<Drawings>,
+) {
+    let before: Rc<RefCell<Option<BeforeMove>>> = Rc::default();
+    view.connect_move_cursor({
+        let (before, preview, drawings) = (before.clone(), preview.clone(), drawings.clone());
+        move |view, _, count, extend| {
+            let mut preview = preview.borrow_mut();
+            let buffer = view.buffer();
+            let fresh =
+                preview.char_bytes.len() == usize::try_from(buffer.char_count()).unwrap_or(0) + 1;
+            if !fresh {
+                return;
+            }
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            if extend {
+                // A selection that grows into a hidden block shows the block first, so it grows
+                // through the source a character or a line at a time, rather than across all the
+                // hidden lines GTK skips.
+                let (mut near, from) = (cursor, usize::try_from(cursor.offset()).unwrap_or(0));
+                if count > 0 {
+                    near.forward_line();
+                    near.forward_to_line_end();
+                } else {
+                    near.backward_line();
+                }
+                let near = usize::try_from(near.offset()).unwrap_or(0);
+                let mut ahead = Vec::new();
+                for index in 0..preview.drawn.len() {
+                    let chars = preview.chars(&preview.drawn[index].range);
+                    let heading = if count > 0 {
+                        from <= chars.start && chars.start <= near
+                    } else {
+                        near <= chars.end && chars.end <= from
+                    };
+                    if heading && !preview.drawn_revealed[index] {
+                        preview.drawn_revealed[index] = true;
+                        ahead.push(index);
+                    }
+                }
+                // Showing a block can move the cursor, which reads the preview again.
+                drop(preview);
+                for index in ahead {
+                    drawings.reveal(&buffer, index, true);
+                }
+                return;
+            }
+            let hidden = preview
+                .drawn
+                .iter()
+                .zip(&preview.drawn_revealed)
+                .filter(|(drawn, revealed)| drawn.block && !**revealed)
+                .map(|(drawn, _)| preview.chars(&drawn.range))
+                .collect();
+            let cursor = usize::try_from(cursor.offset()).unwrap_or(0);
+            *before.borrow_mut() = Some(BeforeMove { cursor, hidden });
+        }
+    });
+    view.connect_local("move-cursor", true, move |values| {
+        let BeforeMove { cursor: from, hidden } = before.borrow_mut().take()?;
+        let view = values.first()?.get::<sourceview5::View>().ok()?;
+        let buffer = view.buffer();
+        let cursor = usize::try_from(buffer.cursor_position()).unwrap_or(0);
+        let entered = hidden
+            .iter()
+            .find(|chars| from < chars.start && chars.start <= cursor && cursor <= chars.end);
+        if let Some(chars) = entered {
+            buffer.place_cursor(&buffer.iter_at_offset(offset(chars.start)));
+        }
+        None
+    });
 }
 
 /// Runs `f`, and stops a panic in it from going further. A panic can't unwind through a GTK signal

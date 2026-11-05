@@ -158,6 +158,21 @@ impl Drawings {
         self.schedule_place();
     }
 
+    /// The cell at `point`, in the view's coordinates, of the `index`th drawing when it's a table,
+    /// as `tables::cell_at` gives it.
+    pub fn table_cell_at(
+        &self,
+        index: usize,
+        point: &gtk::graphene::Point,
+    ) -> Option<crate::tables::CellPath> {
+        let view = self.view.upgrade()?;
+        let overlays = self.overlays.borrow();
+        let overlay = overlays.get(index)?;
+        let Drawing::Table(_) = overlay.drawn.drawing else { return None };
+        let (widget, _, _) = overlay.widget.as_ref()?;
+        crate::tables::cell_at(widget, view.upcast_ref(), point)
+    }
+
     /// Shows or hides the source of the `index`th drawing as the cursor comes and goes.
     pub fn reveal(&self, buffer: &gtk::TextBuffer, index: usize, revealed: bool) {
         let mut overlays = self.overlays.borrow_mut();
@@ -272,13 +287,36 @@ impl Drawings {
         if overlay.drawn.block {
             let mut last_line = end;
             last_line.set_line_offset(0);
-            if !overlay.revealed {
-                // A block that ends the text keeps its last line, which holds the room below it.
-                let hide_to = if end.is_end() { last_line } else { end };
-                buffer.apply_tag_by_name(self.hidden, &start, &hide_to);
+            if overlay.revealed {
+                overlay.tag.set_property("size-set", false);
+                overlay.tag.set_property("foreground-set", false);
+                overlay.tag.set_property("paragraph-background-set", false);
+            } else {
+                // The last line, which holds the room below it, and the line break before it stay,
+                // tiny and unseen. GTK aborts when it looks for the position at a point below a
+                // line whose line break it hides, as GtkSourceView does while it draws, and as a
+                // click does.
+                let mut shown = last_line;
+                if !shown.backward_char() || shown < start {
+                    shown = end;
+                    shown.backward_char();
+                }
+                buffer.apply_tag_by_name(self.hidden, &start, &shown);
+                buffer.remove_tag_by_name(self.hidden, &shown, &end);
+                overlay.tag.set_size_points(1.0);
+                // GTK draws a fully transparent color as black.
+                overlay.tag.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.004)));
+                // Nor does the shade of a code block show behind the drawing.
+                overlay
+                    .tag
+                    .set_paragraph_background_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.004)));
             }
             overlay.tag.set_pixels_below_lines(height + 2 * PAD);
-            buffer.apply_tag(&overlay.tag, &last_line, &end.max(last_line));
+            let mut tiny = last_line;
+            if overlay.revealed || !tiny.backward_char() || tiny < start {
+                tiny = last_line;
+            }
+            buffer.apply_tag(&overlay.tag, &tiny, &end.max(last_line));
         } else if !overlay.revealed {
             let mut last = end;
             last.backward_char();

@@ -60,15 +60,15 @@ pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
 
 /// Text with up to `indent` spaces taken from the start of each line, and the way back to the
 /// original's offsets.
-struct Dedented {
-    text: String,
+pub(crate) struct Dedented {
+    pub(crate) text: String,
     /// For each line, where it starts in the dedented text and in the original, and how many
     /// spaces it lost.
     lines: Vec<(usize, usize, usize)>,
 }
 
 impl Dedented {
-    fn new(original: &str, indent: usize) -> Self {
+    pub(crate) fn new(original: &str, indent: usize) -> Self {
         let mut text = String::with_capacity(original.len());
         let mut lines = Vec::new();
         let mut start = 0;
@@ -99,7 +99,7 @@ impl Dedented {
     }
 
     /// The original's offset of the dedented offset `at`.
-    fn original(&self, at: usize) -> usize {
+    pub(crate) fn original(&self, at: usize) -> usize {
         let (dedented, from, removed) = self.line(at, false);
         from + removed + (at - dedented)
     }

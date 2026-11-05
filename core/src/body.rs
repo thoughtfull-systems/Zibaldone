@@ -406,18 +406,33 @@ pub fn list_table(info: &str, content: &str) -> Option<ListTable> {
             }
         }
     }
+    let items = cell_items(content)?;
+    table.rows = items
+        .iter()
+        .map(|row| row.iter().map(|item| cell_text(content, item.clone())).collect())
+        .collect();
+    let width = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+    for row in &mut table.rows {
+        row.resize(width, String::new());
+    }
+    Some(table)
+}
+
+/// The byte range of each cell's list item in a list table's `content`, row by row, or `None` when
+/// the content isn't a list of lists.
+fn cell_items(content: &str) -> Option<Vec<Vec<Range<usize>>>> {
+    let mut rows: Vec<Vec<Range<usize>>> = Vec::new();
     let mut depth = 0;
     let mut cell_start: Option<usize> = None;
     for (event, range) in Parser::new_ext(content, options()).into_offset_iter() {
         match event {
             Event::Start(Tag::List(_)) => depth += 1,
             Event::End(TagEnd::List(_)) => depth -= 1,
-            Event::Start(Tag::Item) if depth == 1 => table.rows.push(Vec::new()),
+            Event::Start(Tag::Item) if depth == 1 => rows.push(Vec::new()),
             Event::Start(Tag::Item) if depth == 2 => cell_start = Some(range.start),
             Event::End(TagEnd::Item) if depth == 2 => {
                 let start = cell_start.take()?;
-                let row = table.rows.last_mut()?;
-                row.push(cell_text(content, start..range.end));
+                rows.last_mut()?.push(start..range.end);
             }
             // Anything outside the list makes the block code. A row's content outside its list of
             // cells, such as a label, is ignored.
@@ -425,14 +440,70 @@ pub fn list_table(info: &str, content: &str) -> Option<ListTable> {
             _ => {}
         }
     }
-    if table.rows.is_empty() || table.rows.iter().any(Vec::is_empty) {
+    if rows.is_empty() || rows.iter().any(Vec::is_empty) {
         return None;
     }
-    let width = table.rows.iter().map(Vec::len).max().unwrap_or(0);
-    for row in &mut table.rows {
-        row.resize(width, String::new());
+    Some(rows)
+}
+
+/// The source of a cell's text in the list table with `content`, as a byte range of `content`, past
+/// the cell's marker: the cell at `row` and `column`, or, through `nested`, a cell of a table
+/// inside it. Each step of `nested` picks one of the valid list tables in the cell before it,
+/// counting from 0, then a row and a column of that table. `None` when the table has no such cell,
+/// such as an empty cell that pads a short row.
+pub fn table_cell_source(
+    content: &str,
+    row: usize,
+    column: usize,
+    nested: &[(usize, usize, usize)],
+) -> Option<Range<usize>> {
+    let item = cell_items(content)?.get(row)?.get(column)?.clone();
+    let cell = cell_text(content, item.clone());
+    let source = |range: Range<usize>| {
+        cell_offset(content, item.clone(), range.start)
+            ..cell_offset(content, item.clone(), range.end)
+    };
+    let Some(&(table, inner_row, inner_column)) = nested.first() else {
+        return Some(source(0..cell.len()));
+    };
+    let (block, _) = fenced_blocks(&cell)
+        .into_iter()
+        .filter(|(_, fenced)| matches!(fenced, Fenced::Table(Some(_))))
+        .nth(table)?;
+    let fenced = &cell[block.clone()];
+    let start = block.start + fenced.find('\n')? + 1;
+    let last_line = block.start + fenced.rfind('\n').map_or(0, |i| i + 1);
+    let end = if last_line > start { last_line - 1 } else { block.end };
+    let inner = table_cell_source(&cell[start..end], inner_row, inner_column, &nested[1..])?;
+    Some(source(start + inner.start..start + inner.end))
+}
+
+/// The offset in `content` of byte `at` of the text that `cell_text` gives for the item at
+/// `range`, which drops the item's marker and its continuation lines' indentation.
+fn cell_offset(content: &str, range: Range<usize>, at: usize) -> usize {
+    let line_start = content[..range.start].rfind('\n').map_or(0, |i| i + 1);
+    let marker = content[range.clone()].chars().next().map_or(0, char::len_utf8);
+    let indent = range.start - line_start + marker + 1;
+    let after_marker = range.start + marker;
+    let first =
+        (after_marker + usize::from(content[after_marker..].starts_with(' '))).min(range.end);
+    // Walk the item's lines as `cell_text` does, counting the bytes it keeps.
+    let mut kept = 0;
+    let mut line = first;
+    for (index, text) in content[first..range.end].split('\n').enumerate() {
+        let removed = if index == 0 {
+            0
+        } else {
+            (text.len() - text.trim_start_matches(' ').len()).min(indent)
+        };
+        let length = text.len() - removed;
+        if at <= kept + length {
+            return line + removed + (at - kept);
+        }
+        kept += length + 1;
+        line += text.len() + 1;
     }
-    Some(table)
+    range.end
 }
 
 /// A list item's markdown without its marker, with its continuation lines unindented to the
@@ -704,6 +775,23 @@ mod tests {
         let labeled = list_table("table", "- row1\n  - this\n  - that\n- row2\n  - a\n  - b\n");
         assert_eq!(labeled.unwrap().rows, [["this", "that"], ["a", "b"]]);
         assert_eq!(list_table("table", "- row1\n- row2\n"), None);
+    }
+
+    #[test]
+    fn finds_cells_in_the_source() {
+        let content = concat!(
+            "- r1\n  - a\n  - b\n\n    more\n- r2\n  - c\n",
+            "  - ```table\n    - x\n      - inner\n      - last\n    ```\n",
+        );
+        let at = |row, column, nested: &[(usize, usize, usize)]| {
+            table_cell_source(content, row, column, nested).map(|range| &content[range])
+        };
+        assert_eq!(at(0, 1, &[]), Some("b\n\n    more"));
+        assert_eq!(at(1, 0, &[]), Some("c"));
+        assert_eq!(at(1, 1, &[(0, 0, 0)]), Some("inner"));
+        assert_eq!(at(1, 1, &[(0, 0, 1)]), Some("last"));
+        assert_eq!(at(2, 0, &[]), None);
+        assert_eq!(at(1, 1, &[(1, 0, 0)]), None);
         let body = format!("```table\n{content}```\n\n```mermaid\nflowchart LR\n```\n");
         assert_eq!(fenced_blocks(&body).len(), 2);
     }

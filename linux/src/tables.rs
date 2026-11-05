@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use adw::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, glib, graphene};
 use zib_core::Id;
 use zib_core::body::ListTable;
 use zib_core::markup::{self, Block, Inline, Item};
@@ -37,6 +37,46 @@ pub fn link_targets(table: &ListTable) -> Vec<Id> {
 pub fn widget(table: &ListTable, titles: &HashMap<Id, String>) -> gtk::Widget {
     let rows = table.rows.iter().map(|row| row.iter().map(|cell| markup::parse(cell)).collect());
     grid(&rows.collect::<Vec<_>>(), table.header_rows, table.header_columns, titles)
+}
+
+/// A cell of a table: its row and column, then, for a cell of a table inside that cell, which table
+/// it is among those directly in the cell, and its row and column, and so on, as
+/// `body::table_cell_source` takes them.
+pub type CellPath = (usize, usize, Vec<(usize, usize, usize)>);
+
+/// The cell of the table `table` that holds `point`, in `relative_to`'s coordinates.
+pub fn cell_at(
+    table: &gtk::Widget,
+    relative_to: &gtk::Widget,
+    point: &graphene::Point,
+) -> Option<CellPath> {
+    let grid = table.downcast_ref::<gtk::Grid>()?;
+    let contains = |widget: &gtk::Widget| {
+        widget.compute_bounds(relative_to).is_some_and(|bounds| bounds.contains_point(point))
+    };
+    let mut child = grid.first_child();
+    while let Some(cell) = child {
+        child = cell.next_sibling();
+        if !contains(&cell) {
+            continue;
+        }
+        let (column, row, _, _) = grid.query_child(&cell);
+        let (row, column) = (usize::try_from(row).ok()?, usize::try_from(column).ok()?);
+        let mut nested = Vec::new();
+        let mut tables = (0..).zip(children(&cell).filter(|w| w.has_css_class("zib-table")));
+        if let Some((index, inner)) = tables.find(|(_, inner)| contains(inner))
+            && let Some((inner_row, inner_column, deeper)) = cell_at(&inner, relative_to, point)
+        {
+            nested.push((index, inner_row, inner_column));
+            nested.extend(deeper);
+        }
+        return Some((row, column, nested));
+    }
+    None
+}
+
+fn children(widget: &gtk::Widget) -> impl Iterator<Item = gtk::Widget> {
+    std::iter::successors(widget.first_child(), gtk::Widget::next_sibling)
 }
 
 fn grid(

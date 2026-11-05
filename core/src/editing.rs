@@ -252,6 +252,30 @@ pub fn drawings(body: &str) -> Vec<Drawn> {
     drawn
 }
 
+/// The source of a cell's text in the list table at `block` of `body`, the range of a drawn table,
+/// as a byte range of `body`. `row`, `column`, and `nested` pick the cell, as for
+/// `body::table_cell_source`.
+pub fn table_cell_in_body(
+    body: &str,
+    block: Range<usize>,
+    row: usize,
+    column: usize,
+    nested: &[(usize, usize, usize)],
+) -> Option<Range<usize>> {
+    let fenced = &body[block.clone()];
+    let start = block.start + fenced.find('\n')? + 1;
+    let last_line = block.start + fenced.rfind('\n').map_or(0, |i| i + 1);
+    let closing = body[last_line..block.end].trim_start();
+    let closed = last_line > start && (closing.starts_with("```") || closing.starts_with("~~~"));
+    let end = if closed { last_line - 1 } else { block.end };
+    // A table nested in a list item has the item's indentation, which its content drops.
+    let line_start = body[..block.start].rfind('\n').map_or(0, |i| i + 1);
+    let indent = body[line_start..block.start].chars().count();
+    let lines = crate::lists::Dedented::new(&body[start..end.max(start)], indent);
+    let cell = body::table_cell_source(&lines.text, row, column, nested)?;
+    Some(start + lines.original(cell.start)..start + lines.original(cell.end))
+}
+
 /// Where a link points.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LinkTarget {
@@ -508,6 +532,17 @@ mod tests {
                 (&format!("![[{target}]]"), Drawing::Embed(target), false),
             ]
         );
+    }
+
+    #[test]
+    fn finds_table_cells_in_the_body() {
+        let table = "```table\n- - a\n  - b\n```";
+        let nested = "- item\n\n  ```table\n  - - a\n    - b\n  ```\n";
+        for body in [format!("Intro\n\n{table}\n"), nested.to_owned()] {
+            let block = drawings(&body).into_iter().next().unwrap().range;
+            let cell = table_cell_in_body(&body, block, 0, 1, &[]).unwrap();
+            assert_eq!(&body[cell], "b", "{body:?}");
+        }
     }
 
     #[test]
