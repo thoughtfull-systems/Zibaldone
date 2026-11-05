@@ -72,6 +72,9 @@ pub struct Drawings {
     view: glib::WeakRef<gtk::TextView>,
     draw: Draw,
     hidden: &'static str,
+    /// Keeps the shade of a code block from showing on the lines of a block drawn over it, from
+    /// the start of its first line, which can hold a list item's marker.
+    unshaded: gtk::TextTag,
     overlays: RefCell<Vec<Overlay>>,
     /// Hidden overlays that hold no drawing, to use again. GTK offers no way to take an overlay out
     /// of a text view: `gtk_text_view_remove` only knows anchored children, and leaves overlays.
@@ -82,12 +85,19 @@ pub struct Drawings {
 }
 
 impl Drawings {
-    /// Manages the drawings in `view`, hiding their source with the tag named `hidden`.
+    /// Manages the drawings in `view`, hiding their source with the tag named `hidden`. Tags that
+    /// the buffer holds already, such as a code block's shade, rank below the drawings' own.
     pub fn new(view: &gtk::TextView, draw: Draw, hidden: &'static str) -> Rc<Self> {
+        // GTK draws a fully transparent color as black.
+        let unshaded = gtk::TextTag::builder()
+            .paragraph_background_rgba(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.004))
+            .build();
+        view.buffer().tag_table().add(&unshaded);
         let drawings = Rc::new_cyclic(|me| Self {
             view: view.downgrade(),
             draw,
             hidden,
+            unshaded,
             overlays: RefCell::default(),
             spare: RefCell::default(),
             next_id: Cell::new(0),
@@ -223,6 +233,12 @@ impl Drawings {
         }
         overlay.holder.set_visible(false);
         self.spare.borrow_mut().push(overlay.holder);
+        if overlay.drawn.block {
+            let (mut first_line, end) =
+                (buffer.iter_at_mark(&overlay.start), buffer.iter_at_mark(&overlay.end));
+            first_line.set_line_offset(0);
+            buffer.remove_tag(&self.unshaded, &first_line, &end);
+        }
         buffer.tag_table().remove(&overlay.tag);
         buffer.delete_mark(&overlay.start);
         buffer.delete_mark(&overlay.end);
@@ -277,6 +293,11 @@ impl Drawings {
     fn apply(&self, buffer: &gtk::TextBuffer, overlay: &Overlay) {
         let (start, end) = (buffer.iter_at_mark(&overlay.start), buffer.iter_at_mark(&overlay.end));
         buffer.remove_tag(&overlay.tag, &buffer.start_iter(), &buffer.end_iter());
+        let mut first_line = start;
+        first_line.set_line_offset(0);
+        if overlay.drawn.block {
+            buffer.remove_tag(&self.unshaded, &first_line, &end);
+        }
         if overlay.revealed {
             buffer.remove_tag_by_name(self.hidden, &start, &end);
         }
@@ -290,7 +311,6 @@ impl Drawings {
             if overlay.revealed {
                 overlay.tag.set_property("size-set", false);
                 overlay.tag.set_property("foreground-set", false);
-                overlay.tag.set_property("paragraph-background-set", false);
             } else {
                 // The last line, which holds the room below it, and the line break before it stay,
                 // tiny and unseen. GTK aborts when it looks for the position at a point below a
@@ -306,10 +326,8 @@ impl Drawings {
                 overlay.tag.set_size_points(1.0);
                 // GTK draws a fully transparent color as black.
                 overlay.tag.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.004)));
-                // Nor does the shade of a code block show behind the drawing.
-                overlay
-                    .tag
-                    .set_paragraph_background_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.004)));
+                // Nor does the shade of a code block show beside or behind the drawing.
+                buffer.apply_tag(&self.unshaded, &first_line, &end);
             }
             overlay.tag.set_pixels_below_lines(height + 2 * PAD);
             let mut tiny = last_line;
