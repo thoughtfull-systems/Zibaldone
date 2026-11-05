@@ -739,7 +739,8 @@ fn view_point(view: &gtk::Widget, event: &gdk::Event) -> Option<graphene::Point>
 /// syntax. Once the syntax shows, the cursor would sit before or inside it. A click on a drawing
 /// lands in the source it covers, and goes to the start of that source, or for a block, such as
 /// display math or a diagram, to the start of its second line, just inside its opening `$$` or
-/// fence. A click on a block lands on its last line, where its room is, so at the end of its range.
+/// fence, past the indentation that a list item gives it. A click on a block lands on its last
+/// line, where its room is, so at the end of its range.
 fn place_click(
     buffer: &gtk::TextBuffer,
     preview: &Preview,
@@ -772,6 +773,12 @@ fn place_click(
                 let mut start = buffer.iter_at_offset(offset(chars.start));
                 let mut inside = start;
                 if drawn.block && inside.forward_line() && inside.offset() < offset(chars.end) {
+                    // The block's lines are indented as far as its first line starts.
+                    for _ in 0..start.line_offset() {
+                        if inside.char() != ' ' || !inside.forward_char() {
+                            break;
+                        }
+                    }
                     start = inside;
                 }
                 buffer.place_cursor(&start);

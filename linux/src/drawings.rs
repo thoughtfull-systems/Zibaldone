@@ -329,8 +329,13 @@ impl Drawings {
         let mut first_line = start;
         first_line.set_line_offset(0);
         buffer.remove_tag(&self.unshaded, &first_line, &end);
+        // A block in a list item hides the item's indentation before it as well, which would
+        // otherwise hold its first line open as a blank line. A marker before it stays, for the
+        // view to draw its bullet.
+        let indented = first_line.text(&start).chars().all(char::is_whitespace);
+        let from = if overlay.drawn.block && indented { first_line } else { start };
         if overlay.revealed {
-            buffer.remove_tag_by_name(self.hidden, &start, &end);
+            buffer.remove_tag_by_name(self.hidden, &from, &end);
         }
         let Some(view) = self.view.upgrade() else { return };
         let Some((_, height)) = overlay.shown.or_else(|| Self::size(&view, overlay)) else {
@@ -349,7 +354,7 @@ impl Drawings {
                     shown = end;
                     shown.backward_char();
                 }
-                buffer.apply_tag_by_name(self.hidden, &start, &shown);
+                buffer.apply_tag_by_name(self.hidden, &from, &shown);
                 buffer.remove_tag_by_name(self.hidden, &shown, &end);
                 overlay.tag.set_size_points(1.0);
                 // GTK draws a fully transparent color as black.
@@ -395,10 +400,10 @@ impl Drawings {
     }
 
     /// The size a drawing shows at: math at the editor's font size, and nothing wider than the
-    /// text.
+    /// text, past the indentation of a block in a list item.
     fn size(view: &gtk::TextView, overlay: &Overlay) -> Option<(i32, i32)> {
         let (widget, width, height) = overlay.widget.as_ref()?;
-        let room = (text_width(view) - 2 * PAD).max(1);
+        let room = (text_width(view) - indent(view, overlay) - 2 * PAD).max(1);
         // A table fits the text by wrapping its cells, and grows taller as it does.
         if let Drawing::Table(_) = overlay.drawn.drawing {
             let width = (*width).min(room);
@@ -456,7 +461,10 @@ impl Drawings {
                 last_line.set_line_offset(0);
                 let (top, line_height) = view.line_yrange(&last_line);
                 let left = view.left_margin();
+                // A block in a list item starts where its source does, past the item's indentation.
+                let indent = indent(&view, overlay);
                 let x = match overlay.drawn.drawing {
+                    _ if indent > 0 => left + indent,
                     Drawing::Embed(_) | Drawing::Table(_) => left,
                     _ => left + (text_width(&view) - width).max(0) / 2,
                 };
@@ -531,6 +539,33 @@ fn char_range(buffer: &gtk::TextBuffer, overlay: &Overlay) -> Range<usize> {
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start <= b.end && b.start <= a.end
+}
+
+/// How far right of the left margin a block's source starts, past the indentation or marker of the
+/// list item that holds it. Zero for inline drawings, blocks at the margin, and blocks after text
+/// on their first line, such as display math.
+fn indent(view: &gtk::TextView, overlay: &Overlay) -> i32 {
+    if !overlay.drawn.block {
+        return 0;
+    }
+    let start = view.buffer().iter_at_mark(&overlay.start);
+    let mut line_start = start;
+    line_start.set_line_offset(0);
+    let before = line_start.text(&start);
+    if before.chars().all(char::is_whitespace) {
+        // The indentation hides with the source, and is a column of the monospace font that list
+        // prefixes use for each space.
+        let columns = i32::try_from(before.chars().count()).unwrap_or(0);
+        return columns * crate::view::monospace_width(view);
+    }
+    // A marker stays shown, and the source starts after it.
+    let marker = before.chars().all(|c| c.is_whitespace() || "-*+.)[]x0123456789".contains(c));
+    let mut last = start;
+    if !marker || !last.backward_char() {
+        return 0;
+    }
+    let cell = view.iter_location(&last);
+    (cell.x() + cell.width() - view.left_margin()).max(0)
 }
 
 /// The width the text wraps at.
