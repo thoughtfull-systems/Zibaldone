@@ -44,6 +44,8 @@ The Rust workspace holds `core`, the `zib-core` crate that every app builds on, 
 - Builds from the source tree are the development channel, which keeps its data apart from
   production, as [decision ZIB0013](decisions/ZIB0013-development-and-production-channels.md)
   describes. Don't turn on the `production` feature to try a change.
+- Run `zib` from the source tree with `devenv shell -- zib-dev`, which builds `zib` and the
+  `zibaldone` instance it starts. `cargo run --bin zib` builds only `zib`.
 - Build the packages with `nix build .#zibaldone-dev` and `nix build .#zibaldone`, and run the tests
   in Nix with `nix flake check`.
 - `flake.nix` and `nix/packages.nix` define the packages. `flake.lock` pins their inputs.

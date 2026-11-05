@@ -233,5 +233,12 @@ in
     pkgs.vale
     # keep-sorted end
   ];
+
+  # `cargo run --bin zib` builds only `zib`, which starts the `zibaldone` beside it, so it would
+  # start a stale instance. This builds both first.
+  scripts.zib-dev.exec = ''
+    cargo build --quiet --manifest-path ${config.devenv.root}/Cargo.toml --package zib-linux
+    exec ${config.devenv.root}/target/debug/zib "$@"
+  '';
   # keep-sorted end
 }
