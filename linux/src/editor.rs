@@ -453,7 +453,7 @@ fn attach_preview(view: &sourceview5::View, drawings: Rc<Drawings>) {
     let buffer = view.buffer();
     let preview = Rc::new(RefCell::new(Preview::default()));
     let pressed = Rc::new(Cell::new(false));
-    attach_block_entry(view, &preview, &drawings);
+    attach_cursor_moves(view, &preview, &drawings);
     buffer.connect_changed({
         let (preview, drawings) = (preview.clone(), drawings.clone());
         move |buffer| {
@@ -583,17 +583,26 @@ fn clicked_place(at: &gtk::TextIter, hidden: &gtk::TextTag) -> Option<gtk::TextI
     Some(placed)
 }
 
-/// Puts the cursor at the start of a hidden block, such as a table or a diagram, when a key moves
-/// it into the block from above. GTK skips hidden lines, so Down would land on the block's last
-/// line, the one that stays to hold the drawing's room. A move that extends the selection shows a
-/// block it heads into first.
-/// Where the cursor was, and the character ranges of the blocks that were hidden, before a move.
+/// Where the cursor was before a move, the character ranges of the blocks that were hidden, and,
+/// for a move right, those of the hidden syntax.
 struct BeforeMove {
     cursor: usize,
     hidden: Vec<Range<usize>>,
+    syntax: Vec<Range<usize>>,
 }
 
-fn attach_block_entry(
+/// Corrects where GTK puts the cursor when a key moves it into hidden source.
+///
+/// A key that moves the cursor into a hidden block, such as a table or a diagram, from above puts
+/// it at the block's start. GTK skips hidden lines, so Down would land on the block's last line,
+/// the one that stays to hold the drawing's room. A move that extends the selection shows a block
+/// it heads into first.
+///
+/// GTK puts the cursor at the start of the hidden syntax it moves onto, which is inside a span's
+/// closing syntax but outside its opening syntax. A move right onto hidden syntax goes past it,
+/// so the cursor lands inside the span from either side, as a click does. Math is the exception,
+/// and the cursor lands outside its drawing from either side.
+fn attach_cursor_moves(
     view: &sourceview5::View,
     preview: &Rc<RefCell<Preview>>,
     drawings: &Rc<Drawings>,
@@ -601,7 +610,7 @@ fn attach_block_entry(
     let before: Rc<RefCell<Option<BeforeMove>>> = Rc::default();
     view.connect_move_cursor({
         let (before, preview, drawings) = (before.clone(), preview.clone(), drawings.clone());
-        move |view, _, count, extend| {
+        move |view, step, count, extend| {
             let mut preview = preview.borrow_mut();
             let buffer = view.buffer();
             let fresh =
@@ -649,20 +658,46 @@ fn attach_block_entry(
                 .filter(|(drawn, revealed)| drawn.block && !**revealed)
                 .map(|(drawn, _)| preview.chars(&drawn.range))
                 .collect();
+            let right = count > 0
+                && matches!(
+                    step,
+                    gtk::MovementStep::LogicalPositions | gtk::MovementStep::VisualPositions
+                );
+            let syntax = if right {
+                preview
+                    .spans
+                    .iter()
+                    .zip(&preview.revealed)
+                    // Math hides behind its drawing, which a move from either side lands outside.
+                    .filter(|(span, revealed)| !**revealed && span.style != Style::Math)
+                    .flat_map(|(span, _)| span.syntax.iter().map(|syntax| preview.chars(syntax)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let cursor = usize::try_from(cursor.offset()).unwrap_or(0);
-            *before.borrow_mut() = Some(BeforeMove { cursor, hidden });
+            *before.borrow_mut() = Some(BeforeMove { cursor, hidden, syntax });
         }
     });
     view.connect_local("move-cursor", true, move |values| {
-        let BeforeMove { cursor: from, hidden } = before.borrow_mut().take()?;
+        let BeforeMove { cursor: from, hidden, syntax } = before.borrow_mut().take()?;
         let view = values.first()?.get::<sourceview5::View>().ok()?;
         let buffer = view.buffer();
-        let cursor = usize::try_from(buffer.cursor_position()).unwrap_or(0);
+        let mut cursor = usize::try_from(buffer.cursor_position()).unwrap_or(0);
         let entered = hidden
             .iter()
             .find(|chars| from < chars.start && chars.start <= cursor && cursor <= chars.end);
         if let Some(chars) = entered {
             buffer.place_cursor(&buffer.iter_at_offset(offset(chars.start)));
+            return None;
+        }
+        // Syntax can follow syntax, as `*` follows `**` in `***both***`.
+        let landed = cursor;
+        while let Some(chars) = syntax.iter().find(|chars| from < cursor && chars.start == cursor) {
+            cursor = chars.end;
+        }
+        if cursor != landed {
+            buffer.place_cursor(&buffer.iter_at_offset(offset(cursor)));
         }
         None
     });
