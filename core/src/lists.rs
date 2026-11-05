@@ -150,6 +150,17 @@ struct Line<'a> {
     /// Byte offset just past the line's last character, before any line break.
     end: usize,
     text: &'a str,
+    code: CodeLine,
+}
+
+/// Where a line lies relative to code blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodeLine {
+    Outside,
+    /// Starts a code block, after any list item's marker.
+    Opens,
+    /// Lies in a code block past its first line, and is code, never a list item.
+    Inside,
 }
 
 impl Line<'_> {
@@ -159,6 +170,11 @@ impl Line<'_> {
 
     fn indent(&self) -> usize {
         self.text.len() - self.text.trim_start_matches(' ').len()
+    }
+
+    /// The list item that the line starts, unless it's code.
+    fn item(&self) -> Option<Item> {
+        if self.code == CodeLine::Inside { None } else { Item::parse(self.text) }
     }
 }
 
@@ -240,8 +256,16 @@ fn lines(body: &str) -> Vec<Line<'_>> {
     let mut lines = Vec::new();
     let mut start = 0;
     for text in body.split('\n') {
-        lines.push(Line { start, end: start + text.len(), text });
+        lines.push(Line { start, end: start + text.len(), text, code: CodeLine::Outside });
         start += text.len() + 1;
+    }
+    for (event, range) in Parser::new_ext(body, Options::empty()).into_offset_iter() {
+        let Event::Start(Tag::CodeBlock(_)) = event else { continue };
+        let block = body[range.clone()].trim_end_matches(['\n', '\r']);
+        let end = range.start + block.len();
+        for line in lines.iter_mut().filter(|line| line.end >= range.start && line.start <= end) {
+            line.code = if line.start <= range.start { CodeLine::Opens } else { CodeLine::Inside };
+        }
     }
     lines
 }
@@ -320,20 +344,27 @@ fn code_newline(body: &str, cursor: usize, indent: usize) -> Option<Edit> {
 }
 
 /// Finds the item that the line at `current` belongs to: the item it starts, or the item it
-/// continues.
+/// continues. A code block between them belongs to the item only when it's indented to the item's
+/// content column. Otherwise it ends the list, and the line after it is no item's.
 fn owner(lines: &[Line], current: usize) -> Option<(usize, Item)> {
-    if let Some(item) = Item::parse(lines[current].text) {
+    if let Some(item) = lines[current].item() {
         return Some((current, item));
     }
     if lines[current].is_blank() {
         return None;
     }
+    // How far every code line between the item and `current` is indented.
+    let mut reach = usize::MAX;
     for index in (0..current).rev() {
-        if lines[index].is_blank() {
+        let line = lines[index];
+        if line.is_blank() && line.code == CodeLine::Outside {
             return None;
         }
-        if let Some(item) = Item::parse(lines[index].text) {
-            return Some((index, item));
+        if let Some(item) = line.item() {
+            return (item.content_column <= reach).then_some((index, item));
+        }
+        if line.code != CodeLine::Outside && !line.is_blank() {
+            reach = reach.min(line.indent());
         }
     }
     None
@@ -347,7 +378,7 @@ fn enclosing(lines: &[Line], current: usize, cursor: usize) -> Option<(usize, It
     let mut reach = if line.is_blank() { cursor - line.start } else { line.indent() };
     for index in (0..current).rev() {
         let line = lines[index];
-        if let Some(item) = Item::parse(line.text)
+        if let Some(item) = line.item()
             && item.content_column <= reach
         {
             return Some((index, item));
@@ -363,7 +394,7 @@ fn enclosing(lines: &[Line], current: usize, cursor: usize) -> Option<(usize, It
 fn last_continuation(lines: &[Line], owner: usize) -> usize {
     let mut last = owner;
     while let Some(line) = lines.get(last + 1) {
-        if line.is_blank() || Item::parse(line.text).is_some() {
+        if line.is_blank() || line.item().is_some() {
             break;
         }
         last += 1;
@@ -394,7 +425,7 @@ fn parent_indent(lines: &[Line], owner: usize, item: &Item) -> usize {
     lines[..owner]
         .iter()
         .rev()
-        .filter_map(|line| Item::parse(line.text))
+        .filter_map(Line::item)
         .find(|parent| parent.indent < item.indent)
         .map_or(0, |parent| parent.indent)
 }
@@ -431,7 +462,7 @@ fn enter(
         // From the cursor's line, which a code block's blank lines can separate from the item's.
         let last = last_continuation(lines, current);
         let at = lines[last].end;
-        let child = lines.get(last + 1).and_then(|next| Item::parse(next.text));
+        let child = lines.get(last + 1).and_then(Line::item);
         let prefix = match child.filter(|child| child.indent > item.indent) {
             Some(child) => child.same_prefix(),
             None => item.next_prefix(item.indent),
@@ -448,7 +479,7 @@ fn indent(body: &str, lines: &[Line], owner: usize, item: &Item, cursor: usize) 
     let sibling = lines[..owner]
         .iter()
         .rev()
-        .filter_map(|line| Item::parse(line.text))
+        .filter_map(Line::item)
         .find(|other| other.indent <= item.indent)
         .filter(|other| other.indent == item.indent);
     let Some(sibling) = sibling else {
@@ -639,6 +670,20 @@ mod tests {
         );
         assert_eq!(press("```\nx\n```|", ListKey::Enter), None);
         assert_eq!(press("- a\n```\nx\n```|", ListKey::Enter), None);
+    }
+
+    #[test]
+    fn text_after_a_code_block_is_in_no_item_of_its_code() {
+        // The list in a list table is code, and the text after the table is in no item.
+        let table = "```table\n- - this\n  - that\n```\n";
+        for after in ["[[link|blah]]|", "|this", "th|is"] {
+            assert_eq!(press(&format!("{table}{after}"), ListKey::Enter), None, "{after}");
+        }
+        assert_eq!(press(&format!("- a\n{table}text|"), ListKey::Enter), None);
+        // Text after a block that's in an item continues the item.
+        let nested = "- a\n  ```\n  - x\n\n  - y\n  ```\n  more|";
+        let after = "- a\n  ```\n  - x\n\n  - y\n  ```\n  more\n- |";
+        assert_eq!(press(nested, ListKey::Enter).as_deref(), Some(after));
     }
 
     #[test]
