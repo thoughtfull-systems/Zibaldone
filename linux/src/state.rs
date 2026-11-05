@@ -496,10 +496,39 @@ impl State {
         let name = path
             .file_name()
             .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned());
+        self.add_file_note(space_id, hash, size, &name, &media_type).await
+    }
+
+    /// Adds bytes that aren't in a file, such as a pasted image, to a space as a note named `name`,
+    /// and returns the note.
+    pub async fn add_bytes(
+        &self,
+        space_id: Id,
+        bytes: Vec<u8>,
+        name: String,
+        media_type: String,
+    ) -> Result<Id> {
+        let blobs = self.blobs(space_id);
+        let size = bytes.len() as u64;
+        let hash = tokio::task::spawn_blocking(move || blobs.add_bytes(&bytes))
+            .await
+            .map_err(|e| Error::Protocol(e.to_string()))??;
+        self.add_file_note(space_id, hash, size, &name, &media_type).await
+    }
+
+    /// Creates the note for a blob already among the space's blobs.
+    async fn add_file_note(
+        &self,
+        space_id: Id,
+        hash: FileHash,
+        size: u64,
+        name: &str,
+        media_type: &str,
+    ) -> Result<Id> {
         let space = self.space(space_id).await?;
         let id = {
             let mut space = space.lock().await;
-            let id = files::add_file_note(&mut space, hash, size, &name, &media_type)?;
+            let id = files::add_file_note(&mut space, hash, size, name, media_type)?;
             self.reindex_note(space_id, &space, id);
             id
         };

@@ -242,6 +242,7 @@ impl Window {
             remote: crate::remote::Remote::new(view.upcast_ref()),
         }));
         this.connect(&new_note, &add_file, &delete, &view);
+        this.connect_files(&view);
         this.update_history();
         this.reload_spaces();
         this.watch_status();
@@ -327,15 +328,6 @@ impl Window {
             window.set_visible(false);
             glib::Propagation::Stop
         });
-        let w = self.clone();
-        let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
-        target.connect_drop(move |_, value, _, _| {
-            if let Ok(files) = value.get::<gdk::FileList>() {
-                w.add_files(files.files());
-            }
-            true
-        });
-        view.add_controller(target);
         let actions = gio::SimpleActionGroup::new();
         for (name, handler) in [
             ("new-space", Self::new_space as fn(&Self)),
@@ -1071,6 +1063,25 @@ impl Window {
         self.inner().stack.set_visible_child_name(if open { "editor" } else { "empty" });
     }
 
+    /// Adds files dropped on the editor, and images pasted into it, as notes.
+    fn connect_files(&self, view: &sourceview5::View) {
+        let w = self.clone();
+        let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        target.connect_drop(move |_, value, _, _| {
+            if let Ok(files) = value.get::<gdk::FileList>() {
+                w.add_files(files.files());
+            }
+            true
+        });
+        view.add_controller(target);
+        let w = self.clone();
+        view.connect_paste_clipboard(move |view| {
+            if w.paste_image() {
+                view.stop_signal_emission_by_name("paste-clipboard");
+            }
+        });
+    }
+
     fn pick_files(&self) {
         let w = self.clone();
         glib::spawn_future_local(async move {
@@ -1111,6 +1122,62 @@ impl Window {
                 w.open_note(space, note);
             }
         });
+    }
+
+    /// Pastes an image from the clipboard as an `image` note in the open note's space, with a link
+    /// to it in place of the selection. Returns whether the clipboard held an image to paste. A
+    /// clipboard that also holds text, as a copied spreadsheet range does, pastes the text.
+    fn paste_image(&self) -> bool {
+        let Some(space) = self.inner().editor.borrow().as_ref().map(|e| e.space) else {
+            return false;
+        };
+        let clipboard = self.inner().view.clipboard();
+        let formats = clipboard.formats().union_deserialize_types();
+        if !formats.contains_type(gdk::Texture::static_type())
+            || formats.contains_type(glib::Type::STRING)
+        {
+            return false;
+        }
+        let buffer = &self.inner().buffer;
+        let (from, to) = buffer.selection_bounds().unwrap_or_else(|| {
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            (cursor, cursor)
+        });
+        let start = buffer.create_mark(None, &from, true);
+        let end = buffer.create_mark(None, &to, false);
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            let added = match clipboard.read_texture_future().await {
+                Ok(Some(texture)) => {
+                    let bytes = texture.save_to_png_bytes().to_vec();
+                    let now = glib::DateTime::now_local().and_then(|t| t.format("%F %H.%M.%S"));
+                    let name = now.map_or_else(
+                        |_| "Pasted image.png".to_owned(),
+                        |now| format!("Pasted image {now}.png"),
+                    );
+                    let media = "image/png".to_owned();
+                    core(async move { state.add_bytes(space, bytes, name, media).await })
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                Ok(None) => Err("the clipboard is empty".to_owned()),
+                Err(error) => Err(error.to_string()),
+            };
+            match added {
+                Ok(note) => {
+                    w.reload_notes();
+                    w.insert_link(&start, &end, note, None);
+                }
+                Err(error) => {
+                    let buffer = &w.inner().buffer;
+                    buffer.delete_mark(&start);
+                    buffer.delete_mark(&end);
+                    w.toast(&format!("Couldn't paste the image: {error}"));
+                }
+            }
+        });
+        true
     }
 
     /// Opens the file a `file` or `image` note holds in the desktop's app for it.
