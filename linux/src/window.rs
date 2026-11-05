@@ -1124,9 +1124,10 @@ impl Window {
         });
     }
 
-    /// Pastes an image from the clipboard as an `image` note in the open note's space, with a link
-    /// to it in place of the selection. Returns whether the clipboard held an image to paste. A
-    /// clipboard that also holds text, as a copied spreadsheet range does, pastes the text.
+    /// Pastes an image from the clipboard as an `image` note in the open note's space, with an
+    /// embed of it in place of the selection. Returns whether the clipboard held an image to
+    /// paste. A clipboard that also holds text, as a copied spreadsheet range does, pastes the
+    /// text.
     fn paste_image(&self) -> bool {
         let Some(space) = self.inner().editor.borrow().as_ref().map(|e| e.space) else {
             return false;
@@ -1167,7 +1168,7 @@ impl Window {
             match added {
                 Ok(note) => {
                     w.reload_notes();
-                    w.insert_link(&start, &end, note, None);
+                    w.insert_link(&start, &end, note, None, true);
                 }
                 Err(error) => {
                     let buffer = &w.inner().buffer;
@@ -1428,7 +1429,7 @@ impl Window {
                 if let Some(target) = target
                     && !chosen.replace(true)
                 {
-                    w.insert_link(&start, &end, target, label.clone());
+                    w.insert_link(&start, &end, target, label.clone(), false);
                 }
                 popover.popdown();
             }
@@ -1489,15 +1490,16 @@ impl Window {
             .collect()
     }
 
-    /// Replaces the text between two marks with a link to `target`, and deletes the marks. A link
-    /// without a label the owner chose shows its target's title, which the editor removes again
-    /// when it commits.
+    /// Replaces the text between two marks with a link to `target`, or an embed of it, and deletes
+    /// the marks. A link without a label the owner chose shows its target's title, which the
+    /// editor removes again when it commits.
     fn insert_link(
         &self,
         start: &gtk::TextMark,
         end: &gtk::TextMark,
         target: Id,
         label: Option<String>,
+        embed: bool,
     ) {
         let w = self.clone();
         let state = self.inner().state.clone();
@@ -1530,7 +1532,7 @@ impl Window {
             }
             buffer.begin_user_action();
             buffer.delete(&mut from, &mut to);
-            buffer.insert(&mut from, &link);
+            buffer.insert(&mut from, &if embed { format!("!{link}") } else { link });
             buffer.end_user_action();
             buffer.place_cursor(&from);
         });
