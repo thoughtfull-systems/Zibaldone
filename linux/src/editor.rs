@@ -10,8 +10,9 @@ use adw::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
 use sourceview5::prelude::*;
 use zib_core::editing::{
-    Drawing, Drawn, Span, Style, complete_block_opening, drawings as find_drawings,
-    fence_selection, list_pads, spans, table_cell_in_body, toggle_checkbox,
+    Drawing, Drawn, QuotedLine, Span, Style, complete_block_opening, drawings as find_drawings,
+    fence_selection, list_pads, quote_newline, quote_selection, quoted_lines, spans,
+    table_cell_in_body, toggle_checkbox,
 };
 use zib_core::lists::{Edit, ListKey, list_edit};
 use zib_core::pipe_tables::table_edit;
@@ -40,9 +41,27 @@ const LIST_PADS: [&str; 4] =
 /// ghosts of its antialiased edges. A background makes it repaint each run's whole cell. A fully
 /// transparent one renders black.
 const REPAINT: &str = "markup-repaint";
-const QUOTE_MARGIN: &str = "markup-quote-margin";
-/// How far a block quote sits inside the editor's left margin.
-const QUOTE_INDENT: i32 = 16;
+/// Move the lines of block quotes right, one tag for each depth of nested quotes, where the view
+/// draws a bar for each. Quotes nested deeper share the last.
+const QUOTE_MARGINS: [&str; 6] = [
+    "markup-quote-margin-1",
+    "markup-quote-margin-2",
+    "markup-quote-margin-3",
+    "markup-quote-margin-4",
+    "markup-quote-margin-5",
+    "markup-quote-margin-6",
+];
+/// Make room before a block quote that starts past a list item's marker or indentation, on the
+/// character before it, one tag for each depth, where the view draws a bar for each. A margin there
+/// would move the item's marker too.
+const QUOTE_ROOMS: [&str; 6] = [
+    "markup-quote-room-1",
+    "markup-quote-room-2",
+    "markup-quote-room-3",
+    "markup-quote-room-4",
+    "markup-quote-room-5",
+    "markup-quote-room-6",
+];
 const SYNTAX: &str = "markup-syntax";
 
 /// Creates the editor view. Its colors follow the system's light or dark preference.
@@ -65,7 +84,8 @@ pub fn new_view(draw: Draw) -> sourceview5::View {
     apply_scheme(&style_manager);
     style_manager.connect_dark_notify(apply_scheme);
 
-    let view = crate::view::new(&buffer, CODE_BLOCK_SHADE, DRAWN_OVER);
+    let view =
+        crate::view::new(&buffer, CODE_BLOCK_SHADE, DRAWN_OVER, &QUOTE_MARGINS, &QUOTE_ROOMS);
     view.set_wrap_mode(gtk::WrapMode::WordChar);
     view.set_top_margin(16);
     view.set_bottom_margin(24);
@@ -77,10 +97,12 @@ pub fn new_view(draw: Draw) -> sourceview5::View {
     // the list pads follow the view's.
     let set_margins = |view: &sourceview5::View| {
         let table = view.buffer().tag_table();
-        if let Some(tag) = table.lookup(QUOTE_MARGIN) {
-            tag.set_left_margin(view.left_margin() + QUOTE_INDENT);
+        for (depth, name) in (1..).zip(QUOTE_MARGINS) {
+            if let Some(tag) = table.lookup(name) {
+                tag.set_left_margin(view.left_margin() + depth * crate::view::QUOTE_INDENT);
+            }
         }
-        let column = monospace_width(view);
+        let column = crate::view::monospace_width(view.upcast_ref());
         for (columns, name) in (1..).zip(LIST_PADS) {
             if let Some(tag) = table.lookup(name) {
                 tag.set_left_margin(view.left_margin() + columns * column);
@@ -94,15 +116,6 @@ pub fn new_view(draw: Draw) -> sourceview5::View {
     attach_checkbox_clicks(&view);
     attach_primary_selection(&view);
     view
-}
-
-/// The width of a character of the monospace font that list prefixes use, in pixels.
-fn monospace_width(view: &sourceview5::View) -> i32 {
-    let layout = view.create_pango_layout(Some("0"));
-    let mut font = view.pango_context().font_description().unwrap_or_default();
-    font.set_family("monospace");
-    layout.set_font_description(Some(&font));
-    layout.pixel_size().0
 }
 
 /// Offers the selected text as the primary selection, which a middle click pastes, without tying
@@ -133,8 +146,9 @@ pub fn text(buffer: &gtk::TextBuffer) -> String {
 
 /// Wraps the selection in markdown delimiters when the owner types one, rather than replacing it,
 /// and keeps the text inside selected, so typing the delimiter again doubles it. Around lines of
-/// text, a third backtick or a second `$` makes a code block or display math instead. Without a
-/// selection, the same keys at the start of a line open the block, and close it below.
+/// text, a third backtick or a second `$` makes a code block or display math instead, and `>` makes
+/// each line a line of a block quote. Without a selection, the same keys at the start of a line
+/// open the block, and close it below.
 fn attach_wrap_keys(view: &sourceview5::View) {
     // The capture phase sees the key before the view replaces the selection with it.
     let keys = gtk::EventControllerKey::builder()
@@ -153,6 +167,7 @@ fn attach_wrap_keys(view: &sourceview5::View) {
             let (open, close) = match key.to_unicode() {
                 Some(delimiter @ ('*' | '_' | '`' | '~' | '=' | '$')) => (delimiter, delimiter),
                 Some('[') => ('[', ']'),
+                Some('>') => ('>', '>'),
                 _ => return glib::Propagation::Proceed,
             };
             let buffer = view.buffer();
@@ -187,6 +202,14 @@ fn attach_wrap_keys(view: &sourceview5::View) {
             // A third backtick or a second `$` around text that fills its lines makes a block.
             let body = text(&buffer);
             let selection = byte_at(&body, start.offset())..byte_at(&body, end.offset());
+            // `>` quotes whole lines, and otherwise types itself over the selection.
+            if open == '>' {
+                let Some((edit, selected)) = quote_selection(&body, selection) else {
+                    return glib::Propagation::Proceed;
+                };
+                apply_edit(&buffer, &body, edit, Some(selected));
+                return glib::Propagation::Stop;
+            }
             if let Some((edit, selected)) = fence_selection(&body, selection, open) {
                 apply_edit(&buffer, &body, edit, Some(selected));
                 return glib::Propagation::Stop;
@@ -208,7 +231,8 @@ fn attach_wrap_keys(view: &sourceview5::View) {
 }
 
 /// Gives Enter, Shift+Enter, Tab, and Shift+Tab their outliner meanings inside list items. In a
-/// pipe table, even one in a list item, Tab and Shift+Tab move between its cells instead.
+/// pipe table, even one in a list item, Tab and Shift+Tab move between its cells instead, and in a
+/// block quote, Enter leaves the quote and Shift+Enter continues it.
 fn attach_list_keys(view: &sourceview5::View) {
     // The capture phase sees the keys before the view inserts a line break or a tab.
     let keys = gtk::EventControllerKey::builder()
@@ -242,7 +266,15 @@ fn attach_list_keys(view: &sourceview5::View) {
             if tab && apply_table_edit(&buffer, list_key == ListKey::ShiftTab) {
                 return glib::Propagation::Stop;
             }
-            if !buffer.has_selection() && apply_list_edit(&buffer, list_key) {
+            if buffer.has_selection() {
+                return glib::Propagation::Proceed;
+            }
+            // A quote in a list item takes Enter before the item does.
+            let enter = matches!(list_key, ListKey::Enter | ListKey::ShiftEnter);
+            if enter && apply_quote_newline(&buffer, list_key == ListKey::ShiftEnter) {
+                return glib::Propagation::Stop;
+            }
+            if apply_list_edit(&buffer, list_key) {
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -263,6 +295,18 @@ fn apply_list_edit(buffer: &gtk::TextBuffer, key: ListKey) -> bool {
     if !edit.range.is_empty() || !edit.text.is_empty() {
         apply_edit(buffer, &body, edit, None);
     }
+    true
+}
+
+/// Makes the edit that Enter, or Shift+Enter when `continues` is set, makes at the cursor in a
+/// block quote, as one undoable step. Returns whether the cursor was in one.
+fn apply_quote_newline(buffer: &gtk::TextBuffer, continues: bool) -> bool {
+    let body = text(buffer);
+    let cursor = byte_at(&body, buffer.cursor_position());
+    let Some(edit) = quote_newline(&body, cursor, continues) else {
+        return false;
+    };
+    apply_edit(buffer, &body, edit, None);
     true
 }
 
@@ -485,7 +529,12 @@ fn add_tags(table: &gtk::TextTagTable) {
             .style(pango::Style::Italic)
             .foreground_rgba(&dim)
             .build(),
-        gtk::TextTag::builder().name(QUOTE_MARGIN).build(),
+        gtk::TextTag::builder().name(QUOTE_MARGINS[0]).build(),
+        gtk::TextTag::builder().name(QUOTE_MARGINS[1]).build(),
+        gtk::TextTag::builder().name(QUOTE_MARGINS[2]).build(),
+        gtk::TextTag::builder().name(QUOTE_MARGINS[3]).build(),
+        gtk::TextTag::builder().name(QUOTE_MARGINS[4]).build(),
+        gtk::TextTag::builder().name(QUOTE_MARGINS[5]).build(),
         gtk::TextTag::builder().name(LIST_PADS[0]).build(),
         gtk::TextTag::builder().name(LIST_PADS[1]).build(),
         gtk::TextTag::builder().name(LIST_PADS[2]).build(),
@@ -536,6 +585,10 @@ fn add_tags(table: &gtk::TextTagTable) {
         gtk::TextTag::builder().name(HIDDEN).invisible(true).build(),
     ] {
         table.add(&added);
+    }
+    for (depth, name) in (1..).zip(QUOTE_ROOMS) {
+        let spacing = depth * crate::view::QUOTE_INDENT * pango::SCALE;
+        table.add(&gtk::TextTag::builder().name(name).letter_spacing(spacing).build());
     }
     for added in crate::remote::tags() {
         table.add(&added);
@@ -879,9 +932,11 @@ fn contain_panic(f: impl FnOnce()) {
 /// Styles every span from scratch, after the text changes.
 fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings) {
     let (start, end) = buffer.bounds();
-    let names = [CODE_BLOCK_SHADE, DRAWN_OVER, HIDDEN, QUOTE_MARGIN, SYNTAX]
+    let names = [CODE_BLOCK_SHADE, DRAWN_OVER, HIDDEN, SYNTAX]
         .into_iter()
         .chain(HEADING_COLORS)
+        .chain(QUOTE_MARGINS)
+        .chain(QUOTE_ROOMS)
         .chain(LIST_PADS)
         .chain(STYLES.into_iter().map(style_tag));
     for name in names {
@@ -905,6 +960,14 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings)
     for (line, columns) in list_pads(&body) {
         apply(buffer, LIST_PADS[columns.clamp(1, LIST_PADS.len()) - 1], preview.chars(&line));
     }
+    for QuotedLine { line, depth, start } in quoted_lines(&body) {
+        let depth = depth.clamp(1, QUOTE_MARGINS.len()) - 1;
+        if start == line.start {
+            apply(buffer, QUOTE_MARGINS[depth], preview.chars(&line));
+        } else {
+            apply(buffer, QUOTE_ROOMS[depth], preview.chars(&(start - 1..start)));
+        }
+    }
     let selection = preview.selection(buffer);
     preview.drawn = find_drawings(&body);
     preview.revealed = preview.spans.iter().map(|span| preview.shows(span, &selection)).collect();
@@ -913,15 +976,9 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings)
         // GTK takes a line's paragraph properties, such as its margin and background, from the
         // tags at the line's first character. A block nested in a list item starts partway into
         // its first line, after the item's marker or indentation.
-        let line_start = body[..span.range.start].rfind('\n').map_or(0, |i| i + 1);
-        match span.style {
-            Style::CodeBlock => {
-                apply(buffer, CODE_BLOCK_SHADE, preview.chars(&(line_start..span.range.end)));
-            }
-            Style::BlockQuote if line_start == span.range.start => {
-                apply(buffer, QUOTE_MARGIN, preview.chars(&span.range));
-            }
-            _ => {}
+        if span.style == Style::CodeBlock {
+            let line_start = body[..span.range.start].rfind('\n').map_or(0, |i| i + 1);
+            apply(buffer, CODE_BLOCK_SHADE, preview.chars(&(line_start..span.range.end)));
         }
         if let Style::Heading(level) = span.style {
             let color = HEADING_COLORS[usize::from(level.clamp(1, 4)) - 1];

@@ -124,8 +124,10 @@ fn edit(body: &str, cursor: usize, key: ListKey, fence: Option<usize>) -> Option
     let found = owner(&lines, from);
     // A line of text or a code block can belong to its item past blank lines, by its indentation.
     // So can a blank line, for the continuation line that Shift+Enter starts on it, and for Tab
-    // and Shift+Tab to move its item. Enter on it stays a line break.
-    let past_blank_lines = !lines[from].is_blank() || key != ListKey::Enter;
+    // and Shift+Tab to move its item, and one that holds indentation, for Enter to start the next
+    // item after it. Enter on an empty line stays a line break.
+    let past_blank_lines =
+        !lines[from].is_blank() || key != ListKey::Enter || !lines[from].text.is_empty();
     let (owner, item) =
         if past_blank_lines { found.or_else(|| enclosing(&lines, from, at))? } else { found? };
     // A fence left of the item's content ends the list rather than continuing the item.
@@ -651,9 +653,16 @@ mod tests {
         );
         let nested = "- a\n- b\n\n  c|";
         assert_eq!(press(nested, ListKey::Tab).as_deref(), Some("- a\n  - b\n\n    c|"));
-        // Text at the left margin after a blank line ends the list, and a blank line is no item's.
+        // Text at the left margin after a blank line ends the list, and so does an empty line.
         assert_eq!(press("- a\n\nb|", ListKey::Enter), None);
-        assert_eq!(press("- a\n\n  |", ListKey::Enter), None);
+        assert_eq!(press("- a\n\n|", ListKey::Enter), None);
+        // A blank line indented into an item belongs to it, and Enter starts the next item.
+        assert_eq!(press("- a\n\n  |", ListKey::Enter).as_deref(), Some("- a\n\n  \n- |"));
+        let quoted = "- parent\n  - child\n    > not\n    \n    |";
+        assert_eq!(
+            press(quoted, ListKey::Enter).as_deref(),
+            Some("- parent\n  - child\n    > not\n    \n    \n  - |")
+        );
     }
 
     #[test]

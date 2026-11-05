@@ -1,7 +1,7 @@
-//! The editor's text view: `GtkSourceView`'s, drawing paragraph backgrounds on empty lines too, and
-//! drawing bullets and task boxes over the list syntax that a tag hides. GTK draws a tag's
-//! paragraph background on every line but an empty one, so a blank line in a code block would show
-//! as a gap in the block's shade.
+//! The editor's text view: `GtkSourceView`'s, drawing paragraph backgrounds on empty lines too,
+//! drawing bullets and task boxes over the list syntax that a tag hides, and drawing a bar beside
+//! block quotes for each level they nest. GTK draws a tag's paragraph background on every line
+//! but an empty one, so a blank line in a code block would show as a gap in the block's shade.
 
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
@@ -15,7 +15,7 @@ mod imp {
     use gtk::subclass::prelude::*;
     use sourceview5::subclass::prelude::*;
 
-    use super::{draw_over, shade_empty_lines};
+    use super::{draw_over, draw_quote_bars, shade_empty_lines};
 
     #[derive(Default)]
     pub struct View {
@@ -23,6 +23,10 @@ mod imp {
         pub shaded: Cell<&'static str>,
         /// The name of the tag on list markers and task boxes that the view draws over.
         pub drawn_over: Cell<&'static str>,
+        /// The names of the tags on the lines of block quotes, one for each depth, outermost first.
+        pub quote_margins: Cell<&'static [&'static str]>,
+        /// The names of the tags that make room before quotes in list items, one for each depth.
+        pub quote_rooms: Cell<&'static [&'static str]>,
     }
 
     #[glib::object_subclass]
@@ -41,6 +45,8 @@ mod imp {
             match layer {
                 gtk::TextViewLayer::BelowText => {
                     shade_empty_lines(self.obj().upcast_ref(), self.shaded.get(), &snapshot);
+                    let (margins, rooms) = (self.quote_margins.get(), self.quote_rooms.get());
+                    draw_quote_bars(self.obj().upcast_ref(), margins, rooms, &snapshot);
                 }
                 gtk::TextViewLayer::AboveText => {
                     draw_over(self.obj().upcast_ref(), self.drawn_over.get(), &snapshot);
@@ -61,15 +67,22 @@ glib::wrapper! {
 
 /// Creates a view of `buffer` that draws the paragraph background of the tag named `shaded` on
 /// empty lines as well as on the rest, and draws a bullet or a task box over each run of text
-/// with the tag named `drawn_over`, which should leave that text unseen.
+/// with the tag named `drawn_over`, which should leave that text unseen. Beside each line with one
+/// of the tags named in `quote_margins`, which move the lines of block quotes right by
+/// `QUOTE_INDENT` for each depth, it draws a bar for each quote the line lies in, and likewise in
+/// the room that the tags named in `quote_rooms` make on the character before a quote.
 pub fn new(
     buffer: &sourceview5::Buffer,
     shaded: &'static str,
     drawn_over: &'static str,
+    quote_margins: &'static [&'static str],
+    quote_rooms: &'static [&'static str],
 ) -> sourceview5::View {
     let view: View = glib::Object::builder().property("buffer", buffer).build();
     view.imp().shaded.set(shaded);
     view.imp().drawn_over.set(drawn_over);
+    view.imp().quote_margins.set(quote_margins);
+    view.imp().quote_rooms.set(quote_rooms);
     view.upcast()
 }
 
@@ -101,6 +114,88 @@ fn shade_empty_lines(view: &gtk::TextView, shaded: &str, snapshot: &gtk::Snapsho
             break;
         }
     }
+}
+
+/// How far each level of block quote moves its lines right, past the editor's left margin.
+pub const QUOTE_INDENT: i32 = 18;
+/// How far into its level's room a quote's bar sits, and how wide it is.
+const BAR_OFFSET: i32 = 4;
+const BAR_WIDTH: i32 = 3;
+
+/// Draws a bar beside each visible line of a block quote for each quote it lies in, so bars of
+/// lines in a row join up, and nested quotes show nested bars: from the left margin in, on a line
+/// that a quote's margin moves right, or in the room before a quote in a list item.
+fn draw_quote_bars(
+    view: &gtk::TextView,
+    quote_margins: &[&str],
+    quote_rooms: &[&str],
+    snapshot: &gtk::Snapshot,
+) {
+    let table = view.buffer().tag_table();
+    let tags = |names: &[&str]| -> Vec<gtk::TextTag> {
+        names.iter().filter_map(|name| table.lookup(name)).collect()
+    };
+    let (margins, rooms) = (tags(quote_margins), tags(quote_rooms));
+    if margins.is_empty() && rooms.is_empty() {
+        return;
+    }
+    let color = view.color();
+    let color = gtk::gdk::RGBA::new(color.red(), color.green(), color.blue(), 0.3);
+    let visible = view.visible_rect();
+    let (mut line, _) = view.line_at_y(visible.y());
+    loop {
+        let (y, height) = view.line_yrange(&line);
+        if y > visible.y() + visible.height() {
+            break;
+        }
+        if let Some((depth, left, height)) = quote_room(view, &line, &margins, &rooms, height) {
+            for level in 0..depth {
+                let x = left + level * QUOTE_INDENT + BAR_OFFSET;
+                #[allow(clippy::cast_precision_loss)]
+                let rect = graphene::Rect::new(x as f32, y as f32, BAR_WIDTH as f32, height as f32);
+                snapshot.append_color(&color, &rect);
+            }
+        }
+        if !line.forward_line() {
+            break;
+        }
+    }
+}
+
+/// How many quotes the line starting at `line` lies in, where the room for their bars starts, in
+/// buffer coordinates, and how tall the bars are, for a line `height` tall. Bars in the room
+/// before a quote in a list item reach down only as far as the line's first row of text, as the
+/// rows it wraps onto start at the margin.
+fn quote_room(
+    view: &gtk::TextView,
+    line: &gtk::TextIter,
+    margins: &[gtk::TextTag],
+    rooms: &[gtk::TextTag],
+    height: i32,
+) -> Option<(i32, i32, i32)> {
+    let depth = |index: usize| i32::try_from(index + 1).unwrap_or(0);
+    if let Some(index) = margins.iter().position(|tag| line.has_tag(tag)) {
+        return Some((depth(index), view.visible_rect().x() + view.left_margin(), height));
+    }
+    rooms.iter().enumerate().find_map(|(index, tag)| {
+        let mut room = *line;
+        if !room.has_tag(tag) && (!room.forward_to_tag_toggle(Some(tag)) || !room.has_tag(tag)) {
+            return None;
+        }
+        if room.line() != line.line() {
+            return None;
+        }
+        // The room follows the character's own width, a column of the monospace font that list
+        // prefixes use. Pango leaves letter spacing out at the end of a line, as on a blank `>`
+        // line whose `>` hides, so the room's own width can't place the bars.
+        let cell = view.iter_location(&room);
+        let mut end = *line;
+        end.forward_to_line_end();
+        let wraps = view.iter_location(&end).y() > cell.y();
+        let (top, _) = view.line_yrange(line);
+        let height = if wraps { cell.y() + cell.height() - top } else { height };
+        Some((depth(index), cell.x() + monospace_width(view), height))
+    })
 }
 
 /// Draws a bullet over each list marker with the tag named `drawn_over` in the visible lines, and
@@ -287,4 +382,13 @@ fn box_side(height: f32) -> f32 {
 /// The width of the border of a task box whose side is `side`.
 fn box_border(side: f32) -> f32 {
     (side * 0.1).max(1.5)
+}
+
+/// The width of a character of the monospace font that list prefixes use, in pixels.
+pub fn monospace_width(view: &gtk::TextView) -> i32 {
+    let layout = view.create_pango_layout(Some("0"));
+    let mut font = view.pango_context().font_description().unwrap_or_default();
+    font.set_family("monospace");
+    layout.set_font_description(Some(&font));
+    layout.pixel_size().0
 }

@@ -394,6 +394,114 @@ pub fn list_pads(body: &str) -> Vec<(Range<usize>, usize)> {
     pads
 }
 
+/// A line of a block quote.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotedLine {
+    /// The byte range of the line, without its line break.
+    pub line: Range<usize>,
+    /// How many quotes the line lies in.
+    pub depth: usize,
+    /// Where the outermost quote starts on the line: at the line's start, or past a list item's
+    /// marker or indentation.
+    pub start: usize,
+}
+
+/// The lines of block quotes, so an editor can make room before each line's quote and draw a bar
+/// there for each quote it lies in. A quote's lines include its blank `>` lines and the lines that
+/// continue a paragraph without a `>`. A line indented less than its quote's first line, which only
+/// such a continuation can be, gets none.
+pub fn quoted_lines(body: &str) -> Vec<QuotedLine> {
+    let quotes: Vec<Range<usize>> = Parser::new_ext(body, body::options())
+        .into_offset_iter()
+        .filter(|(event, _)| matches!(event, Event::Start(Tag::BlockQuote(_))))
+        .map(|(_, range)| range.start..range.start + body[range].trim_end().len())
+        .collect();
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for line in body.split_inclusive('\n') {
+        let line_end = line_start + line.trim_end_matches(['\n', '\r']).len();
+        let mut holding = quotes.iter().filter(|q| q.start <= line_end && line_start <= q.end);
+        // Quotes come in the order they start, so the first is the outermost.
+        let Some(outer) = holding.next() else {
+            line_start += line.len();
+            continue;
+        };
+        let start = if outer.start >= line_start {
+            Some(outer.start)
+        } else {
+            // Later lines hold the quote's indentation as spaces.
+            let first_line = body[..outer.start].rfind('\n').map_or(0, |i| i + 1);
+            let column = body[first_line..outer.start].chars().count();
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            (indent >= column).then_some(line_start + column)
+        };
+        if let Some(start) = start {
+            lines.push(QuotedLine {
+                line: line_start..line_end,
+                depth: 1 + holding.count(),
+                start,
+            });
+        }
+        line_start += line.len();
+    }
+    lines
+}
+
+/// The edit that Enter makes with the cursor at byte `cursor` in a line of a block quote, past its
+/// `>` markers, or with `continues`, the edit that Shift+Enter makes. Enter leaves the innermost
+/// quote: a line with one `>` fewer separates the quote from the next line, which starts with one
+/// `>` fewer too, so what the owner types next is outside it, rather than continuing its paragraph.
+/// On a quote line with nothing before the cursor, that line becomes the separator. Shift+Enter
+/// starts the next line with the same `>` markers, in the same quote. A quote in a list item keeps
+/// the item's indentation. `None` outside quotes, in their code, and in a list inside a quote,
+/// whose item the list keys handle.
+pub fn quote_newline(body: &str, cursor: usize, continues: bool) -> Option<Edit> {
+    let quoted = quoted_lines(body)
+        .into_iter()
+        .find(|quoted| quoted.line.start <= cursor && cursor <= quoted.line.end)?;
+    if in_code_block(body, cursor) {
+        return None;
+    }
+    // The `>` markers at the quote's start, with the spaces between and after them.
+    let rest = &body[quoted.start..quoted.line.end];
+    let (mut count, mut length) = (0, 0);
+    for (i, c) in rest.char_indices() {
+        match c {
+            '>' => count += 1,
+            ' ' if count > 0 => {}
+            _ => break,
+        }
+        length = i + 1;
+    }
+    let markers_end = quoted.start + length;
+    if cursor < markers_end || ListItem::parse(&body[markers_end..quoted.line.end]).is_some() {
+        return None;
+    }
+    // A line that continues a paragraph without all its quote's markers gets them all.
+    let markers = if count == quoted.depth {
+        rest[..length].trim_end().to_owned()
+    } else {
+        ">".repeat(quoted.depth)
+    };
+    let indent = " ".repeat(body[quoted.line.start..quoted.start].chars().count());
+    let next_line = |markers: &str| {
+        if markers.is_empty() { indent.clone() } else { format!("{indent}{markers} ") }
+    };
+    if continues {
+        let text = format!("\n{}", next_line(&markers));
+        return Some(Edit { cursor: cursor + text.len(), range: cursor..cursor, text });
+    }
+    let outer = markers[..markers.rfind('>').unwrap_or(0)].trim_end();
+    let separator = format!("{indent}{outer}");
+    let (range, text) = if body[markers_end..cursor].trim().is_empty() {
+        // What comes before the quote on the line, such as a list item's marker, stays.
+        (quoted.start..cursor, format!("{outer}\n{}", next_line(outer)))
+    } else {
+        (cursor..cursor, format!("\n{separator}\n{}", next_line(outer)))
+    };
+    Some(Edit { cursor: range.start + text.len(), range, text })
+}
+
 /// Finds the innermost list item that byte `offset` falls in, and returns the edit that toggles
 /// its box: the byte range to replace, and the text to replace it with. An item without a box gets
 /// an unchecked one. An item covers its lines from their start, including indentation, up to the
@@ -552,11 +660,21 @@ fn list_prefixes(body: &str) -> Vec<Span> {
 fn quote_markers(body: &str, range: &Range<usize>) -> Vec<Range<usize>> {
     let mut markers = Vec::new();
     let mut line_start = range.start;
+    // On its later lines, a quote's `>` comes after what comes before the quote on its first line:
+    // the `>` of the quotes it's nested in, or a list item's indentation, which stays.
+    let first_line = body[..range.start].rfind('\n').map_or(0, |i| i + 1);
+    let column = body[first_line..range.start].chars().count();
     for line in body[range.clone()].split_inclusive('\n') {
-        let indent = line.len() - line.trim_start_matches(' ').len();
-        if line[indent..].starts_with('>') {
-            let space = usize::from(line[indent + 1..].starts_with(' '));
-            markers.push(line_start..line_start + indent + 1 + space);
+        let skip = if line_start == range.start {
+            0
+        } else {
+            line.char_indices().nth(column).map_or(line.len(), |(i, _)| i)
+        };
+        let rest = &line[skip..];
+        let indent = rest.len() - rest.trim_start_matches(' ').len();
+        if rest[indent..].starts_with('>') {
+            let space = usize::from(rest[indent + 1..].starts_with(' '));
+            markers.push(line_start + skip..line_start + skip + indent + 1 + space);
         }
         line_start += line.len();
     }
@@ -651,6 +769,35 @@ pub fn fence_selection(
     let start = open + fence.len() + 1 + indent.len();
     let selected = start..start + selected.len();
     Some((Edit { cursor: selected.end, range: open..line_end, text }, selected))
+}
+
+/// The edit that typing `>` makes with the byte range `selection` selected, when the selection
+/// fills its lines: each line becomes a line of a block quote, blank lines included, and the quote
+/// stays selected, so another `>` nests it. Lines inside a list item keep the item's indentation
+/// before their `>`. Returns the edit and the selection's range after it.
+pub fn quote_selection(body: &str, selection: Range<usize>) -> Option<(Edit, Range<usize>)> {
+    let line_end = body[selection.end..].find('\n').map_or(body.len(), |i| selection.end + i);
+    if selection.is_empty()
+        || !body[selection.end..line_end].trim().is_empty()
+        || in_code_block(body, selection.start)
+    {
+        return None;
+    }
+    let column = block_column(body, selection.start)?;
+    let mut text = String::new();
+    for (index, mut line) in body[selection.clone()].split('\n').enumerate() {
+        if index > 0 {
+            // A blank line, or one indented less than the item, takes the item's indentation.
+            let indent = (line.len() - line.trim_start_matches(' ').len()).min(column);
+            text.push('\n');
+            text.push_str(&" ".repeat(column));
+            line = &line[indent..];
+        }
+        text.push_str("> ");
+        text.push_str(line);
+    }
+    let selected = selection.start..selection.start + text.len();
+    Some((Edit { cursor: selected.end, range: selection, text }, selected))
 }
 
 /// Whether byte `at` falls inside a code block or another construct whose text is literal, past
@@ -801,6 +948,19 @@ mod tests {
         assert_eq!(hidden("##"), []);
         assert_eq!(hidden("Title\n====="), []);
         assert_eq!(hidden("> one\n> two"), [(Style::BlockQuote, vec!["> ", "> "])]);
+        // In a list item, the item's indentation stays, and only what's past it hides.
+        let nested = "- child\n  > this\n  >> this\n  this";
+        let mut quotes = hidden(nested);
+        quotes.retain(|(style, _)| *style == Style::BlockQuote);
+        assert_eq!(quotes, [(Style::BlockQuote, vec!["> ", ">"]), (Style::BlockQuote, vec!["> "])]);
+        // Each nested quote hides its own `>` on its later lines, after those of the quotes around
+        // it, so every `> ` hides once.
+        let nested = "> this\n> > something\n> > > another\n> > more";
+        let quotes = spans(nested).into_iter().filter(|span| span.style == Style::BlockQuote);
+        let mut markers: Vec<Range<usize>> = quotes.flat_map(|span| span.syntax).collect();
+        markers.sort_by_key(|marker| marker.start);
+        let expected = nested.match_indices("> ").map(|(i, marker)| i..i + marker.len());
+        assert_eq!(markers, expected.collect::<Vec<_>>());
         assert_eq!(
             hidden("- [x] done"),
             [
@@ -906,6 +1066,109 @@ mod tests {
         assert_eq!(fence("- a\n  $[x]$").as_deref(), Some("- a\n  $$\n  [x]\n  $$"));
         assert_eq!(fence("$$[x]$$"), None);
         assert_eq!(fence("a $[x]$"), None);
+    }
+
+    #[test]
+    fn finds_how_deep_quotes_go() {
+        // Each line, how deep it lies, and what comes before its quote.
+        let depths = |body: &str| -> Vec<(String, usize, String)> {
+            let lines = quoted_lines(body).into_iter();
+            lines
+                .map(|QuotedLine { line, depth, start }| {
+                    (body[line.clone()].to_owned(), depth, body[line.start..start].to_owned())
+                })
+                .collect()
+        };
+        let expected = |lines: &[(&str, usize, &str)]| {
+            let lines = lines.iter().map(|&(l, d, before)| (l.to_owned(), d, before.to_owned()));
+            lines.collect::<Vec<_>>()
+        };
+        let body = "text\n\n> a\n> > b\n> > c\nlazy\n>\n> d\n\nafter";
+        assert_eq!(
+            depths(body),
+            expected(&[
+                ("> a", 1, ""),
+                ("> > b", 2, ""),
+                ("> > c", 2, ""),
+                ("lazy", 2, ""),
+                (">", 1, ""),
+                ("> d", 1, "")
+            ]),
+        );
+        // In a list item, the quote starts past the item's indentation or marker.
+        assert_eq!(
+            depths("- parent item\n  > this\n  this\n\n- > on the marker\n  > > nested"),
+            expected(&[
+                ("  > this", 1, "  "),
+                ("  this", 1, "  "),
+                ("- > on the marker", 1, "- "),
+                ("  > > nested", 2, "  "),
+            ]),
+        );
+    }
+
+    #[test]
+    fn enter_leaves_quotes_and_shift_enter_continues_them() {
+        let press = |before: &str, continues: bool| {
+            let cursor = before.find('|').unwrap();
+            let body = before.replacen('|', "", 1);
+            let edit = quote_newline(&body, cursor, continues)?;
+            let mut after = body;
+            after.replace_range(edit.range, &edit.text);
+            after.insert(edit.cursor, '|');
+            Some(after)
+        };
+        for (before, enter, shift_enter) in [
+            ("> this|", "> this\n\n|", "> this\n> |"),
+            (">> this|", ">> this\n>\n> |", ">> this\n>> |"),
+            ("> > this|", "> > this\n>\n> |", "> > this\n> > |"),
+            ("> th|is", "> th\n\n|is", "> th\n> |is"),
+            // A blank quote line becomes the separator.
+            ("> this\n> |", "> this\n\n|", "> this\n> \n> |"),
+            (">> this\n>> |", ">> this\n>\n> |", ">> this\n>> \n>> |"),
+            // A line that continues a paragraph gets all its quote's markers.
+            ("> > a\n> more|", "> > a\n> more\n>\n> |", "> > a\n> more\n>> |"),
+            // In a list item, the quote keeps the item's indentation.
+            ("- item\n  > this|", "- item\n  > this\n  \n  |", "- item\n  > this\n  > |"),
+            ("- > this|", "- > this\n  \n  |", "- > this\n  > |"),
+        ] {
+            assert_eq!(press(before, false).as_deref(), Some(enter), "{before:?}");
+            assert_eq!(press(before, true).as_deref(), Some(shift_enter), "{before:?}");
+        }
+        for before in ["this|", "|> this", "> - item|", "> ```\n> code|\n> ```"] {
+            assert_eq!(press(before, false), None, "{before:?}");
+        }
+    }
+
+    #[test]
+    fn quotes_selected_lines() {
+        let quote = |before: &str| {
+            let start = before.find('[').unwrap();
+            let end = before.find(']').unwrap() - 1;
+            let body = before.replacen('[', "", 1).replacen(']', "", 1);
+            let (edit, selected) = quote_selection(&body, start..end)?;
+            let mut after = body;
+            after.replace_range(edit.range, &edit.text);
+            after.insert(selected.end, ']');
+            after.insert(selected.start, '[');
+            Some(after)
+        };
+        assert_eq!(
+            quote("[this\nsomething\nanother\n\nafter a blank]").as_deref(),
+            Some("[> this\n> something\n> another\n> \n> after a blank]"),
+        );
+        // Another `>` nests the quote.
+        assert_eq!(quote("[> a\n> b]").as_deref(), Some("[> > a\n> > b]"));
+        // In a list item, the quote keeps the item's indentation.
+        assert_eq!(
+            quote("- item\n\n  [a\n\n  b]").as_deref(),
+            Some("- item\n\n  [> a\n  > \n  > b]")
+        );
+        assert_eq!(quote("- [a\n  b]").as_deref(), Some("- [> a\n  > b]"));
+        // A selection that shares its line with other text stays as it is.
+        assert_eq!(quote("x [a]"), None);
+        assert_eq!(quote("[a] x"), None);
+        assert_eq!(quote("```\n[a]\n```"), None);
     }
 
     #[test]
