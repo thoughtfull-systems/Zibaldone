@@ -1704,8 +1704,21 @@ async fn draw(state: Arc<State>, drawing: Drawing) -> Option<gtk::Widget> {
         Drawing::Embed(target) => return embedded_image(state, target).await,
         Drawing::Table(table) => {
             let targets = tables::link_targets(&table);
-            let titles = core(async move { state.titles(&targets).await }).await;
-            return Some(tables::widget(&table, &titles));
+            let drawings = tables::drawings(&table);
+            let refs = core(async move {
+                let mut refs =
+                    tables::Refs { titles: state.titles(&targets).await, ..Default::default() };
+                for (kind, source) in drawings {
+                    let key = tables::drawing_key(kind, &source);
+                    // A drawing that fails shows its source in the cell.
+                    if let Ok(image) = state.render(kind, source).await {
+                        refs.images.insert(key, image);
+                    }
+                }
+                refs
+            })
+            .await;
+            return Some(tables::widget(&table, &refs));
         }
     };
     let shown = source.clone();

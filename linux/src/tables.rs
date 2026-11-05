@@ -1,6 +1,7 @@
 //! List tables, drawn in the editor over their source as a grid of cells, as the note bodies
 //! specification's list tables define them. Each cell's markdown renders from the core's markup
-//! tree, as decision ZIB0009 describes. Math and diagrams inside a cell show their source.
+//! tree, as decision ZIB0009 describes. Math and diagrams inside a cell draw as they do in the
+//! editor, except math inside a line of text, which shows its source.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -10,6 +11,7 @@ use gtk::{gdk, glib, graphene};
 use zib_core::Id;
 use zib_core::body::ListTable;
 use zib_core::markup::{self, Block, Inline, Item};
+use zib_core::render::{Image, Kind};
 
 /// The style of tables, which the editor's theme colors.
 const CSS: &str = "
@@ -25,6 +27,85 @@ const CSS: &str = "
 
 /// The widest a column's text grows before it wraps, in characters.
 const COLUMN_CHARS: i32 = 40;
+/// The widest a diagram in a cell draws, in pixels.
+const MAX_DIAGRAM_WIDTH: i32 = 480;
+
+/// What a table's cells show from outside their text: the titles of the notes they link to, and the
+/// math and diagrams the core drew, by `drawing_key`.
+#[derive(Default)]
+pub struct Refs {
+    pub titles: HashMap<Id, String>,
+    pub images: HashMap<String, Image>,
+}
+
+/// The key of a drawing in `Refs::images`.
+pub fn drawing_key(kind: Kind, source: &str) -> String {
+    format!("{kind:?}\n{source}")
+}
+
+/// The math and diagrams in `table`'s cells, nested tables included, which the core draws. Math
+/// draws when it's a paragraph of its own; inside a line of text it shows its source.
+pub fn drawings(table: &ListTable) -> Vec<(Kind, String)> {
+    let mut found = Vec::new();
+    for cell in table.rows.iter().flatten() {
+        collect(&markup::parse(cell), &mut found);
+    }
+    found
+}
+
+fn collect(blocks: &[Block], found: &mut Vec<(Kind, String)>) {
+    for block in blocks {
+        match block {
+            Block::Math(source) => found.push((Kind::DisplayMath, source.clone())),
+            Block::Diagram(source) => found.push((Kind::Mermaid, source.clone())),
+            Block::Paragraph(inlines) => found.extend(lone_math(inlines)),
+            Block::Quote(blocks) => collect(blocks, found),
+            Block::List { items, .. } => {
+                for item in items {
+                    collect(&item.blocks, found);
+                }
+            }
+            Block::Table { rows, .. } => {
+                for cell in rows.iter().flatten() {
+                    collect(cell, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The math that a paragraph holds and nothing else.
+fn lone_math(inlines: &[Inline]) -> Option<(Kind, String)> {
+    let [Inline::Math { source, display }] = inlines else { return None };
+    Some((if *display { Kind::DisplayMath } else { Kind::InlineMath }, source.clone()))
+}
+
+/// A drawing the core made, or `None` when it couldn't, so the source shows instead.
+fn picture(kind: Kind, source: &str, refs: &Refs) -> Option<gtk::Widget> {
+    let image = refs.images.get(&drawing_key(kind, source))?;
+    let texture = gdk::Texture::from_bytes(&glib::Bytes::from(&image.png)).ok()?;
+    let picture = gtk::Picture::for_paintable(&texture);
+    picture.set_can_shrink(true);
+    picture.set_halign(gtk::Align::Start);
+    let (width, height) = (f64::from(image.width), f64::from(image.height));
+    let scale = match kind {
+        Kind::Mermaid => (f64::from(MAX_DIAGRAM_WIDTH) / width).min(1.0),
+        Kind::DisplayMath | Kind::InlineMath => crate::drawings::math_scale(&picture),
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let (width, height) = ((width * scale).round() as i32, (height * scale).round() as i32);
+    picture.set_size_request(width, height);
+    // The texture is twice the size the picture shows at, for sharp text, and a picture's natural
+    // size is its texture's. Held to its width, the picture takes the height that fits it.
+    let clamp = adw::Clamp::builder()
+        .maximum_size(width)
+        .tightening_threshold(width)
+        .halign(gtk::Align::Start)
+        .child(&picture)
+        .build();
+    Some(clamp.upcast())
+}
 
 /// The targets of the wikilinks in `table`, whose titles show in place of links without labels.
 pub fn link_targets(table: &ListTable) -> Vec<Id> {
@@ -32,11 +113,10 @@ pub fn link_targets(table: &ListTable) -> Vec<Id> {
     cells.flat_map(|cell| zib_core::body::wikilinks(cell)).map(|link| link.target).collect()
 }
 
-/// A grid of `table`'s cells, with each wikilink that has no label showing its target's title from
-/// `titles`.
-pub fn widget(table: &ListTable, titles: &HashMap<Id, String>) -> gtk::Widget {
+/// A grid of `table`'s cells, showing what they link to and the drawings from `refs`.
+pub fn widget(table: &ListTable, refs: &Refs) -> gtk::Widget {
     let rows = table.rows.iter().map(|row| row.iter().map(|cell| markup::parse(cell)).collect());
-    grid(&rows.collect::<Vec<_>>(), table.header_rows, table.header_columns, titles)
+    grid(&rows.collect::<Vec<_>>(), table.header_rows, table.header_columns, refs)
 }
 
 /// A cell of a table: its row and column, then, for a cell of a table inside that cell, which table
@@ -83,7 +163,7 @@ fn grid(
     rows: &[Vec<Vec<Block>>],
     header_rows: usize,
     header_columns: usize,
-    titles: &HashMap<Id, String>,
+    refs: &Refs,
 ) -> gtk::Widget {
     style();
     let grid = gtk::Grid::builder().halign(gtk::Align::Start).build();
@@ -98,32 +178,36 @@ fn grid(
             if header {
                 cell.add_css_class("zib-table-header");
             }
-            append_blocks(&cell, blocks, titles);
+            append_blocks(&cell, blocks, refs);
             grid.attach(&cell, column, row, 1, 1);
         }
     }
     grid.upcast()
 }
 
-fn append_blocks(container: &gtk::Box, blocks: &[Block], titles: &HashMap<Id, String>) {
+fn append_blocks(container: &gtk::Box, blocks: &[Block], refs: &Refs) {
     for block in blocks {
-        container.append(&block_widget(block, titles));
+        container.append(&block_widget(block, refs));
     }
 }
 
-fn block_widget(block: &Block, titles: &HashMap<Id, String>) -> gtk::Widget {
+fn block_widget(block: &Block, refs: &Refs) -> gtk::Widget {
     match block {
-        Block::Paragraph(inlines) => text(&markup_of(inlines, titles)).upcast(),
+        Block::Paragraph(inlines) => lone_math(inlines)
+            .and_then(|(kind, source)| picture(kind, &source, refs))
+            .unwrap_or_else(|| text(&markup_of(inlines, refs)).upcast()),
         Block::Heading { content, .. } => {
-            text(&format!("<b>{}</b>", markup_of(content, titles))).upcast()
+            text(&format!("<b>{}</b>", markup_of(content, refs))).upcast()
         }
         Block::Quote(blocks) => {
             let quote = gtk::Box::new(gtk::Orientation::Vertical, 6);
             quote.add_css_class("zib-table-quote");
-            append_blocks(&quote, blocks, titles);
+            append_blocks(&quote, blocks, refs);
             quote.upcast()
         }
-        Block::List { start, items } => list(*start, items, titles),
+        Block::List { start, items } => list(*start, items, refs),
+        Block::Diagram(source) if let Some(drawn) = picture(Kind::Mermaid, source, refs) => drawn,
+        Block::Math(source) if let Some(drawn) = picture(Kind::DisplayMath, source, refs) => drawn,
         Block::Code { text: source, .. } | Block::Diagram(source) | Block::Math(source) => {
             let label = text(&glib::markup_escape_text(source.trim_end()));
             label.add_css_class("monospace");
@@ -131,14 +215,14 @@ fn block_widget(block: &Block, titles: &HashMap<Id, String>) -> gtk::Widget {
             label.upcast()
         }
         Block::Table { header_rows, header_columns, rows } => {
-            grid(rows, *header_rows, *header_columns, titles)
+            grid(rows, *header_rows, *header_columns, refs)
         }
         Block::Rule => gtk::Separator::new(gtk::Orientation::Horizontal).upcast(),
         Block::Html(html) => text(&glib::markup_escape_text(html)).upcast(),
     }
 }
 
-fn list(start: Option<u64>, items: &[Item], titles: &HashMap<Id, String>) -> gtk::Widget {
+fn list(start: Option<u64>, items: &[Item], refs: &Refs) -> gtk::Widget {
     let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
     for (number, item) in (start.unwrap_or(1)..).zip(items) {
         let marker = match (item.checked, start) {
@@ -150,7 +234,7 @@ fn list(start: Option<u64>, items: &[Item], titles: &HashMap<Id, String>) -> gtk
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         row.append(&gtk::Label::builder().label(marker).valign(gtk::Align::Start).build());
         let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        append_blocks(&content, &item.blocks, titles);
+        append_blocks(&content, &item.blocks, refs);
         row.append(&content);
         list.append(&row);
     }
@@ -170,17 +254,17 @@ fn text(markup: &str) -> gtk::Label {
 }
 
 /// Inline markdown as Pango markup.
-fn markup_of(inlines: &[Inline], titles: &HashMap<Id, String>) -> String {
+fn markup_of(inlines: &[Inline], refs: &Refs) -> String {
     let mut out = String::new();
     for inline in inlines {
-        write_inline(&mut out, inline, titles);
+        write_inline(&mut out, inline, refs);
     }
     out
 }
 
-fn write_inline(out: &mut String, inline: &Inline, titles: &HashMap<Id, String>) {
+fn write_inline(out: &mut String, inline: &Inline, refs: &Refs) {
     let mut wrapped = |open: &str, close: &str, inlines: &[Inline]| {
-        let _ = write!(out, "{open}{}{close}", markup_of(inlines, titles));
+        let _ = write!(out, "{open}{}{close}", markup_of(inlines, refs));
     };
     match inline {
         Inline::Text(text) => out.push_str(&glib::markup_escape_text(text)),
@@ -201,7 +285,7 @@ fn write_inline(out: &mut String, inline: &Inline, titles: &HashMap<Id, String>)
         Inline::Image { alt, .. } => out.push_str(&glib::markup_escape_text(alt)),
         Inline::WikiLink { label: Some(label), .. } => wrapped(LINK, "</span>", label),
         Inline::WikiLink { target, label: None } | Inline::Embed { target, label: None } => {
-            let title = titles.get(target).map_or_else(|| target.to_string(), Clone::clone);
+            let title = refs.titles.get(target).map_or_else(|| target.to_string(), Clone::clone);
             let _ = write!(out, "{LINK}{}</span>", glib::markup_escape_text(&title));
         }
         Inline::Embed { label: Some(label), .. } => {

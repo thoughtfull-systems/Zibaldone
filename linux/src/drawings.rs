@@ -351,9 +351,7 @@ impl Drawings {
         }
         let (width, height) = (f64::from(*width), f64::from(*height));
         let scale = match overlay.drawn.drawing {
-            Drawing::InlineMath(_) | Drawing::DisplayMath(_) => {
-                font_px(view) * MATH_SCALE / MATH_PX
-            }
+            Drawing::InlineMath(_) | Drawing::DisplayMath(_) => math_scale(view),
             Drawing::Diagram(_) | Drawing::Table(_) => 1.0,
             Drawing::Embed(_) => (f64::from(MAX_IMAGE_HEIGHT) / height).min(1.0),
         };
@@ -458,9 +456,14 @@ fn text_width(view: &gtk::TextView) -> i32 {
     view.width() - view.left_margin() - view.right_margin()
 }
 
+/// How much larger than the core draws it math shows beside `widget`'s text.
+pub fn math_scale(widget: &impl IsA<gtk::Widget>) -> f64 {
+    font_px(widget) * MATH_SCALE / MATH_PX
+}
+
 /// The size of the editor's font in pixels.
-fn font_px(view: &gtk::TextView) -> f64 {
-    let font = view.pango_context().font_description().unwrap_or_default();
+fn font_px(widget: &impl IsA<gtk::Widget>) -> f64 {
+    let font = widget.pango_context().font_description().unwrap_or_default();
     let size = f64::from(font.size()) / f64::from(pango::SCALE);
     if font.is_size_absolute() { size } else { size * 96.0 / 72.0 }
 }
