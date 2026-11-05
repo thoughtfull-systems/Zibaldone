@@ -23,8 +23,9 @@ impl Kind {
         match self {
             Self::InlineMath => "inline-math",
             Self::DisplayMath => "display-math",
-            // Diagrams drawn before their labels became SVG text lack labels, so they cache anew.
-            Self::Mermaid => "mermaid-3",
+            // Diagrams drawn before their labels became SVG text lack labels, and those with front
+            // matter drew their labels unwrapped, so they cache anew.
+            Self::Mermaid => "mermaid-4",
         }
     }
 }
@@ -99,13 +100,12 @@ pub fn math_svg(source: &str, display: bool) -> Result<String> {
 pub fn mermaid_svg(source: &str) -> Result<String> {
     use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SvgRequest};
     // Labels as SVG text, not HTML, which neither resvg nor Typst draws. Front matter has to come
-    // first, so a diagram that has some keeps Mermaid's defaults.
+    // first, so the settings follow it. HTML labels would reach the drawing as one line each, as
+    // `foreign_labels` gives them, without the wrapping their boxes were sized for.
     let plain = "%%{init: {\"htmlLabels\": false, \"flowchart\": {\"htmlLabels\": false}}}%%\n";
-    let source = if source.trim_start().starts_with("---") {
-        source.to_owned()
-    } else {
-        format!("{plain}{source}")
-    };
+    let after_front_matter = front_matter_end(source);
+    let (front, rest) = source.split_at(after_front_matter);
+    let source = format!("{front}{plain}{rest}");
     let output = Renderer::new()
         .render(RenderRequest::svg(&source, OperationControl::new(), SvgRequest::default()))
         .map_err(|e| Error::Render(e.to_string()))?;
@@ -113,6 +113,24 @@ pub fn mermaid_svg(source: &str) -> Result<String> {
         RenderOutput::Svg(Some(svg)) => Ok(foreign_labels(svg.svg())),
         _ => Err(Error::Render("no Mermaid diagram found".into())),
     }
+}
+
+/// The byte offset just past a diagram's front matter, the lines between a first line of `---` and
+/// the next such line, or 0 when it has none.
+fn front_matter_end(source: &str) -> usize {
+    let start = source.len() - source.trim_start().len();
+    let mut lines = source[start..].split_inclusive('\n');
+    if lines.next().map(str::trim_end) != Some("---") {
+        return 0;
+    }
+    let mut at = start + 4;
+    for line in lines {
+        at += line.len();
+        if line.trim_end() == "---" {
+            return at;
+        }
+    }
+    0
 }
 
 /// Replaces the HTML labels that some diagrams, such as mind maps, draw whatever the settings say,
@@ -243,6 +261,21 @@ mod tests {
             renderer.image(Kind::Mermaid, "flowchart LR\n  idea --> draft --> note").unwrap();
         assert!(diagram.width > 20);
         assert!(renderer.image(Kind::Mermaid, "not a diagram at all").is_err());
+    }
+
+    #[test]
+    fn wraps_labels_after_front_matter() {
+        let label = "    id1[This is longer text in the box]\n";
+        for source in [
+            format!("flowchart LR\n{label}"),
+            format!("---\ntitle: Node with text\n---\nflowchart LR\n{label}"),
+        ] {
+            let svg = mermaid_svg(&source).unwrap();
+            assert!(svg.contains(">This</tspan>") && svg.contains(">in</tspan>"), "{source:?}");
+        }
+        assert_eq!(front_matter_end("---\ntitle: T\n---\nflowchart"), 17);
+        assert_eq!(front_matter_end("flowchart LR"), 0);
+        assert_eq!(front_matter_end("---\nunclosed"), 0);
     }
 
     #[test]
