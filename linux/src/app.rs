@@ -91,6 +91,11 @@ fn startup(app: &adw::Application, state: Arc<State>) {
                         shown.toast(&text);
                     }
                 }
+                UiEvent::NameSpace { space, from, arrived } => {
+                    if let Some(shown) = window.borrow().clone() {
+                        shown.name_space(space, from, arrived);
+                    }
+                }
             }
         }
     });

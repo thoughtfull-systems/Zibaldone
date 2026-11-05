@@ -79,6 +79,8 @@ pub struct Store {
     pub config: MachineConfig,
     /// The policy that this platform's implementation sets, as decision ZIB0004 requires.
     pub policy: Policy,
+    /// Whether this open created the machine's identity, so the machine is new.
+    pub created: bool,
 }
 
 impl Store {
@@ -87,6 +89,7 @@ impl Store {
         let dir = dirs.data.clone();
         create_private_dir(&dir)?;
         let path = dir.join(MACHINE);
+        let mut created = false;
         let config = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Space(format!("{}: {e}", path.display())))?,
@@ -102,11 +105,12 @@ impl Store {
                     page: Page::default(),
                 };
                 write_atomic(&path, &serde_json::to_vec_pretty(&config).expect("serializable"))?;
+                created = true;
                 config
             }
             Err(e) => return Err(Error::io(path, e)),
         };
-        Ok(Self { dir, config, policy })
+        Ok(Self { dir, config, policy, created })
     }
 
     pub fn dir(&self) -> &Path {
@@ -262,6 +266,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(root.path());
         let mut store = Store::open(&dirs, Policy::All).unwrap();
+        assert!(store.created);
         let machine = store.config.id;
         let mut space = store.create_space("Personal").unwrap();
         let note = space.create_note(schema::NOTE, "Hello").unwrap();
@@ -269,6 +274,7 @@ mod tests {
         let key = store.secret_key().unwrap();
 
         let reopened = Store::open(&dirs, Policy::All).unwrap();
+        assert!(!reopened.created);
         assert_eq!(reopened.config.id, machine);
         assert_eq!(reopened.secret_key().unwrap(), key);
         let id = space.id().unwrap();

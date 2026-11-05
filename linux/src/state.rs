@@ -25,6 +25,10 @@ use crate::derive;
 
 /// The Linux app keeps every file, as decision ZIB0004 sets for it.
 pub const POLICY: Policy = Policy::All;
+/// The pet name of the space that a new machine starts with.
+const DEFAULT_SPACE: &str = "Default";
+/// How many times a machine tries to receive a space that another shared with it while pairing.
+const RECEIVE_TRIES: u32 = 6;
 /// How long the instance syncs what it can before it quits.
 const QUIT_SYNC: Duration = Duration::from_secs(10);
 /// How often changed spaces go to disk.
@@ -45,6 +49,8 @@ pub enum UiEvent {
     ConfirmPairing { peer: Party, code: String, reply: oneshot::Sender<Option<Vec<Id>>> },
     /// Pairing or joining finished, with a message for the owner.
     Notice(String),
+    /// A space arrived from another machine with the name `arrived`: ask the owner for one.
+    NameSpace { space: Id, from: String, arrived: String },
 }
 
 /// A note, as the note list shows it.
@@ -143,6 +149,11 @@ impl State {
         });
         let _ = pairing.state.set(Arc::downgrade(&state));
         state.open_spaces().await?;
+        // A new machine starts with a space, so the owner can write a note straight away.
+        if state.store.lock().await.created {
+            let space = state.create_space(DEFAULT_SPACE).await?;
+            state.set_last_space(space).await?;
+        }
         tokio::spawn(state.node.clone().serve(pairing));
         tokio::spawn(state.clone().sync_forever());
         tokio::spawn(state.clone().save_forever());
@@ -265,6 +276,13 @@ impl State {
 
     pub async fn rename_space(&self, id: Id, name: &str) -> Result<()> {
         self.store.lock().await.rename_space(id, name)
+    }
+
+    /// The name of a machine in a space's `machines`.
+    pub async fn machine_name(&self, space: Id, machine: Id) -> Option<String> {
+        let space = self.space(space).await.ok()?;
+        let space = space.lock().await;
+        space.machines().into_iter().find(|m| m.id == machine).map(|m| m.name)
     }
 
     /// A space's notes, most recently changed first.
@@ -621,15 +639,29 @@ impl State {
         if self.node.spaces().lock().await.contains_key(&space_id) {
             return Ok(());
         }
-        let space = self.node.fetch(space_id, address).await?;
+        // The other machine adds this one as a member only once its side of pairing finishes, which
+        // can come after this side's first try, so later tries wait longer, up to half a minute.
+        let mut tries = 0;
+        let space = loop {
+            match self.node.fetch(space_id, address).await {
+                Ok(space) => break space,
+                Err(error) if tries + 1 >= RECEIVE_TRIES => return Err(error),
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(1 << tries)).await;
+                    tries += 1;
+                }
+            }
+        };
         let mut store = self.store.lock().await;
         let guard = space.lock().await;
-        store.add_space(&guard, &format!("Shared by {from}"))?;
+        let arrived = format!("Shared by {from}");
+        store.add_space(&guard, &arrived)?;
         store.record_peer(&guard)?;
         self.index(space_id, &guard)?;
         drop(guard);
         drop(store);
         self.send_ui(UiEvent::Changed(space_id));
+        self.send_ui(UiEvent::NameSpace { space: space_id, from: from.to_owned(), arrived });
         Ok(())
     }
 

@@ -32,8 +32,6 @@ const REPAINT: &str = "markup-repaint";
 const QUOTE_MARGIN: &str = "markup-quote-margin";
 /// How far a block quote sits inside the editor's left margin.
 const QUOTE_INDENT: i32 = 16;
-/// Another machine's cursor or selection.
-pub const REMOTE: &str = "remote";
 const SYNTAX: &str = "markup-syntax";
 
 /// Creates the editor view. Its colors follow the system's light or dark preference.
@@ -364,11 +362,10 @@ fn add_tags(table: &gtk::TextTagTable) {
             .build(),
         gtk::TextTag::builder().name(tag(Style::ListPrefix)).family("monospace").build(),
         gtk::TextTag::builder().name(HIDDEN).invisible(true).build(),
-        gtk::TextTag::builder()
-            .name(REMOTE)
-            .background_rgba(&gdk::RGBA::new(1.0, 0.82, 0.5, 0.5))
-            .build(),
     ] {
+        table.add(&added);
+    }
+    for added in crate::remote::tags() {
         table.add(&added);
     }
     // A tag added later wins, so syntax would take the color of a heading it sits in.

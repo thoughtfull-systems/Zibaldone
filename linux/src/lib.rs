@@ -8,6 +8,7 @@ pub mod drawings;
 pub mod editor;
 pub mod icon;
 pub mod instance;
+pub mod remote;
 pub mod state;
 pub mod tray;
 pub mod window;

@@ -60,6 +60,8 @@ pub struct Inner {
     status: gtk::Button,
     editor: RefCell<Option<Editor>>,
     loading: Cell<bool>,
+    /// Other machines' cursors in the open note.
+    remote: Rc<crate::remote::Remote>,
 }
 
 /// The note open in the editor.
@@ -227,11 +229,13 @@ impl Window {
             status,
             editor: RefCell::default(),
             loading: Cell::new(false),
+            remote: crate::remote::Remote::new(view.upcast_ref()),
         }));
         this.connect(&new_note, &add_file, &delete, &view);
         this.update_history();
         this.reload_spaces();
         this.watch_status();
+        this.resend_cursor();
         this
     }
 
@@ -836,6 +840,7 @@ impl Window {
                 core(async move { state.close_note(space, note) }).await;
             });
         }
+        self.inner().remote.clear();
         self.inner().open_file.set_visible(false);
     }
 
@@ -850,29 +855,34 @@ impl Window {
         if !is_open {
             return;
         }
+        let remote = &self.inner().remote;
         match event {
-            LiveEvent::Changed => {
-                if let Some(editor) = self.inner().editor.borrow().as_ref() {
-                    editor.live.set(true);
-                }
+            LiveEvent::Started { machine } => {
+                remote.started(machine);
+                // The other machine sees this one's cursor at once, not at the next move.
+                self.cursor_moved();
+            }
+            LiveEvent::Changed { machine } => {
+                remote.started(machine);
                 self.refresh_open(space, note);
             }
-            LiveEvent::Cursor { selections, .. } => {
-                if let Some(editor) = self.inner().editor.borrow().as_ref() {
-                    editor.live.set(true);
-                }
-                self.update_title();
-                self.show_remote(space, selections);
+            LiveEvent::Cursor { machine, selections } => {
+                let name = self.inner().state.clone();
+                let w = self.clone();
+                glib::spawn_future_local(async move {
+                    let name = core(async move { name.machine_name(space, machine).await })
+                        .await
+                        .unwrap_or_default();
+                    w.inner().remote.received(machine, name, selections);
+                    w.place_remote(space);
+                });
             }
-            LiveEvent::Ended => {
-                if let Some(editor) = self.inner().editor.borrow().as_ref() {
-                    editor.live.set(false);
-                }
-                let buffer = &self.inner().buffer;
-                buffer.remove_tag_by_name(editor::REMOTE, &buffer.start_iter(), &buffer.end_iter());
-                self.update_title();
-            }
+            LiveEvent::Ended { machine } => remote.ended(machine),
         }
+        if let Some(editor) = self.inner().editor.borrow().as_ref() {
+            editor.live.set(remote.live());
+        }
+        self.update_title();
     }
 
     /// Reloads the open note after another machine changed it, keeping the owner's typing.
@@ -917,6 +927,8 @@ impl Window {
             w.set_text(&text);
             buffer.place_cursor(&buffer.iter_at_offset(cursor.min(buffer.char_count())));
             w.update_title();
+            // Replacing the text moved every mark, so the cursors go back where they belong.
+            w.place_remote(space);
         });
     }
 
@@ -925,7 +937,7 @@ impl Window {
         let (space, note, sender, insertions) = {
             let editor = self.inner().editor.borrow();
             let Some(editor) = editor.as_ref() else { return };
-            let Some(sender) = editor.cursors.clone().filter(|_| editor.live.get()) else { return };
+            let Some(sender) = editor.cursors.clone() else { return };
             (editor.space, editor.note, sender, editor.insertions.clone())
         };
         let buffer = &self.inner().buffer;
@@ -953,20 +965,25 @@ impl Window {
         });
     }
 
-    /// Marks another machine's cursors and selections in the editor.
-    fn show_remote(&self, space: Id, selections: Vec<Selection>) {
+    /// Turns each machine's cursors into places in the text, and shows them there.
+    fn place_remote(&self, space: Id) {
         let w = self.clone();
         let state = self.inner().state.clone();
+        let selections = self.inner().remote.selections();
         glib::spawn_future_local(async move {
             let positions = core(async move {
                 let mut out = Vec::new();
-                for selection in selections {
-                    if let (Some(a), Some(h)) = (
-                        state.cursor_position(space, &selection.anchor).await,
-                        state.cursor_position(space, &selection.head).await,
-                    ) {
-                        out.push((a.min(h), a.max(h)));
+                for (machine, selections) in selections {
+                    let mut places = Vec::new();
+                    for selection in selections {
+                        if let (Some(a), Some(h)) = (
+                            state.cursor_position(space, &selection.anchor).await,
+                            state.cursor_position(space, &selection.head).await,
+                        ) {
+                            places.push((a, h));
+                        }
                     }
+                    out.push((machine, places));
                 }
                 out
             })
@@ -976,21 +993,29 @@ impl Window {
                 .editor
                 .borrow()
                 .as_ref()
-                .map(|e| e.insertions.clone())
-                .unwrap_or_default();
-            let buffer = &w.inner().buffer;
-            buffer.remove_tag_by_name(editor::REMOTE, &buffer.start_iter(), &buffer.end_iter());
-            for (start, end) in positions {
-                let start = i32::try_from(body::stored_to_shown(start, &insertions)).unwrap_or(0);
-                let end = i32::try_from(body::stored_to_shown(end, &insertions))
-                    .unwrap_or(0)
-                    .max(start + 1);
-                buffer.apply_tag_by_name(
-                    editor::REMOTE,
-                    &buffer.iter_at_offset(start),
-                    &buffer.iter_at_offset(end),
-                );
+                .filter(|e| e.space == space)
+                .map(|e| e.insertions.clone());
+            let Some(insertions) = insertions else { return };
+            let shown = |stored: usize| {
+                i32::try_from(body::stored_to_shown(stored, &insertions)).unwrap_or(i32::MAX)
+            };
+            for (machine, places) in positions {
+                let offsets: Vec<(i32, i32)> =
+                    places.into_iter().map(|(a, h)| (shown(a), shown(h))).collect();
+                w.inner().remote.place_at(machine, &offsets);
             }
+        });
+    }
+
+    /// Sends the owner's cursor again while it stays still, and drops other machines' cursors
+    /// that went quiet, as live editing in the sync specification asks.
+    fn resend_cursor(&self) {
+        let w = Rc::downgrade(&self.0);
+        glib::timeout_add_local(crate::remote::RESEND, move || {
+            let Some(w) = w.upgrade().map(Self) else { return glib::ControlFlow::Break };
+            w.cursor_moved();
+            w.inner().remote.expire();
+            glib::ControlFlow::Continue
         });
     }
 
@@ -1120,6 +1145,21 @@ impl Window {
             if response != "ok" || name.is_empty() {
                 return;
             }
+            let state = w.inner().state.clone();
+            let _ = core(async move { state.rename_space(space, &name).await }).await;
+            w.reload_spaces();
+        });
+    }
+
+    /// Asks the owner to name a space that `from` shared with this machine, which the pairing
+    /// specification asks for. Without an answer, it keeps the name it arrived with.
+    pub fn name_space(&self, space: Id, from: String, arrived: String) {
+        let w = self.clone();
+        glib::spawn_future_local(async move {
+            let heading = format!("Name the space from {from}");
+            let Some(name) = ask(&w.inner().window, &heading, &arrived, "Name").await else {
+                return;
+            };
             let state = w.inner().state.clone();
             let _ = core(async move { state.rename_space(space, &name).await }).await;
             w.reload_spaces();
@@ -1528,6 +1568,13 @@ pub async fn ask(
     dialog.set_default_response(Some("ok"));
     dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
     dialog.set_extra_child(Some(&entry));
+    // The dialog focuses its buttons as it opens, so the entry takes the focus once it shows.
+    entry.connect_map(|entry| {
+        let entry = entry.clone();
+        glib::idle_add_local_once(move || {
+            entry.grab_focus();
+        });
+    });
     let response = dialog.choose_future(Some(parent)).await;
     let name = entry.text().trim().to_owned();
     (response == "ok" && !name.is_empty()).then_some(name)

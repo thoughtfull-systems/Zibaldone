@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, presets};
+use iroh::endpoint::{Connection, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -23,6 +23,16 @@ use crate::{Error, Id, Result, Space};
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long one exchange may take.
 pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Finishes a stream and closes its connection once the other machine acknowledges everything
+/// sent on it, since closing a connection discards what's still on the way, such as a last message
+/// that crossed the other machine's own last message.
+async fn close_after_sent(connection: &Connection, mut send: SendStream) {
+    if send.finish().is_ok() {
+        let _ = timeout(CONNECT_TIMEOUT, send.stopped()).await;
+    }
+    connection.close(0u32.into(), b"done");
+}
 
 /// Where an endpoint looks for other machines.
 #[derive(Clone, Debug)]
@@ -344,11 +354,11 @@ impl Node {
         let connection = self.connect(address, sync::ALPN).await?;
         let (send, recv) =
             connection.open_bi().await.map_err(|e| Error::Protocol(e.to_string()))?;
-        let result =
-            timeout(EXCHANGE_TIMEOUT, sync::dial(tokio::io::join(recv, send), space, address.key))
-                .await
-                .map_err(|_| Error::Protocol("the exchange took too long".into()))?;
-        connection.close(0u32.into(), b"done");
+        let mut stream = tokio::io::join(recv, send);
+        let result = timeout(EXCHANGE_TIMEOUT, sync::dial(&mut stream, space, address.key))
+            .await
+            .map_err(|_| Error::Protocol("the exchange took too long".into()))?;
+        close_after_sent(&connection, stream.into_inner().1).await;
         result
     }
 
@@ -595,9 +605,9 @@ impl Node {
         let connection = self.connect(address, pairing::ALPN).await?;
         let (send, recv) =
             connection.open_bi().await.map_err(|e| Error::Protocol(e.to_string()))?;
-        let paired =
-            pairing::initiate(tokio::io::join(recv, send), &self.me, address.key, confirm).await;
-        connection.close(0u32.into(), b"done");
+        let mut stream = tokio::io::join(recv, send);
+        let paired = pairing::initiate(&mut stream, &self.me, address.key, confirm).await;
+        close_after_sent(&connection, stream.into_inner().1).await;
         paired
     }
 
@@ -857,7 +867,7 @@ mod live_tests {
         let changed = timeout(Duration::from_secs(5), async {
             loop {
                 match b_open.events.recv().await {
-                    Some(LiveEvent::Changed)
+                    Some(LiveEvent::Changed { .. })
                         if copy.lock().await.note(note).unwrap().body == "shared live" =>
                     {
                         return true;

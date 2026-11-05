@@ -288,12 +288,14 @@ pub async fn answer_hold<W: AsyncWrite + Unpin>(
 /// What a live editing session reports to the app.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LiveEvent {
+    /// The session with `machine` started.
+    Started { machine: Id },
     /// The other machine's changes arrived and the space imported them.
-    Changed,
+    Changed { machine: Id },
     /// The other machine's cursors and selections in the note.
     Cursor { machine: Id, selections: Vec<Selection> },
-    /// The session ended.
-    Ended,
+    /// The session with `machine` ended.
+    Ended { machine: Id },
 }
 
 /// Runs a live editing session on a stream where both sides have the note open: it catches the
@@ -312,6 +314,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
+    let _ = events.send(LiveEvent::Started { machine: peer }).await;
     if let Some(updates) = space.lock().await.updates_since(peer_version)? {
         send(&mut writer, &Message::Updates { updates }).await?;
     }
@@ -344,7 +347,7 @@ where
             message = frame::read::<_, Message>(&mut reader, MAX_FRAME) => match message? {
                 Some(Message::Updates { updates }) => {
                     space.lock().await.import_checked(&updates)?;
-                    let _ = events.send(LiveEvent::Changed).await;
+                    let _ = events.send(LiveEvent::Changed { machine: peer }).await;
                 }
                 Some(Message::Cursor { selections, .. }) => {
                     let _ = events.send(LiveEvent::Cursor { machine: peer, selections }).await;
@@ -354,7 +357,7 @@ where
             },
         }
     };
-    let _ = events.send(LiveEvent::Ended).await;
+    let _ = events.send(LiveEvent::Ended { machine: peer }).await;
     result
 }
 
@@ -562,8 +565,10 @@ mod tests {
         let b_session = tokio::spawn(async move {
             live(two, &b, a_id, &version_a, b_rx, b_cursor_rx, b_events_tx).await
         });
-        // B catches up with A's note through the session.
-        assert_eq!(b_events.recv().await, Some(LiveEvent::Changed));
+        // Each side hears that the session started, then B catches up with A's note through it.
+        assert_eq!(b_events.recv().await, Some(LiveEvent::Started { machine: a_id }));
+        assert_eq!(a_events.recv().await, Some(LiveEvent::Started { machine: b_id }));
+        assert_eq!(b_events.recv().await, Some(LiveEvent::Changed { machine: a_id }));
         assert_eq!(p.b.lock().await.note(note).unwrap().body, "shared");
         // A types; its local update reaches B.
         let before = p.a.lock().await.version();
@@ -574,7 +579,7 @@ mod tests {
         }
         let update = p.a.lock().await.updates_since(&before).unwrap().unwrap();
         a_tx.send(update).unwrap();
-        assert_eq!(b_events.recv().await, Some(LiveEvent::Changed));
+        assert_eq!(b_events.recv().await, Some(LiveEvent::Changed { machine: a_id }));
         assert_eq!(p.b.lock().await.note(note).unwrap().body, "shared!");
         // B's cursor reaches A.
         let selection = Selection { anchor: vec![1], head: vec![1] };
@@ -585,8 +590,8 @@ mod tests {
                     assert_eq!(selections, vec![selection]);
                     break;
                 }
-                LiveEvent::Changed => {}
-                LiveEvent::Ended => panic!("ended early"),
+                LiveEvent::Started { .. } | LiveEvent::Changed { .. } => {}
+                LiveEvent::Ended { .. } => panic!("ended early"),
             }
         }
         // B closes the note.
