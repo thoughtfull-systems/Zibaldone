@@ -314,49 +314,104 @@ pub struct MarkedSpan {
 /// The underlines and highlights in one block's text, paired by the same rules as `*` for
 /// emphasis in `CommonMark`, with `\=` as a literal `=`.
 pub fn marked_spans(text: &str) -> Vec<MarkedSpan> {
-    let bytes = text.as_bytes();
-    let mut runs: Vec<(Range<usize>, bool, bool)> = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i += 2;
-            continue;
+    let mut runs = Vec::new();
+    mark_runs(text, 0..text.len(), 0, &mut runs);
+    pair_marks(runs)
+}
+
+/// The underlines and highlights of `body`, paired within each block. A pair's runs lie in the
+/// same element, such as a paragraph, an emphasis, or a link's text, so the marks of `==**a**==`
+/// pair around the strong emphasis, but a pair never crosses an element's edge. The marks in a
+/// wikilink's label pair among themselves, and code and math hold none.
+pub fn marks(body: &str) -> Vec<MarkedSpan> {
+    let links = wikilinks(body);
+    let mut runs = Vec::new();
+    let mut elements = vec![0];
+    let mut next = 1;
+    let mut in_code_block = false;
+    for (event, range) in Parser::new_ext(body, options()).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                in_code_block |= matches!(tag, Tag::CodeBlock(_));
+                elements.push(next);
+                next += 1;
+            }
+            Event::End(end) => {
+                in_code_block &= end != TagEnd::CodeBlock;
+                elements.pop();
+            }
+            Event::Text(_) if !in_code_block => {
+                let element = *elements.last().unwrap_or(&0);
+                let start = runs.len();
+                mark_runs(body, range, element, &mut runs);
+                // Element numbers count up from 0, and wikilinks' count down from the top.
+                for run in &mut runs[start..] {
+                    if let Some(i) = links.iter().position(|l| l.range.contains(&run.range.start)) {
+                        run.element = usize::MAX - i;
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+    pair_marks(runs)
+}
+
+/// A run of `=`, the element it lies in, and whether it can open and close a mark.
+struct MarkRun {
+    range: Range<usize>,
+    element: usize,
+    open: bool,
+    close: bool,
+}
+
+/// Adds the runs of `=` in the `within` part of `text` to `runs`. The characters around `within`
+/// decide whether a run at its edge opens or closes a mark, and whether a backslash escapes it.
+fn mark_runs(text: &str, within: Range<usize>, element: usize, runs: &mut Vec<MarkRun>) {
+    let bytes = text.as_bytes();
+    let mut i = within.start;
+    while i < within.end {
         if bytes[i] != b'=' {
             i += 1;
             continue;
         }
+        let backslashes = bytes[..i].iter().rev().take_while(|b| **b == b'\\').count();
+        if backslashes % 2 == 1 {
+            i += 1;
+            continue;
+        }
         let start = i;
-        while i < bytes.len() && bytes[i] == b'=' {
+        while i < within.end && bytes[i] == b'=' {
             i += 1;
         }
         let before = text[..start].chars().next_back();
         let after = text[i..].chars().next();
         let space = |c: Option<char>| c.is_none_or(char::is_whitespace);
         let punct = |c: Option<char>| c.is_some_and(|c| c.is_ascii_punctuation());
-        let left = !space(after) && (!punct(after) || space(before) || punct(before));
-        let right = !space(before) && (!punct(before) || space(after) || punct(after));
-        runs.push((start..i, left, right));
+        let open = !space(after) && (!punct(after) || space(before) || punct(before));
+        let close = !space(before) && (!punct(before) || space(after) || punct(after));
+        runs.push(MarkRun { range: start..i, element, open, close });
     }
+}
+
+/// Pairs runs of `=` of the same length in the same element, as `CommonMark` pairs `*`.
+fn pair_marks(runs: Vec<MarkRun>) -> Vec<MarkedSpan> {
     let mut spans = Vec::new();
-    let mut openers: Vec<Range<usize>> = Vec::new();
-    for (range, can_open, can_close) in runs {
-        let len = range.len();
-        if Mark::from_len(len).is_none() {
-            continue;
-        }
-        if can_close && let Some(pos) = openers.iter().rposition(|o| o.len() == len) {
-            let open = openers.remove(pos);
+    let mut openers: Vec<MarkRun> = Vec::new();
+    for run in runs {
+        let len = run.range.len();
+        let Some(mark) = Mark::from_len(len) else { continue };
+        let opener = openers.iter().rposition(|o| o.range.len() == len && o.element == run.element);
+        if run.close
+            && let Some(pos) = opener
+        {
+            let open = openers.remove(pos).range;
             openers.truncate(pos);
-            spans.push(MarkedSpan {
-                mark: Mark::from_len(len).expect("checked"),
-                open,
-                close: range,
-            });
+            spans.push(MarkedSpan { mark, open, close: run.range });
             continue;
         }
-        if can_open {
-            openers.push(range);
+        if run.open {
+            openers.push(run);
         }
     }
     spans.sort_by_key(|span| span.open.start);
@@ -760,6 +815,25 @@ mod tests {
         assert_eq!(marked_spans("x=5 and y=6").len(), 1);
         assert_eq!(marked_spans("x\\=5 and y\\=6").len(), 0);
         assert_eq!(marked_spans("====four====").len(), 0);
+    }
+
+    #[test]
+    fn pairs_marks_around_other_elements() {
+        let pairs = |body: &str| {
+            marks(body)
+                .into_iter()
+                .map(|span| body[span.open.start..span.close.end].to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs("==**this**== and **==that==**"), ["==**this**==", "==that=="]);
+        // A pair can't cross an element's edge, or reach into code or another block.
+        assert_eq!(pairs("**a ==b** c=="), [] as [&str; 0]);
+        assert_eq!(pairs("==a `b==` c\n\nd=="), [] as [&str; 0]);
+        assert_eq!(pairs("x\\=5 and y\\=6"), [] as [&str; 0]);
+        assert_eq!(
+            pairs(&format!("==a [[{A}|=b=]] c==")),
+            [format!("==a [[{A}|=b=]] c=="), "=b=".into()]
+        );
     }
 
     #[test]

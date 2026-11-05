@@ -66,7 +66,6 @@ pub fn spans(body: &str) -> Vec<Span> {
 
     let mut spans = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
-    let mut in_code_block = false;
     for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
         if !matches!(event, Event::End(_))
             && let Some(parent) = stack.last_mut()
@@ -77,14 +76,10 @@ pub fn spans(body: &str) -> Vec<Span> {
             });
         }
         match event {
-            Event::Text(_) if !in_code_block => marks(body, &range, &mut spans),
             Event::Start(tag) => {
                 let style = match tag {
                     Tag::BlockQuote(_) => Some(Style::BlockQuote),
-                    Tag::CodeBlock(_) => {
-                        in_code_block = true;
-                        Some(Style::CodeBlock)
-                    }
+                    Tag::CodeBlock(_) => Some(Style::CodeBlock),
                     Tag::Emphasis => Some(Style::Emphasis),
                     Tag::Heading { level, .. } => Some(Style::Heading(level as u8)),
                     Tag::Link { .. } => Some(Style::Link),
@@ -94,10 +89,7 @@ pub fn spans(body: &str) -> Vec<Span> {
                 };
                 stack.push(Frame { inner: None, range, style });
             }
-            Event::End(end) => {
-                if end == TagEnd::CodeBlock {
-                    in_code_block = false;
-                }
+            Event::End(_) => {
                 let Some(Frame { inner, range, style: Some(style) }) = stack.pop() else {
                     continue;
                 };
@@ -137,6 +129,7 @@ pub fn spans(body: &str) -> Vec<Span> {
             _ => {}
         }
     }
+    marks(body, &mut spans);
     spans.extend(list_prefixes(body));
     for link in body::wikilinks(body) {
         let Range { start, end } = link.range;
@@ -319,14 +312,11 @@ fn delimited(body: &str, range: Range<usize>, delimiter: u8, style: Style) -> Sp
     span(body, range, style, syntax)
 }
 
-/// The underlines and highlights in a run of text, which the note bodies specification marks
-/// with `=`.
-fn marks(body: &str, range: &Range<usize>, spans: &mut Vec<Span>) {
-    for marked in body::marked_spans(&body[range.clone()]) {
-        let open = range.start + marked.open.start..range.start + marked.open.end;
-        let close = range.start + marked.close.start..range.start + marked.close.end;
-        let whole = open.start..close.end;
-        let syntax = vec![open, close];
+/// The underlines and highlights of `body`, which the note bodies specification marks with `=`.
+fn marks(body: &str, spans: &mut Vec<Span>) {
+    for marked in body::marks(body) {
+        let whole = marked.open.start..marked.close.end;
+        let syntax = vec![marked.open, marked.close];
         match marked.mark {
             Mark::Underline => spans.push(span(body, whole, Style::Underline, syntax)),
             Mark::Highlight => spans.push(span(body, whole, Style::Highlight, syntax)),
@@ -565,6 +555,16 @@ mod tests {
         assert_eq!(
             hidden("an =under= and ==high== line"),
             [(Style::Underline, vec!["=", "="]), (Style::Highlight, vec!["==", "=="])]
+        );
+        // A mark can hold other spans, and a span can hold a mark.
+        assert_eq!(
+            hidden("==**this**== and **==that==**"),
+            [
+                (Style::Highlight, vec!["==", "=="]),
+                (Style::Strong, vec!["**", "**"]),
+                (Style::Strong, vec!["**", "**"]),
+                (Style::Highlight, vec!["==", "=="]),
+            ]
         );
     }
 

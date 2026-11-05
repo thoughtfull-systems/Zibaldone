@@ -6,7 +6,7 @@ use std::ops::Range;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 
 use crate::Id;
-use crate::body::{self, Mark, WikiLink};
+use crate::body::{self, Mark, MarkedSpan, WikiLink};
 
 /// A block of a note's body.
 #[derive(Clone, Debug, PartialEq)]
@@ -85,8 +85,18 @@ pub enum Inline {
 /// The tree of a note's body.
 pub fn parse(body: &str) -> Vec<Block> {
     let links = body::wikilinks(body);
-    let mut builder =
-        Builder { source: body, links: &links, stack: vec![Frame::root()], skip_until: 0 };
+    // A wikilink's label is parsed on its own, marks and all.
+    let marks: Vec<MarkedSpan> = body::marks(body)
+        .into_iter()
+        .filter(|mark| !links.iter().any(|link| link.range.contains(&mark.open.start)))
+        .collect();
+    let mut builder = Builder {
+        source: body,
+        links: &links,
+        marks: &marks,
+        stack: vec![Frame::root()],
+        skip_until: 0,
+    };
     for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
         builder.event(event, range);
     }
@@ -103,15 +113,35 @@ struct Frame {
 enum FrameKind {
     Root,
     Paragraph,
-    Heading { level: u8, setext: Option<String> },
+    Heading {
+        level: u8,
+        setext: Option<String>,
+    },
     Quote,
-    List { start: Option<u64>, items: Vec<Item> },
-    Item { checked: Option<bool> },
+    List {
+        start: Option<u64>,
+        items: Vec<Item>,
+    },
+    Item {
+        checked: Option<bool>,
+    },
     Span(SpanKind),
-    Link { url: String },
-    Image { url: String },
-    Code { language: String, text: String },
-    Table { rows: Vec<Vec<Vec<Block>>>, header_rows: usize },
+    Link {
+        url: String,
+    },
+    Image {
+        url: String,
+    },
+    /// An underline or highlight, whose `=` runs open and close it inside text.
+    Mark(Mark),
+    Code {
+        language: String,
+        text: String,
+    },
+    Table {
+        rows: Vec<Vec<Vec<Block>>>,
+        header_rows: usize,
+    },
     Row,
     Cell,
     Html,
@@ -139,6 +169,7 @@ impl Frame {
 struct Builder<'a> {
     source: &'a str,
     links: &'a [WikiLink],
+    marks: &'a [MarkedSpan],
     stack: Vec<Frame>,
     /// Text before this byte belongs to a wikilink already emitted.
     skip_until: usize,
@@ -229,7 +260,7 @@ impl Builder<'_> {
 
     fn end(&mut self, end: TagEnd) {
         let frame = self.stack.pop().expect("a frame for each end");
-        let inlines = apply_marks(frame.inlines);
+        let inlines = frame.inlines;
         match frame.kind {
             FrameKind::Root => unreachable!("the root never ends"),
             FrameKind::Paragraph | FrameKind::Cell => self.push_block(Block::Paragraph(inlines)),
@@ -261,7 +292,8 @@ impl Builder<'_> {
                     items.push(Item { checked, blocks });
                 }
             }
-            FrameKind::Span(SpanKind::Plain) => {
+            // A mark's closing run ends it before its element ends.
+            FrameKind::Span(SpanKind::Plain) | FrameKind::Mark(_) => {
                 for inline in inlines {
                     self.push_inline(inline);
                 }
@@ -328,6 +360,49 @@ impl Builder<'_> {
             code.push_str(text);
             return;
         }
+        let mut runs: Vec<(Range<usize>, Option<Mark>)> = self
+            .marks
+            .iter()
+            .flat_map(|mark| [(mark.open.clone(), Some(mark.mark)), (mark.close.clone(), None)])
+            .filter(|(run, _)| range.start <= run.start && run.end <= range.end)
+            .collect();
+        if runs.is_empty() {
+            self.unmarked_text(text, range);
+            return;
+        }
+        runs.sort_by_key(|(run, _)| run.start);
+        let source = self.source;
+        let mut at = range.start;
+        for (run, mark) in runs {
+            if at < run.start {
+                self.unmarked_text(&source[at..run.start], at..run.start);
+            }
+            match mark {
+                Some(mark) => self.stack.push(Frame::new(FrameKind::Mark(mark))),
+                None => self.close_mark(&source[run.clone()]),
+            }
+            at = run.end;
+        }
+        if at < range.end {
+            self.unmarked_text(&source[at..range.end], at..range.end);
+        }
+    }
+
+    /// Ends the underline or highlight that the innermost frame holds, at its closing `run`.
+    fn close_mark(&mut self, run: &str) {
+        let FrameKind::Mark(mark) = self.top().kind else {
+            self.push_inline(Inline::Text(run.to_owned()));
+            return;
+        };
+        let inlines = self.stack.pop().expect("a mark's frame").inlines;
+        self.push_inline(match mark {
+            Mark::Underline => Inline::Underline(inlines),
+            Mark::Highlight => Inline::Highlight(inlines),
+            Mark::Both => Inline::Underline(vec![Inline::Highlight(inlines)]),
+        });
+    }
+
+    fn unmarked_text(&mut self, text: &str, range: Range<usize>) {
         // Wikilinks span several text events, so they come from their ranges in the source.
         let mut at = range.start;
         let mut out = Vec::new();
@@ -415,46 +490,6 @@ fn autolinks(text: &str) -> Vec<Inline> {
     out
 }
 
-/// Turns pairs of `=` runs in text into underlines and highlights, within each text run.
-fn apply_marks(inlines: Vec<Inline>) -> Vec<Inline> {
-    let mut out = Vec::with_capacity(inlines.len());
-    for inline in inlines {
-        match inline {
-            Inline::Text(text) if text.contains('=') => out.extend(marks_in(&text)),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-fn marks_in(text: &str) -> Vec<Inline> {
-    let spans = body::marked_spans(text);
-    if spans.is_empty() {
-        return vec![Inline::Text(text.replace("\\=", "="))];
-    }
-    let mut out = Vec::new();
-    let mut at = 0;
-    for span in &spans {
-        if span.open.start < at {
-            continue;
-        }
-        if span.open.start > at {
-            out.push(Inline::Text(text[at..span.open.start].replace("\\=", "=")));
-        }
-        let inner = marks_in(&text[span.open.end..span.close.start]);
-        out.push(match span.mark {
-            Mark::Underline => Inline::Underline(inner),
-            Mark::Highlight => Inline::Highlight(inner),
-            Mark::Both => Inline::Underline(vec![Inline::Highlight(inner)]),
-        });
-        at = span.close.end;
-    }
-    if at < text.len() {
-        out.push(Inline::Text(text[at..].replace("\\=", "=")));
-    }
-    out
-}
-
 /// The text of inlines, without formatting.
 pub fn flatten_text(inlines: &[Inline]) -> String {
     let mut out = String::new();
@@ -505,6 +540,20 @@ mod tests {
         assert!(inlines.iter().any(|i| matches!(i, Inline::Underline(_))));
         let Block::List { items, .. } = &tree[2] else { panic!("{tree:?}") };
         assert_eq!(items[0].checked, Some(true));
+    }
+
+    #[test]
+    fn marks_hold_other_spans() {
+        let text = |t: &str| Inline::Text(t.into());
+        assert_eq!(
+            parse("==**this**== and =a ==b= c=="),
+            [Block::Paragraph(vec![
+                Inline::Highlight(vec![Inline::Strong(vec![text("this")])]),
+                text(" and "),
+                Inline::Underline(vec![text("a ==b")]),
+                text(" c=="),
+            ])]
+        );
     }
 
     #[test]
