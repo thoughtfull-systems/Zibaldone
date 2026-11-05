@@ -6,7 +6,7 @@ use std::ops::Range;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 
 use crate::Id;
-use crate::body::{self, Mark, MarkedSpan, WikiLink};
+use crate::body::{self, Alignment, Mark, MarkedSpan, WikiLink};
 
 /// A block of a note's body.
 #[derive(Clone, Debug, PartialEq)]
@@ -33,6 +33,8 @@ pub enum Block {
     Table {
         header_rows: usize,
         header_columns: usize,
+        /// Each column's alignment, which only pipe tables set.
+        alignments: Vec<Alignment>,
         rows: Vec<Vec<Vec<Block>>>,
     },
     Rule,
@@ -141,6 +143,7 @@ enum FrameKind {
     Table {
         rows: Vec<Vec<Vec<Block>>>,
         header_rows: usize,
+        alignments: Vec<Alignment>,
     },
     Row,
     Cell,
@@ -249,7 +252,11 @@ impl Builder<'_> {
                 },
                 text: String::new(),
             },
-            Tag::Table(_) => FrameKind::Table { rows: Vec::new(), header_rows: 0 },
+            Tag::Table(alignments) => FrameKind::Table {
+                rows: Vec::new(),
+                header_rows: 0,
+                alignments: alignments.iter().map(|alignment| alignment_of(*alignment)).collect(),
+            },
             Tag::TableHead | Tag::TableRow => FrameKind::Row,
             Tag::TableCell => FrameKind::Cell,
             Tag::HtmlBlock => FrameKind::Html,
@@ -320,6 +327,7 @@ impl Builder<'_> {
                         Some(table) => Block::Table {
                             header_rows: table.header_rows,
                             header_columns: table.header_columns,
+                            alignments: table.alignments,
                             rows: table
                                 .rows
                                 .iter()
@@ -332,8 +340,8 @@ impl Builder<'_> {
                 };
                 self.push_block(block);
             }
-            FrameKind::Table { rows, header_rows } => {
-                self.push_block(Block::Table { header_rows, header_columns: 0, rows });
+            FrameKind::Table { rows, header_rows, alignments } => {
+                self.push_block(Block::Table { header_rows, header_columns: 0, alignments, rows });
             }
             FrameKind::Row => {
                 let cells = frame.blocks.into_iter().map(|cell| match cell {
@@ -341,7 +349,7 @@ impl Builder<'_> {
                     other => vec![other],
                 });
                 let row: Vec<Vec<Block>> = cells.collect();
-                if let FrameKind::Table { rows, header_rows } = &mut self.top().kind {
+                if let FrameKind::Table { rows, header_rows, .. } = &mut self.top().kind {
                     if matches!(end, TagEnd::TableHead) {
                         *header_rows += 1;
                     }
@@ -515,6 +523,15 @@ pub fn flatten_text(inlines: &[Inline]) -> String {
     out
 }
 
+fn alignment_of(alignment: pulldown_cmark::Alignment) -> Alignment {
+    match alignment {
+        pulldown_cmark::Alignment::None => Alignment::None,
+        pulldown_cmark::Alignment::Left => Alignment::Left,
+        pulldown_cmark::Alignment::Center => Alignment::Center,
+        pulldown_cmark::Alignment::Right => Alignment::Right,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,7 +606,7 @@ mod tests {
     fn renders_math_diagrams_and_tables() {
         let body = [
             "Inline $x^2$.\n\n$$\\int f$$\n\n```math\na+b\n```\n\n",
-            "```mermaid\nflowchart LR\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n",
+            "```mermaid\nflowchart LR\n```\n\n| a | b |\n|---|:-:|\n| 1 | 2 |\n\n",
             "```table header-columns=1\n- - H\n  - *x*\n```\n",
         ]
         .concat();
@@ -601,6 +618,8 @@ mod tests {
         let tables: Vec<_> = tree.iter().filter(|b| matches!(b, Block::Table { .. })).collect();
         assert_eq!(tables.len(), 2);
         assert!(matches!(tables[0], Block::Table { header_rows: 1, rows, .. } if rows.len() == 2));
+        let Block::Table { alignments, .. } = tables[0] else { unreachable!() };
+        assert_eq!(alignments, &[Alignment::None, Alignment::Center]);
         assert!(matches!(tables[1], Block::Table { header_columns: 1, .. }));
     }
 }

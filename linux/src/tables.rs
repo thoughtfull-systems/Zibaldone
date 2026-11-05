@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use adw::prelude::*;
 use gtk::{gdk, glib, graphene};
 use zib_core::Id;
-use zib_core::body::ListTable;
+use zib_core::body::{Alignment, ListTable};
 use zib_core::markup::{self, Block, Inline, Item};
 use zib_core::render::{Image, Kind};
 
@@ -116,7 +116,8 @@ pub fn link_targets(table: &ListTable) -> Vec<Id> {
 /// A grid of `table`'s cells, showing what they link to and the drawings from `refs`.
 pub fn widget(table: &ListTable, refs: &Refs) -> gtk::Widget {
     let rows = table.rows.iter().map(|row| row.iter().map(|cell| markup::parse(cell)).collect());
-    grid(&rows.collect::<Vec<_>>(), table.header_rows, table.header_columns, refs)
+    let rows = rows.collect::<Vec<_>>();
+    grid(&rows, table.header_rows, table.header_columns, &table.alignments, refs)
 }
 
 /// A cell of a table: its row and column, then, for a cell of a table inside that cell, which table
@@ -163,6 +164,7 @@ fn grid(
     rows: &[Vec<Vec<Block>>],
     header_rows: usize,
     header_columns: usize,
+    alignments: &[Alignment],
     refs: &Refs,
 ) -> gtk::Widget {
     style();
@@ -179,10 +181,28 @@ fn grid(
                 cell.add_css_class("zib-table-header");
             }
             append_blocks(&cell, blocks, refs);
+            let alignment = usize::try_from(column).ok().and_then(|c| alignments.get(c));
+            align(&cell, alignment.copied().unwrap_or_default());
             grid.attach(&cell, column, row, 1, 1);
         }
     }
     grid.upcast()
+}
+
+/// Places the blocks of a cell to follow its column's alignment, with each line of their text too.
+fn align(cell: &gtk::Box, alignment: Alignment) {
+    let (halign, xalign, justify) = match alignment {
+        Alignment::None | Alignment::Left => return,
+        Alignment::Center => (gtk::Align::Center, 0.5, gtk::Justification::Center),
+        Alignment::Right => (gtk::Align::End, 1.0, gtk::Justification::Right),
+    };
+    for child in children(cell.upcast_ref()) {
+        child.set_halign(halign);
+        if let Some(label) = child.downcast_ref::<gtk::Label>() {
+            label.set_xalign(xalign);
+            label.set_justify(justify);
+        }
+    }
 }
 
 fn append_blocks(container: &gtk::Box, blocks: &[Block], refs: &Refs) {
@@ -214,8 +234,8 @@ fn block_widget(block: &Block, refs: &Refs) -> gtk::Widget {
             label.add_css_class("zib-table-code");
             label.upcast()
         }
-        Block::Table { header_rows, header_columns, rows } => {
-            grid(rows, *header_rows, *header_columns, refs)
+        Block::Table { header_rows, header_columns, alignments, rows } => {
+            grid(rows, *header_rows, *header_columns, alignments, refs)
         }
         Block::Rule => gtk::Separator::new(gtk::Orientation::Horizontal).upcast(),
         Block::Html(html) => text(&glib::markup_escape_text(html)).upcast(),

@@ -16,6 +16,7 @@ use typst::{Library, LibraryExt, World};
 use typst_kit::fonts::{self, FontStore};
 use typst_layout::PagedDocument;
 
+use crate::body::Alignment;
 use crate::markup::{self, Block, Inline, Item};
 use crate::render::{math_svg, mermaid_svg};
 pub use crate::store::Page;
@@ -160,8 +161,8 @@ impl Writer<'_> {
                 }
                 Err(_) => self.code_text(source),
             },
-            Block::Table { header_rows, header_columns, rows } => {
-                self.table(*header_rows, *header_columns, rows);
+            Block::Table { header_rows, header_columns, alignments, rows } => {
+                self.table(*header_rows, *header_columns, alignments, rows);
             }
             Block::Rule => self.out.push_str("#line(length: 100%, stroke: 0.5pt + luma(160))"),
             Block::Html(text) => self.out.push_str(&escape(text)),
@@ -197,9 +198,23 @@ impl Writer<'_> {
         self.out.push(')');
     }
 
-    fn table(&mut self, header_rows: usize, header_columns: usize, rows: &[Vec<Vec<Block>>]) {
+    fn table(
+        &mut self,
+        header_rows: usize,
+        header_columns: usize,
+        alignments: &[Alignment],
+        rows: &[Vec<Vec<Block>>],
+    ) {
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
-        let _ = write!(self.out, "#table(columns: {columns}, align: left");
+        let _ = write!(self.out, "#table(columns: {columns}, align: (");
+        for column in 0..columns {
+            self.out.push_str(match alignments.get(column) {
+                Some(Alignment::Center) => "center, ",
+                Some(Alignment::Right) => "right, ",
+                Some(Alignment::None | Alignment::Left) | None => "left, ",
+            });
+        }
+        self.out.push(')');
         for (y, row) in rows.iter().enumerate() {
             if y == 0 && header_rows > 0 {
                 self.out.push_str(", table.header(repeat: true");
@@ -453,7 +468,7 @@ mod tests {
             "> quoted #hash [brackets]\n\n",
             "```rust\nfn main() {}\n```\n\n",
             "```math\n\\frac{a}{b}\n```\n\n",
-            "| a | b |\n|---|---|\n| 1 | 2 |\n\n",
+            "| a | b |\n|:-:|--:|\n| 1 | 2 |\n\n",
             "---\n",
         ]
         .concat();

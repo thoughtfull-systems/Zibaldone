@@ -10,10 +10,11 @@ use adw::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
 use sourceview5::prelude::*;
 use zib_core::editing::{
-    Drawn, Span, Style, complete_block_opening, drawings as find_drawings, fence_selection,
-    list_pads, spans, table_cell_in_body, toggle_checkbox,
+    Drawing, Drawn, Span, Style, complete_block_opening, drawings as find_drawings,
+    fence_selection, list_pads, spans, table_cell_in_body, toggle_checkbox,
 };
 use zib_core::lists::{Edit, ListKey, list_edit};
+use zib_core::pipe_tables::table_edit;
 
 use crate::drawings::{Draw, Drawings};
 
@@ -206,7 +207,8 @@ fn attach_wrap_keys(view: &sourceview5::View) {
     view.add_controller(keys);
 }
 
-/// Gives Enter, Shift+Enter, Tab, and Shift+Tab their outliner meanings inside list items.
+/// Gives Enter, Shift+Enter, Tab, and Shift+Tab their outliner meanings inside list items. In a
+/// pipe table, even one in a list item, Tab and Shift+Tab move between its cells instead.
 fn attach_list_keys(view: &sourceview5::View) {
     // The capture phase sees the keys before the view inserts a line break or a tab.
     let keys = gtk::EventControllerKey::builder()
@@ -232,7 +234,15 @@ fn attach_list_keys(view: &sourceview5::View) {
                 _ => return glib::Propagation::Proceed,
             };
             let buffer = view.buffer();
-            if view.is_editable() && !buffer.has_selection() && apply_list_edit(&buffer, list_key) {
+            if !view.is_editable() {
+                return glib::Propagation::Proceed;
+            }
+            // Tab selects the next cell's text, so the next Tab comes with a selection.
+            let tab = matches!(list_key, ListKey::Tab | ListKey::ShiftTab);
+            if tab && apply_table_edit(&buffer, list_key == ListKey::ShiftTab) {
+                return glib::Propagation::Stop;
+            }
+            if !buffer.has_selection() && apply_list_edit(&buffer, list_key) {
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -256,6 +266,19 @@ fn apply_list_edit(buffer: &gtk::TextBuffer, key: ListKey) -> bool {
     true
 }
 
+/// Makes the edit that Tab, or Shift+Tab when `back` is set, makes at the cursor in a pipe table,
+/// as one undoable step, which lines up its columns and selects the text of the cell it moves to.
+/// Returns whether the cursor was in a pipe table.
+fn apply_table_edit(buffer: &gtk::TextBuffer, back: bool) -> bool {
+    let body = text(buffer);
+    let cursor = byte_at(&body, buffer.cursor_position());
+    let Some((edit, selected)) = table_edit(&body, cursor, back) else {
+        return false;
+    };
+    apply_edit(buffer, &body, edit, Some(selected));
+    true
+}
+
 /// Makes `edit` to `body`, the buffer's text, as one undoable step. Then it selects `selected`, a
 /// byte range of the changed text, or puts the cursor where the edit says.
 fn apply_edit(buffer: &gtk::TextBuffer, body: &str, edit: Edit, selected: Option<Range<usize>>) {
@@ -263,7 +286,9 @@ fn apply_edit(buffer: &gtk::TextBuffer, body: &str, edit: Edit, selected: Option
     let mut changed = body.to_owned();
     changed.replace_range(edit.range, &edit.text);
     let chars = |byte: usize| buffer.iter_at_offset(offset(changed[..byte].chars().count()));
-    replace(buffer, range, &edit.text);
+    if !range.is_empty() || !edit.text.is_empty() {
+        replace(buffer, range, &edit.text);
+    }
     match selected {
         Some(selected) => buffer.select_range(&chars(selected.end), &chars(selected.start)),
         None => buffer.place_cursor(&chars(edit.cursor)),
@@ -349,6 +374,19 @@ struct Preview {
 impl Preview {
     fn chars(&self, bytes: &Range<usize>) -> Range<usize> {
         self.byte_chars[bytes.start]..self.byte_chars[bytes.end]
+    }
+
+    /// Whether a span's syntax shows with the cursor or selection at `selection`: the span touches
+    /// it, or lies in a pipe table that it touches, whose columns line up only with all their
+    /// syntax showing.
+    fn shows(&self, span: &Span, selection: &Range<usize>) -> bool {
+        span.touches(selection)
+            || self.drawn.iter().any(|drawn| {
+                matches!(drawn.drawing, Drawing::Table(_))
+                    && drawn.touches(selection)
+                    && drawn.range.start <= span.range.start
+                    && span.range.end <= drawn.range.end
+            })
     }
 
     /// The cursor or selection as a byte range.
@@ -458,6 +496,7 @@ fn add_tags(table: &gtk::TextTagTable) {
             .background_rgba(&shade)
             .build(),
         gtk::TextTag::builder().name(tag(Style::CodeBlock)).family("monospace").build(),
+        gtk::TextTag::builder().name(tag(Style::Table)).family("monospace").build(),
         gtk::TextTag::builder().name(CODE_BLOCK_SHADE).paragraph_background_rgba(&shade).build(),
         gtk::TextTag::builder().name(tag(Style::Emphasis)).style(pango::Style::Italic).build(),
         gtk::TextTag::builder().name(tag(Style::Strikethrough)).strikethrough(true).build(),
@@ -538,6 +577,7 @@ fn style_tag(style: Style) -> &'static str {
         Style::Math => "markup-math",
         Style::Strikethrough => "markup-strikethrough",
         Style::Strong => "markup-strong",
+        Style::Table => "markup-table",
         Style::Underline => "markup-underline",
     }
 }
@@ -554,7 +594,7 @@ fn drawn_over(style: Style) -> bool {
 }
 
 /// Every style the editor applies, for clearing them before a restyle.
-const STYLES: [Style; 19] = [
+const STYLES: [Style; 20] = [
     Style::BlockQuote,
     Style::Checkbox(false),
     Style::Checkbox(true),
@@ -573,6 +613,7 @@ const STYLES: [Style; 19] = [
     Style::Math,
     Style::Strikethrough,
     Style::Strong,
+    Style::Table,
     Style::Underline,
 ];
 
@@ -865,7 +906,8 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings)
         apply(buffer, LIST_PADS[columns.clamp(1, LIST_PADS.len()) - 1], preview.chars(&line));
     }
     let selection = preview.selection(buffer);
-    preview.revealed = preview.spans.iter().map(|span| span.touches(&selection)).collect();
+    preview.drawn = find_drawings(&body);
+    preview.revealed = preview.spans.iter().map(|span| preview.shows(span, &selection)).collect();
     for (span, &revealed) in preview.spans.iter().zip(&preview.revealed) {
         apply(buffer, style_tag(span.style), preview.chars(&span.range));
         // GTK takes a line's paragraph properties, such as its margin and background, from the
@@ -901,7 +943,6 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings)
         }
     }
     // After the spans, whose hidden syntax a drawing's source can hold.
-    preview.drawn = find_drawings(&body);
     preview.drawn_revealed = preview.drawn.iter().map(|drawn| drawn.touches(&selection)).collect();
     let found = preview
         .drawn
@@ -921,7 +962,7 @@ fn reveal(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings) 
     }
     let selection = preview.selection(buffer);
     for i in 0..preview.spans.len() {
-        let revealed = preview.spans[i].touches(&selection);
+        let revealed = preview.shows(&preview.spans[i], &selection);
         if revealed == preview.revealed[i] {
             continue;
         }

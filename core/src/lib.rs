@@ -18,6 +18,7 @@ pub mod markup;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod pairing;
+pub mod pipe_tables;
 #[cfg(feature = "print")]
 pub mod print;
 #[cfg(feature = "render")]

@@ -37,6 +37,8 @@ pub enum Style {
     Math,
     Strikethrough,
     Strong,
+    /// A pipe table's source, which editors draw in a monospace font, so its columns line up.
+    Table,
     Underline,
 }
 
@@ -91,6 +93,7 @@ pub fn spans(body: &str) -> Vec<Span> {
                     Tag::Link { .. } => Some(Style::Link),
                     Tag::Strikethrough => Some(Style::Strikethrough),
                     Tag::Strong => Some(Style::Strong),
+                    Tag::Table(_) => Some(Style::Table),
                     _ => None,
                 };
                 stack.push(Frame { inner: None, range, style });
@@ -111,7 +114,7 @@ pub fn spans(body: &str) -> Vec<Span> {
                 }
                 let syntax = match (style, inner) {
                     (Style::BlockQuote, _) => quote_markers(body, &range),
-                    (Style::CodeBlock, _) | (_, None) => Vec::new(),
+                    (Style::CodeBlock | Style::Table, _) | (_, None) => Vec::new(),
                     (_, Some(inner)) => vec![range.start..inner.start, inner.end..range.end],
                 };
                 spans.push(span(body, range, style, syntax));
@@ -166,7 +169,7 @@ pub enum Drawing {
     InlineMath(String),
     DisplayMath(String),
     Diagram(String),
-    /// A list table, whose cells `markup::parse` reads.
+    /// A list table or a pipe table, whose cells `markup::parse` reads.
     Table(body::ListTable),
     Embed(Id),
 }
@@ -189,8 +192,8 @@ impl Drawn {
     }
 }
 
-/// Finds the math, diagrams, and embeds of `body` that an editor draws, ordered by where they
-/// start.
+/// Finds the math, diagrams, tables, and embeds of `body` that an editor draws, ordered by where
+/// they start. Math and embeds inside a pipe table draw in the table's cells instead.
 pub fn drawings(body: &str) -> Vec<Drawn> {
     let fills_lines = |range: &Range<usize>| {
         let line_start = body[..range.start].rfind('\n').map_or(0, |i| i + 1);
@@ -200,8 +203,11 @@ pub fn drawings(body: &str) -> Vec<Drawn> {
     };
     let mut drawn = Vec::new();
     let mut code: Option<(Range<usize>, String, String)> = None;
+    let mut tables: Vec<Range<usize>> = Vec::new();
+    let mut in_table = false;
     for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
         match event {
+            Event::InlineMath(_) | Event::DisplayMath(_) if in_table => {}
             Event::InlineMath(source) => drawn.push(Drawn {
                 range,
                 drawing: Drawing::InlineMath(source.into_string()),
@@ -216,6 +222,14 @@ pub fn drawings(body: &str) -> Vec<Drawn> {
                     drawing: Drawing::DisplayMath(source.into_string()),
                     block,
                 });
+            }
+            Event::Start(Tag::Table(_)) => in_table = true,
+            Event::End(TagEnd::Table) => {
+                in_table = false;
+                let end = range.start + body[range.clone()].trim_end_matches(['\n', '\r']).len();
+                let drawing = Drawing::Table(crate::pipe_tables::read(body, &range));
+                drawn.push(Drawn { range: range.start..end, drawing, block: true });
+                tables.push(range);
             }
             Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(language))) => {
                 code = Some((range, language.into_string(), String::new()));
@@ -242,7 +256,10 @@ pub fn drawings(body: &str) -> Vec<Drawn> {
             _ => {}
         }
     }
-    for link in body::wikilinks(body).into_iter().filter(|link| link.embed) {
+    let in_table = |range: &Range<usize>| tables.iter().any(|table| table.contains(&range.start));
+    for link in
+        body::wikilinks(body).into_iter().filter(|link| link.embed && !in_table(&link.range))
+    {
         let block = fills_lines(&link.range);
         drawn.push(Drawn { range: link.range, drawing: Drawing::Embed(link.target), block });
     }
@@ -250,9 +267,9 @@ pub fn drawings(body: &str) -> Vec<Drawn> {
     drawn
 }
 
-/// The source of a cell's text in the list table at `block` of `body`, the range of a drawn table,
-/// as a byte range of `body`. `row`, `column`, and `nested` pick the cell, as for
-/// `body::table_cell_source`.
+/// The source of a cell's text in the list table or pipe table at `block` of `body`, the range of a
+/// drawn table, as a byte range of `body`. `row`, `column`, and `nested` pick the cell, as for
+/// `body::table_cell_source`. A pipe table's cells hold no tables.
 pub fn table_cell_in_body(
     body: &str,
     block: Range<usize>,
@@ -261,6 +278,10 @@ pub fn table_cell_in_body(
     nested: &[(usize, usize, usize)],
 ) -> Option<Range<usize>> {
     let fenced = &body[block.clone()];
+    if !fenced.starts_with("```") && !fenced.starts_with("~~~") {
+        let pipe_table = nested.is_empty().then_some(block)?;
+        return crate::pipe_tables::cell_source(body, &pipe_table, row, column);
+    }
     let start = block.start + fenced.find('\n')? + 1;
     let last_line = block.start + fenced.rfind('\n').map_or(0, |i| i + 1);
     let closing = body[last_line..block.end].trim_start();
@@ -689,6 +710,7 @@ mod tests {
                     Drawing::Table(ListTable {
                         header_rows: 0,
                         header_columns: 0,
+                        alignments: Vec::new(),
                         rows: vec![vec!["a".into(), "b".into()]],
                     }),
                     true
@@ -702,6 +724,19 @@ mod tests {
         let blocks = |body: &str| drawings(body).iter().map(|d| d.block).collect::<Vec<_>>();
         assert_eq!(blocks("this \n$$\ng=q^{2}\n$$this"), [true]);
         assert_eq!(blocks("this$$g=q^{2}$$"), [false]);
+    }
+
+    #[test]
+    fn draws_pipe_tables_with_their_math_inside() {
+        let body = "Intro\n\n- | $x$ | b |\n  |---|---|\n  | c | d |\n\n$y$";
+        let found = drawings(body);
+        assert_eq!(found.len(), 2);
+        assert_eq!(&body[found[0].range.clone()], "| $x$ | b |\n  |---|---|\n  | c | d |");
+        let Drawing::Table(table) = &found[0].drawing else { panic!("not a table") };
+        assert_eq!(table.rows, [vec!["$x$", "b"], vec!["c", "d"]]);
+        assert_eq!(found[1].drawing, Drawing::InlineMath("y".into()));
+        let cell = table_cell_in_body(body, found[0].range.clone(), 1, 1, &[]).unwrap();
+        assert_eq!(&body[cell], "d");
     }
 
     #[test]

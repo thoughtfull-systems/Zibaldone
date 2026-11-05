@@ -434,11 +434,24 @@ fn remove_marks(text: &str) -> String {
     out.replace("\\=", "=")
 }
 
-/// A list table, as the note bodies specification defines it.
+/// Where the text of a table's column sits in its cells, as a pipe table's delimiter row says.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum Alignment {
+    /// The delimiter row says nothing, so the text sits at the start.
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// A list table, as the note bodies specification defines it, or a pipe table read the same way.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ListTable {
     pub header_rows: usize,
     pub header_columns: usize,
+    /// Each column's alignment, which only pipe tables set. Columns past its end sit at the start.
+    pub alignments: Vec<Alignment>,
     /// Each row's cells, as markdown, padded with empty cells to the longest row.
     pub rows: Vec<Vec<String>>,
 }
@@ -450,7 +463,8 @@ pub fn list_table(info: &str, content: &str) -> Option<ListTable> {
     if words.next() != Some("table") {
         return None;
     }
-    let mut table = ListTable { header_rows: 1, header_columns: 0, rows: Vec::new() };
+    let mut table =
+        ListTable { header_rows: 1, header_columns: 0, alignments: Vec::new(), rows: Vec::new() };
     for word in words {
         if let Some((name, value)) = word.split_once('=') {
             let Ok(value) = value.parse() else { continue };
