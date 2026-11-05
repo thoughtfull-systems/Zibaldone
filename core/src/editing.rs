@@ -174,8 +174,8 @@ pub struct Drawn {
     /// Byte range of the element's source, which ends before any line break that follows it.
     pub range: Range<usize>,
     pub drawing: Drawing,
-    /// Whether the source fills its lines, so the drawing takes their place, rather than sitting
-    /// inside a line of text.
+    /// Whether the drawing takes the place of the lines its source spans, rather than sitting
+    /// inside a line of text: the source fills its lines, or it's display math across lines.
     pub block: bool,
 }
 
@@ -205,7 +205,9 @@ pub fn drawings(body: &str) -> Vec<Drawn> {
                 block: false,
             }),
             Event::DisplayMath(source) => {
-                let block = fills_lines(&range);
+                // Display math across lines takes their place too, between any text before and
+                // after it on its first and last lines.
+                let block = fills_lines(&range) || body[range.clone()].contains('\n');
                 drawn.push(Drawn {
                     range,
                     drawing: Drawing::DisplayMath(source.into_string()),
@@ -522,6 +524,11 @@ mod tests {
                 (&format!("![[{target}]]"), Drawing::Embed(target), false),
             ]
         );
+        // Display math across lines is a block, even with text beside it, and on one line with
+        // text it's inline.
+        let blocks = |body: &str| drawings(body).iter().map(|d| d.block).collect::<Vec<_>>();
+        assert_eq!(blocks("this \n$$\ng=q^{2}\n$$this"), [true]);
+        assert_eq!(blocks("this$$g=q^{2}$$"), [false]);
     }
 
     #[test]

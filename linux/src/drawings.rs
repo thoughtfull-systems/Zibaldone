@@ -43,11 +43,14 @@ struct Fit {
     /// Letter spacing to add to it, in pixels.
     spacing: i32,
     tries: u8,
+    /// The spacing and the width of the room it gave, when last measured. The room can grow
+    /// slower than the spacing, as at the start of a line, where GTK reports half of it.
+    measured: Option<(i32, i32)>,
 }
 
 impl Default for Fit {
     fn default() -> Self {
-        Self { scale: 1.0, spacing: 0, tries: 0 }
+        Self { scale: 1.0, spacing: 0, tries: 0, measured: None }
     }
 }
 
@@ -133,8 +136,20 @@ impl Drawings {
         let mut old = std::mem::take(&mut *self.overlays.borrow_mut());
         let mut overlays = Vec::with_capacity(found.len());
         let mut redraw = Vec::new();
-        for (drawn, chars, revealed) in found {
-            let same = old.iter().position(|o| o.drawn.drawing == drawn.drawing);
+        // First each drawing that's still where it was keeps its overlay, so that drawings of the
+        // same source keep their places, and the room each was fitted to there. Then the rest
+        // take an overlay of the same source from elsewhere, or one of the same kind nearby.
+        let same_here = |old: &[Overlay], drawn: &Drawn, chars: &Range<usize>| {
+            old.iter().position(|o| {
+                o.drawn.drawing == drawn.drawing && overlaps(&char_range(buffer, o), chars)
+            })
+        };
+        let mut kept: Vec<Option<Overlay>> = found
+            .iter()
+            .map(|(drawn, chars, _)| same_here(&old, drawn, chars).map(|i| old.swap_remove(i)))
+            .collect();
+        for ((drawn, chars, revealed), kept) in found.into_iter().zip(&mut kept) {
+            let same = || old.iter().position(|o| o.drawn.drawing == drawn.drawing);
             let near = || {
                 old.iter().position(|o| {
                     std::mem::discriminant(&o.drawn.drawing)
@@ -142,12 +157,21 @@ impl Drawings {
                         && overlaps(&char_range(buffer, o), &chars)
                 })
             };
-            let mut overlay = match same.or_else(near) {
-                Some(i) => old.swap_remove(i),
-                None => self.new_overlay(buffer, &drawn),
+            let mut overlay = match kept.take() {
+                Some(overlay) => overlay,
+                None => match same().or_else(near) {
+                    Some(i) => old.swap_remove(i),
+                    None => self.new_overlay(buffer, &drawn),
+                },
             };
             if overlay.drawn.drawing != drawn.drawing {
                 redraw.push((overlay.id, drawn.drawing.clone()));
+            }
+            // The text around it may have changed the room it gets, so it's measured again, and
+            // from the start when it turned from inline to a block or back.
+            overlay.fit.tries = 0;
+            if overlay.drawn.block != drawn.block {
+                overlay.fit = Fit::default();
             }
             buffer.move_mark(&overlay.start, &buffer.iter_at_offset(offset(chars.start)));
             buffer.move_mark(&overlay.end, &buffer.iter_at_offset(offset(chars.end)));
@@ -293,11 +317,18 @@ impl Drawings {
     fn apply(&self, buffer: &gtk::TextBuffer, overlay: &Overlay) {
         let (start, end) = (buffer.iter_at_mark(&overlay.start), buffer.iter_at_mark(&overlay.end));
         buffer.remove_tag(&overlay.tag, &buffer.start_iter(), &buffer.end_iter());
+        // A drawing can turn from inline to a block and back, as a line break before `$$` makes
+        // it fill its line, so nothing that the other kind set stays.
+        for property in
+            ["size-set", "foreground-set", "letter-spacing-set", "pixels-above-lines-set"]
+                .into_iter()
+                .chain(["pixels-below-lines-set"])
+        {
+            overlay.tag.set_property(property, false);
+        }
         let mut first_line = start;
         first_line.set_line_offset(0);
-        if overlay.drawn.block {
-            buffer.remove_tag(&self.unshaded, &first_line, &end);
-        }
+        buffer.remove_tag(&self.unshaded, &first_line, &end);
         if overlay.revealed {
             buffer.remove_tag_by_name(self.hidden, &start, &end);
         }
@@ -308,10 +339,7 @@ impl Drawings {
         if overlay.drawn.block {
             let mut last_line = end;
             last_line.set_line_offset(0);
-            if overlay.revealed {
-                overlay.tag.set_property("size-set", false);
-                overlay.tag.set_property("foreground-set", false);
-            } else {
+            if !overlay.revealed {
                 // The last line, which holds the room below it, and the line break before it stay,
                 // tiny and unseen. GTK aborts when it looks for the position at a point below a
                 // line whose line break it hides, as GtkSourceView does while it draws, and as a
@@ -326,10 +354,20 @@ impl Drawings {
                 overlay.tag.set_size_points(1.0);
                 // GTK draws a fully transparent color as black.
                 overlay.tag.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.004)));
-                // Nor does the shade of a code block show beside or behind the drawing.
-                buffer.apply_tag(&self.unshaded, &first_line, &end);
+                // Nor does the shade of a code block show beside or behind the drawing. Only a
+                // shaded block needs it, as it draws a faint shade of its own.
+                let shaded = first_line.tags().iter().any(|tag| {
+                    tag.property::<bool>("paragraph-background-set") && *tag != self.unshaded
+                });
+                if shaded {
+                    buffer.apply_tag(&self.unshaded, &first_line, &end);
+                }
             }
-            overlay.tag.set_pixels_below_lines(height + 2 * PAD);
+            if room_above(overlay, &end) {
+                overlay.tag.set_pixels_above_lines(height + 2 * PAD);
+            } else {
+                overlay.tag.set_pixels_below_lines(height + 2 * PAD);
+            }
             let mut tiny = last_line;
             if overlay.revealed || !tiny.backward_char() || tiny < start {
                 tiny = last_line;
@@ -422,7 +460,12 @@ impl Drawings {
                     Drawing::Embed(_) | Drawing::Table(_) => left,
                     _ => left + (text_width(&view) - width).max(0) / 2,
                 };
-                (x, top + line_height - height - PAD)
+                let y = if room_above(overlay, &end) {
+                    top + PAD
+                } else {
+                    top + line_height - height - PAD
+                };
+                (x, y)
             } else {
                 // GTK places text after hidden text as if it showed, but places hidden text where
                 // the next shown character is, which is the one that holds the room.
@@ -431,7 +474,9 @@ impl Drawings {
                     self.apply(&buffer, overlay);
                     resized = true;
                 }
-                (place.x() + (place.width() - width) / 2, place.y() + (place.height() - height) / 2)
+                // A room narrower than the drawing, as at the end of a line, holds its left edge.
+                let x = place.x() + ((place.width() - width) / 2).max(0);
+                (x, place.y() + (place.height() - height) / 2)
             };
             view.move_overlay(&overlay.holder, x, y);
         }
@@ -451,11 +496,30 @@ fn refit(fit: &mut Fit, place: &gdk::Rectangle, width: i32, height: i32) -> bool
     // font as it is.
     let ratio = f64::from(height) / f64::from(place.height().max(1));
     let scale = if ratio > 1.0 { fit.scale * ratio } else { (fit.scale * ratio).max(1.0) };
-    let spacing = fit.spacing + width - place.width();
-    if (scale - fit.scale).abs() < 0.005 && (spacing - fit.spacing).abs() <= 1 {
+    // How much the room grew for each pixel of spacing, from the last two measurements. Pango
+    // leaves letter spacing out at the ends of a line, so a character alone on its line doesn't
+    // grow at all. Nothing follows it there for the drawing to cover, so the spacing goes back to
+    // what it was, and the fitting stops.
+    // A step of a pixel or two can round away, so it says nothing.
+    let growth = match fit.measured {
+        Some((spacing, room)) if (spacing - fit.spacing).abs() >= 4 => {
+            f64::from(place.width() - room) / f64::from(fit.spacing - spacing)
+        }
+        _ => 1.0,
+    };
+    if growth < 0.1 {
+        let spacing = fit.measured.map_or(fit.spacing, |(spacing, _)| spacing);
+        *fit = Fit { scale, spacing, tries: FIT_TRIES, measured: None };
+        return true;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let step = (f64::from(width - place.width()) / growth.clamp(0.25, 2.0)).round() as i32;
+    let spacing = fit.spacing + step;
+    if (scale - fit.scale).abs() < 0.005 && step.abs() <= 1 {
         return false;
     }
-    *fit = Fit { scale, spacing, tries: fit.tries + 1 };
+    let measured = Some((fit.spacing, place.width()));
+    *fit = Fit { scale, spacing, tries: fit.tries + 1, measured };
     true
 }
 
@@ -488,4 +552,15 @@ fn font_px(widget: &impl IsA<gtk::Widget>) -> f64 {
 
 fn offset(chars: usize) -> i32 {
     i32::try_from(chars).unwrap_or(i32::MAX)
+}
+
+/// Whether a block's drawing sits above the last line of its source rather than below it: when
+/// text follows the source on that line, as after the closing `$$` of display math, and the
+/// source is hidden.
+fn room_above(overlay: &Overlay, end: &gtk::TextIter) -> bool {
+    let mut line_end = *end;
+    if !line_end.ends_line() {
+        line_end.forward_to_line_end();
+    }
+    !overlay.revealed && !end.visible_text(&line_end).trim().is_empty()
 }
