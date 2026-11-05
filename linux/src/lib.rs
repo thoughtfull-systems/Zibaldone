@@ -12,6 +12,7 @@ pub mod remote;
 pub mod sharing;
 pub mod state;
 pub mod status;
+pub mod tables;
 pub mod tray;
 pub mod window;
 

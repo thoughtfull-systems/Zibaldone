@@ -131,6 +131,9 @@ A fenced code block whose language is `table` holds a list table, whose cells ca
 - **Rows and cells.** The block's content is markdown, holding one list. Each item of that list is a
   row, and holds one list of its own, whose items are the row's cells. A cell holds any markdown,
   including a list table of its own.
+- **Row labels.** A row may hold text before its list of cells, such as `- Install` with the cells
+  nested under it. The text labels the row for whoever reads the source, and readers ignore it, as
+  they ignore anything else a row holds outside its list of cells.
 - **Width.** The table has as many columns as its longest row, and shorter rows end with empty
   cells.
 - **Anything else.** A `table` block whose content isn't a list of lists shows as a code block, with

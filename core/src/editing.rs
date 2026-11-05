@@ -170,6 +170,8 @@ pub enum Drawing {
     InlineMath(String),
     DisplayMath(String),
     Diagram(String),
+    /// A list table, whose cells `markup::parse` reads.
+    Table(body::ListTable),
     Embed(Id),
 }
 
@@ -218,8 +220,7 @@ pub fn drawings(body: &str) -> Vec<Drawn> {
                 });
             }
             Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(language))) => {
-                let language = language.split_whitespace().next().unwrap_or("").to_owned();
-                code = Some((range, language, String::new()));
+                code = Some((range, language.into_string(), String::new()));
             }
             Event::Text(text) => {
                 if let Some((_, _, source)) = code.as_mut() {
@@ -227,13 +228,17 @@ pub fn drawings(body: &str) -> Vec<Drawn> {
                 }
             }
             Event::End(TagEnd::CodeBlock) => {
-                let Some((range, language, source)) = code.take() else { continue };
-                let drawing = match language.as_str() {
+                let Some((range, info, source)) = code.take() else { continue };
+                let end = range.start + body[range.clone()].trim_end_matches(['\n', '\r']).len();
+                let drawing = match info.split_whitespace().next().unwrap_or("") {
                     "math" => Drawing::DisplayMath(source),
                     "mermaid" => Drawing::Diagram(source),
+                    "table" => match body::list_table(&info, &source) {
+                        Some(table) => Drawing::Table(table),
+                        None => continue,
+                    },
                     _ => continue,
                 };
-                let end = range.start + body[range.clone()].trim_end_matches(['\n', '\r']).len();
                 drawn.push(Drawn { range: range.start..end, drawing, block: true });
             }
             _ => {}
@@ -458,6 +463,7 @@ fn span(body: &str, mut range: Range<usize>, style: Style, syntax: Vec<Range<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::ListTable;
 
     fn hidden(body: &str) -> Vec<(Style, Vec<&str>)> {
         spans(body)
@@ -472,6 +478,8 @@ mod tests {
         let body = [
             "Inline $x^2$ here.\n\n$$\na + b\n$$\n\n",
             "```mermaid\nflowchart LR\n  a --> b\n```\n\n```rust\nfn main() {}\n```\n\n",
+            // A list table draws, and a `table` block that isn't one stays code.
+            "```table header-rows=0\n- - a\n  - b\n```\n\n```table\njust text\n```\n\n",
             &format!("![[{target}]]\n\nSee ![[{target}]] inline."),
         ]
         .concat();
@@ -485,6 +493,15 @@ mod tests {
                 (
                     "```mermaid\nflowchart LR\n  a --> b\n```",
                     Drawing::Diagram("flowchart LR\n  a --> b\n".into()),
+                    true
+                ),
+                (
+                    "```table header-rows=0\n- - a\n  - b\n```",
+                    Drawing::Table(ListTable {
+                        header_rows: 0,
+                        header_columns: 0,
+                        rows: vec![vec!["a".into(), "b".into()]],
+                    }),
                     true
                 ),
                 (&format!("![[{target}]]"), Drawing::Embed(target), true),

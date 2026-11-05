@@ -303,16 +303,23 @@ impl Drawings {
     /// The size a drawing shows at: math at the editor's font size, and nothing wider than the
     /// text.
     fn size(view: &gtk::TextView, overlay: &Overlay) -> Option<(i32, i32)> {
-        let (_, width, height) = overlay.widget.as_ref()?;
+        let (widget, width, height) = overlay.widget.as_ref()?;
+        let room = (text_width(view) - 2 * PAD).max(1);
+        // A table fits the text by wrapping its cells, and grows taller as it does.
+        if let Drawing::Table(_) = overlay.drawn.drawing {
+            let width = (*width).min(room);
+            let (_, height, _, _) = widget.measure(gtk::Orientation::Vertical, width);
+            return Some((width, height));
+        }
         let (width, height) = (f64::from(*width), f64::from(*height));
         let scale = match overlay.drawn.drawing {
             Drawing::InlineMath(_) | Drawing::DisplayMath(_) => {
                 font_px(view) * MATH_SCALE / MATH_PX
             }
-            Drawing::Diagram(_) => 1.0,
+            Drawing::Diagram(_) | Drawing::Table(_) => 1.0,
             Drawing::Embed(_) => (f64::from(MAX_IMAGE_HEIGHT) / height).min(1.0),
         };
-        let room = f64::from((text_width(view) - 2 * PAD).max(1));
+        let room = f64::from(room);
         let scale = scale.min(room / width);
         #[allow(clippy::cast_possible_truncation)]
         Some(((width * scale).round() as i32, (height * scale).round() as i32))
@@ -342,7 +349,11 @@ impl Drawings {
             if overlay.shown != Some((width, height)) {
                 overlay.shown = Some((width, height));
                 overlay.fit.tries = 0;
-                widget.set_size_request(width, height);
+                // A table's height follows from its width, as its cells wrap, and a height
+                // request would keep it from shrinking when the text grows wider.
+                let requested =
+                    if matches!(overlay.drawn.drawing, Drawing::Table(_)) { -1 } else { height };
+                widget.set_size_request(width, requested);
                 self.apply(&buffer, overlay);
                 resized = true;
             }
@@ -354,7 +365,7 @@ impl Drawings {
                 let (top, line_height) = view.line_yrange(&last_line);
                 let left = view.left_margin();
                 let x = match overlay.drawn.drawing {
-                    Drawing::Embed(_) => left,
+                    Drawing::Embed(_) | Drawing::Table(_) => left,
                     _ => left + (text_width(&view) - width).max(0) / 2,
                 };
                 (x, top + line_height - height - PAD)

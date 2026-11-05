@@ -380,7 +380,7 @@ fn remove_marks(text: &str) -> String {
 }
 
 /// A list table, as the note bodies specification defines it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ListTable {
     pub header_rows: usize,
     pub header_columns: usize,
@@ -419,6 +419,8 @@ pub fn list_table(info: &str, content: &str) -> Option<ListTable> {
                 let row = table.rows.last_mut()?;
                 row.push(cell_text(content, start..range.end));
             }
+            // Anything outside the list makes the block code. A row's content outside its list of
+            // cells, such as a label, is ignored.
             Event::Start(_) | Event::Text(_) if depth == 0 => return None,
             _ => {}
         }
@@ -698,6 +700,10 @@ mod tests {
         assert_eq!(table.rows[1][1], "Download.\n\nThen check.");
         assert_eq!(table.rows[2], vec!["Only".to_owned(), String::new()]);
         assert_eq!(list_table("table", "just text"), None);
+        // A row's label before its cells is ignored.
+        let labeled = list_table("table", "- row1\n  - this\n  - that\n- row2\n  - a\n  - b\n");
+        assert_eq!(labeled.unwrap().rows, [["this", "that"], ["a", "b"]]);
+        assert_eq!(list_table("table", "- row1\n- row2\n"), None);
         let body = format!("```table\n{content}```\n\n```mermaid\nflowchart LR\n```\n");
         assert_eq!(fenced_blocks(&body).len(), 2);
     }

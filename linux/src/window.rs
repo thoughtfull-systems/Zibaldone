@@ -20,6 +20,7 @@ use crate::app::core;
 use crate::drawings::Draw;
 use crate::editor;
 use crate::state::State;
+use crate::tables;
 
 /// How long the editor waits after typing stops before it commits, and how long while another
 /// machine edits the same note live.
@@ -1701,6 +1702,11 @@ async fn draw(state: Arc<State>, drawing: Drawing) -> Option<gtk::Widget> {
         Drawing::DisplayMath(source) => (Kind::DisplayMath, source),
         Drawing::Diagram(source) => (Kind::Mermaid, source),
         Drawing::Embed(target) => return embedded_image(state, target).await,
+        Drawing::Table(table) => {
+            let targets = tables::link_targets(&table);
+            let titles = core(async move { state.titles(&targets).await }).await;
+            return Some(tables::widget(&table, &titles));
+        }
     };
     let shown = source.clone();
     match core(async move { state.render(kind, source).await }).await {
