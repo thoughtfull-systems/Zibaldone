@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, oneshot};
-use zib_core::address::Address;
+use zib_core::address::{Address, MachineKey};
 use zib_core::channel::Dirs;
 use zib_core::files::{self, Blobs, GarbageRecords};
 use zib_core::net::{Nearby, Network, Node, OpenNote, Pairing};
@@ -113,6 +113,25 @@ impl Pairing for UiPairing {
             if let Some(state) = state {
                 state.finish_pairing(paired, None, Vec::new()).await;
             }
+        }
+    }
+
+    fn offered(&self, space: Id, from: MachineKey) -> impl Future<Output = bool> + Send {
+        let state = self.state.get().and_then(std::sync::Weak::upgrade);
+        async move {
+            let Some(state) = state else { return false };
+            let party = state.store.lock().await.paired().into_iter().find(|p| p.key == from);
+            let Some(party) = party else { return false };
+            tokio::spawn(async move {
+                let address = Address { key: from, hints: Vec::new() };
+                if let Err(error) = state.receive_space(space, &address, &party.name).await {
+                    state.send_ui(UiEvent::Notice(format!(
+                        "Couldn't receive a space from {}: {error}",
+                        party.name
+                    )));
+                }
+            });
+            true
         }
     }
 }
@@ -603,6 +622,13 @@ impl State {
 
     /// Adds the other machine to the spaces this one shared, and receives the spaces it shared.
     async fn finish_pairing(&self, paired: Paired, address: Option<Address>, shared: Vec<Id>) {
+        // A paired machine can offer this one spaces later, as decision ZIB0016 describes.
+        if let Err(error) = self.store.lock().await.add_paired(&paired.peer) {
+            self.send_ui(UiEvent::Notice(format!(
+                "Couldn't remember {}: {error}",
+                paired.peer.name
+            )));
+        }
         let address = address.unwrap_or(Address { key: paired.peer.key, hints: Vec::new() });
         let shared = if shared.is_empty() { self.last_shared() } else { shared };
         for space_id in &shared {
@@ -628,6 +654,72 @@ impl State {
             }
         }
         self.send_ui(UiEvent::Notice(format!("Paired with {}", paired.peer.name)));
+    }
+
+    /// The machines this one paired with, and whether each is a member of `space`.
+    pub async fn sharing(&self, space_id: Id) -> Result<Vec<(Party, bool)>> {
+        let space = self.space(space_id).await?;
+        let members: HashSet<Id> = space.lock().await.members().into_iter().map(|m| m.id).collect();
+        let paired = self.store.lock().await.paired();
+        Ok(paired
+            .into_iter()
+            .map(|p| {
+                let member = members.contains(&p.machine);
+                (p, member)
+            })
+            .collect())
+    }
+
+    /// Shares a space with a paired machine: adds it to the space's members and offers it the
+    /// space, as decision ZIB0016 describes.
+    pub async fn share_space(&self, space_id: Id, machine: Id) -> Result<()> {
+        let party = self.store.lock().await.paired().into_iter().find(|p| p.machine == machine);
+        let party = party.ok_or_else(|| Error::NotFound(format!("paired machine {machine}")))?;
+        let space = self.space(space_id).await?;
+        space.lock().await.add_machine(party.machine, party.key, &party.name, party.policy)?;
+        self.mark_dirty(space_id);
+        self.save_dirty().await;
+        self.node.offer(space_id, &Address { key: party.key, hints: Vec::new() }).await
+    }
+
+    /// Moves a note to another space with its files, as decision ZIB0005 describes moving one.
+    pub async fn move_note(&self, from: Id, to: Id, note: Id) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let (source, target) = (self.space(from).await?, self.space(to).await?);
+        let (source_blobs, target_blobs) = (self.blobs(from), self.blobs(to));
+        {
+            let mut source = source.lock().await;
+            let mut target = target.lock().await;
+            for hash in source.note_files(note) {
+                let Some(entry) = source.file(hash) else { continue };
+                if source_blobs.has(hash) && !target_blobs.has(hash) {
+                    target_blobs.add_file(&source_blobs.path(hash))?;
+                }
+                target.add_file(hash, entry.size, &entry.media_type)?;
+                if !target_blobs.has(hash) {
+                    target.set_holding(hash, false)?;
+                }
+            }
+            source.move_note_to(note, &mut target)?;
+            self.reindex_note(from, &source, note);
+            self.reindex_note(to, &target, note);
+        }
+        self.mark_dirty(from);
+        self.mark_dirty(to);
+        self.send_ui(UiEvent::Changed(from));
+        self.send_ui(UiEvent::Changed(to));
+        Ok(())
+    }
+
+    /// Moves every note of one space to another, and returns the notes it moved.
+    pub async fn move_notes(&self, from: Id, to: Id) -> Result<Vec<Id>> {
+        let notes = self.space(from).await?.lock().await.note_ids();
+        for note in &notes {
+            self.move_note(from, to, *note).await?;
+        }
+        Ok(notes)
     }
 
     /// The spaces the owner chose in the last confirmation.
@@ -694,6 +786,8 @@ impl State {
     }
 
     async fn sync_once(&self, failures: &mut HashMap<(Id, Id), u32>) {
+        let paired: HashSet<MachineKey> =
+            self.store.lock().await.paired().into_iter().map(|p| p.key).collect();
         let spaces: Vec<(Id, Arc<Mutex<Space>>)> =
             self.node.spaces().lock().await.iter().map(|(id, s)| (*id, s.clone())).collect();
         for (id, space) in spaces {
@@ -711,6 +805,11 @@ impl State {
                 if count > 0 && !due(count) {
                     failures.insert((id, member.id), count + 1);
                     continue;
+                }
+                // A paired machine that failed may lack the space, so it hears the offer again.
+                if count > 0 && paired.contains(&member.key) {
+                    let address = Address { key: member.key, hints: Vec::new() };
+                    let _ = self.node.offer(id, &address).await;
                 }
                 match self.node.sync(&space, &Address { key: member.key, hints: Vec::new() }).await
                 {

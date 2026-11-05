@@ -95,6 +95,13 @@ pub enum Message {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
+    Offer {
+        space: Id,
+        machine: Id,
+    },
+    Offered {
+        space: Id,
+    },
 }
 
 /// The most a `chunk` message holds.

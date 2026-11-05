@@ -106,6 +106,9 @@ impl Window {
         let menu = gio::Menu::new();
         menu.append(Some("New space…"), Some("win.new-space"));
         menu.append(Some("Rename space…"), Some("win.rename-space"));
+        menu.append(Some("Share space…"), Some("win.share-space"));
+        menu.append(Some("Move note to space…"), Some("win.move-note"));
+        menu.append(Some("Move notes to space…"), Some("win.move-notes"));
         menu.append(Some("Add machine…"), Some("win.add-machine"));
         menu.append(Some("Quit"), Some("app.quit"));
         let menu_button =
@@ -331,6 +334,9 @@ impl Window {
             ("new-space", Self::new_space as fn(&Self)),
             ("rename-space", Self::rename_space as fn(&Self)),
             ("add-machine", Self::add_machine as fn(&Self)),
+            ("share-space", |w: &Self| crate::sharing::share(w, w.inner().state.clone())),
+            ("move-note", Self::move_note),
+            ("move-notes", |w: &Self| crate::sharing::move_all(w, w.inner().state.clone())),
             ("print", |w: &Self| w.print(false)),
             ("print-linked", |w: &Self| w.print(true)),
         ] {
@@ -1503,6 +1509,36 @@ impl Window {
 
     fn add_machine(&self) {
         crate::adding::show(self, self.inner().state.clone());
+    }
+
+    /// Moves the open note to another space, once its pending edits are in the document.
+    fn move_note(&self) {
+        let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
+        if let Some(timer) = pending {
+            timer.remove();
+            self.commit();
+        }
+        let Some((space, note)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
+        else {
+            return;
+        };
+        crate::sharing::move_note(self, self.inner().state.clone(), space, note);
+    }
+
+    /// Follows notes that moved to another space, so the open note and the history point there.
+    pub fn notes_moved(&self, from: Id, to: Id, notes: &[Id]) {
+        for history in [&self.inner().back, &self.inner().forward] {
+            for entry in history.borrow_mut().iter_mut() {
+                if entry.0 == from && notes.contains(&entry.1) {
+                    entry.0 = to;
+                }
+            }
+        }
+        let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
+        if let Some((_, note)) = open.filter(|(s, n)| *s == from && notes.contains(n)) {
+            self.load_note(to, note);
+        }
+        self.reload_notes();
     }
 
     pub fn gtk_window(&self) -> gtk::Window {

@@ -72,6 +72,7 @@ Against the criteria:
 - The pairing specification adds that each side records the other as a paired machine.
 - Machines paired before this change aren't in each other's lists. The owner pairs them again once.
 - To stop sharing with a machine, the owner makes a new space, moves the notes into it, and shares
-  it only with the machines to keep. The old space stays on the dropped machine as it last synced.
+  it only with the machines to keep. The dropped machine still syncs the old space, so the notes
+  leave its copy too, though the old space's history still holds what they said before the move.
 - A lost or stolen machine keeps syncing every space it shares until the owner moves the notes out
   of those spaces.

@@ -623,16 +623,23 @@ impl Space {
     pub fn files_in_use(&self) -> Vec<FileHash> {
         let mut hashes = Vec::new();
         for id in self.note_ids() {
-            let Ok(note) = self.note(id) else { continue };
-            let Some(ty) = schema::read_type(&self.doc, &note.type_name) else { continue };
-            for (name, def) in &ty.fields {
-                if let Some(value) = note.fields.get(name).and_then(|v| Value::from_loro(def, v)) {
-                    collect_files(&value, &mut hashes);
-                }
-            }
+            hashes.extend(self.note_files(id));
         }
         hashes.sort();
         hashes.dedup();
+        hashes
+    }
+
+    /// The blobs that a note's file fields hold.
+    pub fn note_files(&self, id: Id) -> Vec<FileHash> {
+        let mut hashes = Vec::new();
+        let Ok(note) = self.note(id) else { return hashes };
+        let Some(ty) = schema::read_type(&self.doc, &note.type_name) else { return hashes };
+        for (name, def) in &ty.fields {
+            if let Some(value) = note.fields.get(name).and_then(|v| Value::from_loro(def, v)) {
+                collect_files(&value, &mut hashes);
+            }
+        }
         hashes
     }
 

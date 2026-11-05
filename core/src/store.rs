@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::address::MachineKey;
 use crate::channel::Dirs;
+use crate::pairing::Party;
 use crate::space::Policy;
 use crate::{Error, Id, Result, Space};
 
@@ -42,9 +44,23 @@ pub struct MachineConfig {
     /// The space that the owner last put a note into, where new notes go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_space: Option<Id>,
+    /// The machines this one paired with, which may offer it spaces, as decision ZIB0016
+    /// describes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub paired: BTreeMap<Id, PairedMachine>,
     /// The page that notes print on, which depends on the printer at hand.
     #[serde(default)]
     pub page: Page,
+}
+
+/// A machine this one paired with.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PairedMachine {
+    /// Its public key, as 64 lowercase hexadecimal digits.
+    pub key: String,
+    pub name: String,
+    /// Its file policy, by the name that decision ZIB0004 gives it.
+    pub policy: String,
 }
 
 /// The page that notes print on, a machine setting from decision ZIB0003.
@@ -103,6 +119,7 @@ impl Store {
                     peers: BTreeMap::new(),
                     last_space: None,
                     page: Page::default(),
+                    paired: BTreeMap::new(),
                 };
                 write_atomic(&path, &serde_json::to_vec_pretty(&config).expect("serializable"))?;
                 created = true;
@@ -224,6 +241,36 @@ impl Store {
         self.save()
     }
 
+    /// Records a machine that this one paired with, or updates its name.
+    pub fn add_paired(&mut self, party: &Party) -> Result<()> {
+        let entry = PairedMachine {
+            key: party.key.to_hex(),
+            name: party.name.clone(),
+            policy: party.policy.name().to_owned(),
+        };
+        if self.config.paired.get(&party.machine) == Some(&entry) {
+            return Ok(());
+        }
+        self.config.paired.insert(party.machine, entry);
+        self.save()
+    }
+
+    /// The machines this one paired with.
+    pub fn paired(&self) -> Vec<Party> {
+        self.config
+            .paired
+            .iter()
+            .filter_map(|(id, entry)| {
+                Some(Party {
+                    machine: *id,
+                    name: entry.name.clone(),
+                    policy: Policy::from_name(&entry.policy)?,
+                    key: MachineKey::from_hex(&entry.key).ok()?,
+                })
+            })
+            .collect()
+    }
+
     /// Records a space that arrived through pairing, with the pet name its owner gave it.
     pub fn add_space(&mut self, space: &Space, name: &str) -> Result<()> {
         self.config.spaces.insert(space.id()?, SpaceEntry { name: name.to_owned(), hidden: false });
@@ -282,5 +329,15 @@ mod tests {
         assert_eq!(reopened.load_space(id).unwrap().note(note).unwrap().body, "Hello");
         let mode = fs::metadata(dirs.data.join(SECRET_KEY)).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        let party = Party {
+            machine: Id::generate(),
+            name: "other".into(),
+            policy: Policy::OnDemand,
+            key: MachineKey([7; 32]),
+        };
+        let mut store = reopened;
+        store.add_paired(&party).unwrap();
+        assert_eq!(Store::open(&dirs, Policy::All).unwrap().paired(), vec![party]);
     }
 }

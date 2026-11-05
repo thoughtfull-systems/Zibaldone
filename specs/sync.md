@@ -104,6 +104,26 @@ order:
 The machine keeps the blob and asks again later when no such holder is online, or when every one
 replies `false`.
 
+## Offering a space
+
+A member hands a space to a machine it paired with, outside pairing, as
+[decision ZIB0016](../decisions/ZIB0016-sharing-spaces-with-paired-machines.md) describes. Each
+machine remembers the machines it paired with, as the pairing specification defines.
+
+- **Adding.** The member adds the machine to the space's `machines` in one commit, as pairing does,
+  before it offers the space.
+- **Offer.** The member opens a `zib/sync` stream to the machine and sends `offer`, with `space` and
+  its own `machine` identifier.
+- **Accepting.** The machine accepts only when the key the connection authenticated belongs to a
+  machine it paired with. It replies `offered`, with the same `space`, then receives the space as
+  pairing receives a shared space, and asks its owner for a pet name. A machine that already holds
+  the space replies `offered` and does nothing more.
+- **Refusing.** Otherwise the machine replies `error`. A machine that doesn't know `offer` replies
+  `error` too, and the member treats both as a refusal.
+- **Retrying.** When an exchange of the space with a member that this machine paired with fails, the
+  next try at that member sends `offer` first, so a machine that was off when the owner shared the
+  space receives it once it's back.
+
 ## When to sync
 
 While an instance runs, it accepts streams from the members of its spaces. It starts an exchange of

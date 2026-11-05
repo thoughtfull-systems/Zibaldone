@@ -81,6 +81,12 @@ For each space that a side shares, it adds the other machine to the space's `mac
 commit, with the other's `key`, `name`, and `policy`, and then syncs the space with it as the sync
 specification defines. The receiving machine asks its owner for a pet name for each space it gains.
 
+Once pairing finishes, each side remembers the other as a paired machine in its machine store, with
+its identifier, `key`, `name`, and `policy`, even when neither side shared a space. A paired machine
+can offer the other spaces later, as the sync specification defines in
+[offering a space](sync.md#offering-a-space). A machine that joins a space by invite doesn't become
+a paired machine.
+
 A machine in the middle has to send its `commitment` before it learns the responder's nonce, and
 receives the initiator's nonce only after the responder sent its own, so it can't choose nonces that
 make the two codes match. Its one guess succeeds one time in a million, and a failed guess shows the

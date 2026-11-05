@@ -16,9 +16,9 @@ use zib_core::Id;
 use zib_core::sync::Selection;
 
 /// How long a machine's cursor stays without a new `cursor` message.
-pub const EXPIRY: Duration = Duration::from_secs(60);
+pub const EXPIRY: Duration = zib_core::sync::CURSOR_TIMEOUT;
 /// How often a machine sends its cursor again while nothing moves.
-pub const RESEND: Duration = Duration::from_secs(20);
+pub const RESEND: Duration = zib_core::sync::CURSOR_REPEAT;
 
 /// The colors of machines' cursors, as red, green, and blue, picked by machine identifier.
 const COLORS: [(u8, u8, u8); 6] = [

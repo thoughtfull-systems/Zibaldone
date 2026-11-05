@@ -55,6 +55,10 @@ pub trait Pairing: Send + Sync + 'static {
     fn confirm(&self, peer: &Party, code: &str) -> impl Future<Output = Option<Vec<Id>>> + Send;
     /// Records that pairing finished, so the app can add the machine to the shared spaces.
     fn paired(&self, paired: Paired) -> impl Future<Output = ()> + Send;
+    /// Whether to take a space that the machine holding `from` offers, which this machine does
+    /// only when it paired with that machine, as decision ZIB0016 describes. A machine that takes
+    /// the space starts receiving it.
+    fn offered(&self, space: Id, from: MachineKey) -> impl Future<Output = bool> + Send;
 }
 
 /// A running machine's endpoint and the spaces it serves.
@@ -210,9 +214,10 @@ impl Node {
                 } else {
                     while let Ok((send, recv)) = connection.accept_bi().await {
                         let node = node.clone();
+                        let pairing = pairing.clone();
                         tokio::spawn(async move {
-                            let _ =
-                                timeout(EXCHANGE_TIMEOUT, node.answer_sync(send, recv, peer)).await;
+                            let answer = node.answer_sync(send, recv, peer, pairing.as_ref());
+                            let _ = timeout(EXCHANGE_TIMEOUT, answer).await;
                         });
                     }
                 }
@@ -220,13 +225,23 @@ impl Node {
         }
     }
 
-    async fn answer_sync(
+    async fn answer_sync<P: Pairing>(
         &self,
         mut send: iroh::endpoint::SendStream,
         mut recv: iroh::endpoint::RecvStream,
         peer: MachineKey,
+        pairing: &P,
     ) -> Result<()> {
         match sync::receive(&mut recv).await? {
+            Message::Offer { space, .. } => {
+                let holds = self.spaces.lock().await.contains_key(&space);
+                if holds || pairing.offered(space, peer).await {
+                    sync::send(&mut send, &Message::Offered { space }).await?;
+                } else {
+                    let reason = "this machine didn't pair with that one".to_owned();
+                    sync::send(&mut send, &Message::Error { reason }).await?;
+                }
+            }
             first @ Message::Hello { .. } => {
                 let spaces = self.spaces.lock().await.clone();
                 sync::respond(&mut recv, &mut send, first, peer, |id| spaces.get(&id).cloned())
@@ -360,6 +375,27 @@ impl Node {
             .map_err(|_| Error::Protocol("the exchange took too long".into()))?;
         close_after_sent(&connection, stream.into_inner().1).await;
         result
+    }
+
+    /// Offers `space` to the paired machine at `address`, which then receives it, as decision
+    /// ZIB0016 describes. The caller adds the machine to the space's members first.
+    pub async fn offer(&self, space: Id, address: &Address) -> Result<()> {
+        let connection = self.connect(address, sync::ALPN).await?;
+        let (mut send, mut recv) =
+            connection.open_bi().await.map_err(|e| Error::Protocol(e.to_string()))?;
+        let offer = Message::Offer { space, machine: self.me.machine };
+        let reply = timeout(CONNECT_TIMEOUT, async {
+            sync::send(&mut send, &offer).await?;
+            sync::receive(&mut recv).await
+        })
+        .await
+        .map_err(|_| Error::Protocol("the other machine didn't answer the offer".into()));
+        close_after_sent(&connection, send).await;
+        match reply?? {
+            Message::Offered { space: offered } if offered == space => Ok(()),
+            Message::Error { reason } => Err(Error::Protocol(reason)),
+            other => Err(Error::Protocol(format!("unexpected {other:?}"))),
+        }
     }
 
     /// Syncs `space` with every member that answers, and returns what each exchange learned.
@@ -717,6 +753,9 @@ mod tests {
         fn paired(&self, _: Paired) -> impl Future<Output = ()> + Send {
             std::future::ready(())
         }
+        fn offered(&self, _: Id, _: MachineKey) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
     }
 
     async fn node(policy: Policy) -> Arc<Node> {
@@ -759,6 +798,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offers_spaces_to_paired_machines() {
+        // Sync specification, offering: B paired with A, so it takes the space.
+        let (a, b) = (node(Policy::All).await, node(Policy::All).await);
+        a.offer(Id::generate(), &b.address()).await.unwrap();
+        a.close().await;
+        b.close().await;
+    }
+
+    #[tokio::test]
     async fn pairs_by_address() {
         let (a, b) = (node(Policy::All).await, node(Policy::OnDemand).await);
         let paired =
@@ -785,6 +833,9 @@ mod live_tests {
         }
         fn paired(&self, _: Paired) -> impl Future<Output = ()> + Send {
             std::future::ready(())
+        }
+        fn offered(&self, _: Id, _: MachineKey) -> impl Future<Output = bool> + Send {
+            std::future::ready(false)
         }
     }
 
@@ -815,6 +866,16 @@ mod live_tests {
         a.spaces().lock().await.insert(id, space.clone());
         b.spaces().lock().await.insert(id, copy.clone());
         (a, b, id, space, copy)
+    }
+
+    #[tokio::test]
+    async fn refuses_offers_from_unpaired_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (node(&dir.path().join("a")).await, node(&dir.path().join("b")).await);
+        assert!(a.offer(Id::generate(), &b.address()).await.is_err());
+        // A machine that holds the space already takes the offer and does nothing more.
+        let (a, b, id, _, _) = shared(&dir.path().join("shared")).await;
+        a.offer(id, &b.address()).await.unwrap();
     }
 
     #[tokio::test]
