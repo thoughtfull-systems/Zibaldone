@@ -333,6 +333,46 @@ fn marks(body: &str, spans: &mut Vec<Span>) {
     }
 }
 
+/// The lines of the items of numbered lists whose numbers have one digit, with how many columns an
+/// editor moves each line right, so that a list's numbers line up on the right until they reach
+/// three digits. An item's lines include its nested items, so the columns add up across levels.
+/// Lists in block quotes keep their columns, as the quote's margin sets theirs.
+pub fn list_pads(body: &str) -> Vec<(Range<usize>, usize)> {
+    let mut items = Vec::new();
+    // Whether each list that holds the current event is numbered.
+    let mut lists = Vec::new();
+    let mut quotes = 0;
+    for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::BlockQuote(_)) => quotes += 1,
+            Event::End(TagEnd::BlockQuote(_)) => quotes -= 1,
+            Event::Start(Tag::List(start)) => lists.push(start.is_some()),
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) if quotes == 0 && lists.last() == Some(&true) => {
+                let digits = body[range.start..].bytes().take_while(u8::is_ascii_digit).count();
+                if digits == 1 {
+                    let line_start = body[..range.start].rfind('\n').map_or(0, |i| i + 1);
+                    items.push(line_start..range.start + body[range].trim_end().len());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut pads = Vec::new();
+    let mut line_start = 0;
+    for line in body.split_inclusive('\n') {
+        let line_end = line_start + line.trim_end_matches(['\n', '\r']).len();
+        let pad = items.iter().filter(|item| item.contains(&line_start)).count();
+        if pad > 0 {
+            pads.push((line_start..line_end, pad));
+        }
+        line_start += line.len();
+    }
+    pads
+}
+
 /// Finds the innermost list item that byte `offset` falls in, and returns the edit that toggles
 /// its box: the byte range to replace, and the text to replace it with. An item without a box gets
 /// an unchecked one. An item covers its lines from their start, including indentation, up to the
@@ -744,6 +784,20 @@ mod tests {
                 (Style::Checkbox(false), vec!["- ", "[ ] "]),
             ]
         );
+    }
+
+    #[test]
+    fn pads_short_numbers() {
+        fn pads(body: &str) -> Vec<(&str, usize)> {
+            list_pads(body).into_iter().map(|(range, pad)| (&body[range], pad)).collect()
+        }
+        let body = "1. one\n   more\n\n   1) nested\n10. ten\n    10) nested\n11. 9) x";
+        assert_eq!(
+            pads(body),
+            [("1. one", 1), ("   more", 1), ("", 1), ("   1) nested", 2), ("11. 9) x", 1)]
+        );
+        // Bullets, numbers in quotes, and numbers in code aren't padded.
+        assert_eq!(pads("- a\n\n> 1. quoted\n\n```\n1. code\n```"), []);
     }
 
     #[test]

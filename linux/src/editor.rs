@@ -10,8 +10,8 @@ use adw::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
 use sourceview5::prelude::*;
 use zib_core::editing::{
-    Drawn, Span, Style, complete_block_opening, drawings as find_drawings, fence_selection, spans,
-    table_cell_in_body, toggle_checkbox,
+    Drawn, Span, Style, complete_block_opening, drawings as find_drawings, fence_selection,
+    list_pads, spans, table_cell_in_body, toggle_checkbox,
 };
 use zib_core::lists::{Edit, ListKey, list_edit};
 
@@ -30,6 +30,10 @@ const HEADING_COLORS: [&str; 4] = [
 /// and boxes over. GTK draws a fully transparent color as black.
 const DRAWN_OVER: &str = "markup-drawn-over";
 const HIDDEN: &str = "markup-hidden";
+/// Move the lines of numbered items with one-digit numbers right by one to four columns of the
+/// monospace font that list prefixes use, so a list's numbers line up on the right.
+const LIST_PADS: [&str; 4] =
+    ["markup-list-pad-1", "markup-list-pad-2", "markup-list-pad-3", "markup-list-pad-4"];
 /// Covers the whole text, so GTK repaints every run of text that moves. GTK's GL renderer
 /// repaints too little around text that moves or goes, such as syntax as it hides, and leaves faint
 /// ghosts of its antialiased edges. A background makes it repaint each run's whole cell. A fully
@@ -68,20 +72,36 @@ pub fn new_view(draw: Draw) -> sourceview5::View {
     view.set_right_margin(24);
     view.set_vexpand(true);
     attach_preview(&view, Drawings::new(view.upcast_ref(), draw, HIDDEN));
-    // A tag's margin replaces the view's margin rather than adding to it, so the quote margin
-    // follows the view's.
-    let indent_quotes = |view: &sourceview5::View| {
-        if let Some(tag) = view.buffer().tag_table().lookup(QUOTE_MARGIN) {
+    // A tag's margin replaces the view's margin rather than adding to it, so the quote margin and
+    // the list pads follow the view's.
+    let set_margins = |view: &sourceview5::View| {
+        let table = view.buffer().tag_table();
+        if let Some(tag) = table.lookup(QUOTE_MARGIN) {
             tag.set_left_margin(view.left_margin() + QUOTE_INDENT);
         }
+        let column = monospace_width(view);
+        for (columns, name) in (1..).zip(LIST_PADS) {
+            if let Some(tag) = table.lookup(name) {
+                tag.set_left_margin(view.left_margin() + columns * column);
+            }
+        }
     };
-    indent_quotes(&view);
-    view.connect_left_margin_notify(indent_quotes);
+    set_margins(&view);
+    view.connect_left_margin_notify(set_margins);
     attach_list_keys(&view);
     attach_wrap_keys(&view);
     attach_checkbox_clicks(&view);
     attach_primary_selection(&view);
     view
+}
+
+/// The width of a character of the monospace font that list prefixes use, in pixels.
+fn monospace_width(view: &sourceview5::View) -> i32 {
+    let layout = view.create_pango_layout(Some("0"));
+    let mut font = view.pango_context().font_description().unwrap_or_default();
+    font.set_family("monospace");
+    layout.set_font_description(Some(&font));
+    layout.pixel_size().0
 }
 
 /// Offers the selected text as the primary selection, which a middle click pastes, without tying
@@ -428,6 +448,10 @@ fn add_tags(table: &gtk::TextTagTable) {
             .foreground_rgba(&dim)
             .build(),
         gtk::TextTag::builder().name(QUOTE_MARGIN).build(),
+        gtk::TextTag::builder().name(LIST_PADS[0]).build(),
+        gtk::TextTag::builder().name(LIST_PADS[1]).build(),
+        gtk::TextTag::builder().name(LIST_PADS[2]).build(),
+        gtk::TextTag::builder().name(LIST_PADS[3]).build(),
         gtk::TextTag::builder()
             .name(tag(Style::Code))
             .family("monospace")
@@ -817,6 +841,7 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings)
     let names = [CODE_BLOCK_SHADE, DRAWN_OVER, HIDDEN, QUOTE_MARGIN, SYNTAX]
         .into_iter()
         .chain(HEADING_COLORS)
+        .chain(LIST_PADS)
         .chain(STYLES.into_iter().map(style_tag));
     for name in names {
         buffer.remove_tag_by_name(name, &start, &end);
@@ -836,6 +861,9 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings)
     preview.byte_chars = byte_chars;
     preview.char_bytes = char_bytes;
     preview.spans = spans(&body);
+    for (line, columns) in list_pads(&body) {
+        apply(buffer, LIST_PADS[columns.clamp(1, LIST_PADS.len()) - 1], preview.chars(&line));
+    }
     let selection = preview.selection(buffer);
     preview.revealed = preview.spans.iter().map(|span| span.touches(&selection)).collect();
     for (span, &revealed) in preview.spans.iter().zip(&preview.revealed) {
