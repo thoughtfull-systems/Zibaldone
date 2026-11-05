@@ -1,10 +1,11 @@
-//! The editor's text view: `GtkSourceView`'s, drawing paragraph backgrounds on empty lines too.
-//! GTK draws a tag's paragraph background on every line but an empty one, so a blank line in a
-//! code block would show as a gap in the block's shade.
+//! The editor's text view: `GtkSourceView`'s, drawing paragraph backgrounds on empty lines too, and
+//! drawing bullets and task boxes over the list syntax that a tag hides. GTK draws a tag's
+//! paragraph background on every line but an empty one, so a blank line in a code block would show
+//! as a gap in the block's shade.
 
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
-use gtk::{glib, graphene};
+use gtk::{glib, graphene, gsk};
 
 mod imp {
     use std::cell::Cell;
@@ -14,12 +15,14 @@ mod imp {
     use gtk::subclass::prelude::*;
     use sourceview5::subclass::prelude::*;
 
-    use super::shade_empty_lines;
+    use super::{draw_over, shade_empty_lines};
 
     #[derive(Default)]
     pub struct View {
         /// The name of the tag whose paragraph background the view draws on empty lines.
         pub shaded: Cell<&'static str>,
+        /// The name of the tag on list markers and task boxes that the view draws over.
+        pub drawn_over: Cell<&'static str>,
     }
 
     #[glib::object_subclass]
@@ -35,8 +38,14 @@ mod imp {
     impl TextViewImpl for View {
         fn snapshot_layer(&self, layer: gtk::TextViewLayer, snapshot: gtk::Snapshot) {
             self.parent_snapshot_layer(layer, snapshot.clone());
-            if layer == gtk::TextViewLayer::BelowText {
-                shade_empty_lines(self.obj().upcast_ref(), self.shaded.get(), &snapshot);
+            match layer {
+                gtk::TextViewLayer::BelowText => {
+                    shade_empty_lines(self.obj().upcast_ref(), self.shaded.get(), &snapshot);
+                }
+                gtk::TextViewLayer::AboveText => {
+                    draw_over(self.obj().upcast_ref(), self.drawn_over.get(), &snapshot);
+                }
+                _ => {}
             }
         }
     }
@@ -51,10 +60,16 @@ glib::wrapper! {
 }
 
 /// Creates a view of `buffer` that draws the paragraph background of the tag named `shaded` on
-/// empty lines as well as on the rest.
-pub fn new(buffer: &sourceview5::Buffer, shaded: &'static str) -> sourceview5::View {
+/// empty lines as well as on the rest, and draws a bullet or a task box over each run of text
+/// with the tag named `drawn_over`, which should leave that text unseen.
+pub fn new(
+    buffer: &sourceview5::Buffer,
+    shaded: &'static str,
+    drawn_over: &'static str,
+) -> sourceview5::View {
     let view: View = glib::Object::builder().property("buffer", buffer).build();
     view.imp().shaded.set(shaded);
+    view.imp().drawn_over.set(drawn_over);
     view.upcast()
 }
 
@@ -86,4 +101,190 @@ fn shade_empty_lines(view: &gtk::TextView, shaded: &str, snapshot: &gtk::Snapsho
             break;
         }
     }
+}
+
+/// Draws a bullet over each list marker with the tag named `drawn_over` in the visible lines, and
+/// a box over each task box with it: a plain one, or a filled and checked one.
+fn draw_over(view: &gtk::TextView, drawn_over: &str, snapshot: &gtk::Snapshot) {
+    let Some(tag) = view.buffer().tag_table().lookup(drawn_over) else { return };
+    let visible = view.visible_rect();
+    let (mut at, _) = view.line_at_y(visible.y());
+    let color = view.color();
+    loop {
+        if !at.has_tag(&tag) && !at.forward_to_tag_toggle(Some(&tag)) {
+            break;
+        }
+        let start = at;
+        at.forward_to_tag_toggle(Some(&tag));
+        if view.iter_location(&start).y() > visible.y() + visible.height() {
+            break;
+        }
+        if let Some((_, checked)) = task_box(&start, &at) {
+            draw_box(snapshot, &box_rect(view, &start, &at), checked, &color);
+            continue;
+        }
+        let mut marker = start;
+        while marker < at {
+            draw_bullet(view, snapshot, &marker, &color);
+            marker.forward_char();
+        }
+    }
+}
+
+/// Draws the bullet for the list marker at `marker` over its cell, as wide as the inside of a task
+/// box on its line, so the shapes look alike in size whatever font draws them, and line up with
+/// boxes.
+fn draw_bullet(
+    view: &gtk::TextView,
+    snapshot: &gtk::Snapshot,
+    marker: &gtk::TextIter,
+    color: &gtk::gdk::RGBA,
+) {
+    // The glyph and its weight.
+    let (glyph, weight) = match marker.char() {
+        '*' => ("•", gtk::pango::Weight::Normal),
+        '-' => ("⁃", gtk::pango::Weight::Normal),
+        '+' => ("＋", gtk::pango::Weight::Bold),
+        _ => return,
+    };
+    let cell = view.iter_location(marker);
+    let layout = view.create_pango_layout(Some(glyph));
+    let attributes = gtk::pango::AttrList::new();
+    attributes.insert(gtk::pango::AttrInt::new_weight(weight));
+    layout.set_attributes(Some(&attributes));
+    let (ink, _) = layout.extents();
+    if ink.width() <= 0 || ink.height() <= 0 {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let (cell, ink) = (
+        graphene::Rect::new(
+            cell.x() as f32,
+            cell.y() as f32,
+            cell.width() as f32,
+            cell.height() as f32,
+        ),
+        graphene::Rect::new(
+            ink.x() as f32,
+            ink.y() as f32,
+            ink.width() as f32,
+            ink.height() as f32,
+        )
+        .scale(1.0 / gtk::pango::SCALE as f32, 1.0 / gtk::pango::SCALE as f32),
+    );
+    let side = box_side(cell.height());
+    let scale = (side - 2.0 * box_border(side)) / ink.width();
+    snapshot.save();
+    snapshot.translate(&cell.center());
+    snapshot.scale(scale, scale);
+    snapshot.translate(&graphene::Point::new(-ink.center().x(), -ink.center().y()));
+    snapshot.append_layout(&layout, color);
+    snapshot.restore();
+}
+
+/// The `[` of the task box that a run of drawn-over text from `start` to `end` stands for, and
+/// whether it's checked: the box itself, or the marker of its item, which the hidden box follows.
+fn task_box(start: &gtk::TextIter, end: &gtk::TextIter) -> Option<(gtk::TextIter, bool)> {
+    let open = [*start, *end].into_iter().find(|at| at.char() == '[')?;
+    let mut mark = open;
+    mark.forward_char();
+    Some((open, mark.char() != ' '))
+}
+
+/// The cells of the text from `start` to `end`, on one line.
+fn run_rect(view: &gtk::TextView, start: &gtk::TextIter, end: &gtk::TextIter) -> graphene::Rect {
+    let first = view.iter_location(start);
+    let mut last = *end;
+    last.backward_char();
+    let last = view.iter_location(&last);
+    #[allow(clippy::cast_precision_loss)]
+    graphene::Rect::new(
+        first.x() as f32,
+        first.y() as f32,
+        (last.x() + last.width() - first.x()) as f32,
+        first.height() as f32,
+    )
+}
+
+/// Where the view draws the task box whose drawn-over text runs from `start` to `end`: a square a
+/// little smaller than a line, centered on the box's source, or in place of a marker, on the
+/// marker, where its siblings' bullets are.
+fn box_rect(view: &gtk::TextView, start: &gtk::TextIter, end: &gtk::TextIter) -> graphene::Rect {
+    let run = run_rect(view, start, end);
+    let side = box_side(run.height());
+    #[allow(clippy::cast_precision_loss)]
+    let center = if start.char() == '[' {
+        run.x() + run.width() / 2.0
+    } else {
+        run.x() + view.iter_location(start).width() as f32 / 2.0
+    };
+    graphene::Rect::new(
+        (center - side / 2.0).round(),
+        (run.y() + (run.height() - side) / 2.0).round(),
+        side,
+        side,
+    )
+}
+
+/// Draws a task box in `rect`: an outline in the text's color, or when `checked`, filled with the
+/// accent color and checked.
+fn draw_box(
+    snapshot: &gtk::Snapshot,
+    rect: &graphene::Rect,
+    checked: bool,
+    color: &gtk::gdk::RGBA,
+) {
+    let side = rect.width();
+    let rounded = gsk::RoundedRect::from_rect(*rect, side * 0.2);
+    if !checked {
+        let outline = gtk::gdk::RGBA::new(color.red(), color.green(), color.blue(), 0.55);
+        let width = box_border(side);
+        snapshot.append_border(&rounded, &[width; 4], &[outline; 4]);
+        return;
+    }
+    let style = adw::StyleManager::default();
+    snapshot.push_rounded_clip(&rounded);
+    snapshot.append_color(&style.accent_color_rgba(), rect);
+    snapshot.pop();
+    let (x, y) = (rect.x(), rect.y());
+    let check = gsk::PathBuilder::new();
+    check.move_to(x + side * 0.26, y + side * 0.52);
+    check.line_to(x + side * 0.43, y + side * 0.69);
+    check.line_to(x + side * 0.75, y + side * 0.33);
+    let stroke = gsk::Stroke::new(side * 0.13);
+    stroke.set_line_cap(gsk::LineCap::Round);
+    stroke.set_line_join(gsk::LineJoin::Round);
+    snapshot.append_stroke(&check.to_path(), &stroke, &gtk::gdk::RGBA::WHITE);
+}
+
+/// The `[` of the task box that the view draws under `x` and `y`, in buffer coordinates, or over
+/// whose source they lie. A box can reach left past its source, over the character before it.
+pub fn box_at(view: &gtk::TextView, x: i32, y: i32) -> Option<gtk::TextIter> {
+    let tag =
+        view.buffer().tag_table().lookup(view.downcast_ref::<View>()?.imp().drawn_over.get())?;
+    let under = view.iter_at_location(x, y)?;
+    let mut next = under;
+    next.forward_char();
+    #[allow(clippy::cast_precision_loss)]
+    let point = graphene::Point::new(x as f32, y as f32);
+    [under, next].into_iter().filter(|at| at.has_tag(&tag)).find_map(|mut start| {
+        if !start.starts_tag(Some(&tag)) {
+            start.backward_to_tag_toggle(Some(&tag));
+        }
+        let mut end = start;
+        end.forward_to_tag_toggle(Some(&tag));
+        let (open, _) = task_box(&start, &end)?;
+        let area = run_rect(view, &start, &end).union(&box_rect(view, &start, &end));
+        area.contains_point(&point).then_some(open)
+    })
+}
+
+/// The side of the task box on a line of `height`, a little smaller than the line.
+fn box_side(height: f32) -> f32 {
+    (height * 0.8).round()
+}
+
+/// The width of the border of a task box whose side is `side`.
+fn box_border(side: f32) -> f32 {
+    (side * 0.1).max(1.5)
 }

@@ -26,6 +26,9 @@ const HEADING_COLORS: [&str; 4] = [
     "markup-heading-color-3",
     "markup-heading-color-4",
 ];
+/// Leaves list markers and task boxes unseen, but keeping their room, for the view to draw bullets
+/// and boxes over. GTK draws a fully transparent color as black.
+const DRAWN_OVER: &str = "markup-drawn-over";
 const HIDDEN: &str = "markup-hidden";
 /// Covers the whole text, so GTK repaints every run of text that moves. GTK's GL renderer
 /// repaints too little around text that moves or goes, such as syntax as it hides, and leaves faint
@@ -57,7 +60,7 @@ pub fn new_view(draw: Draw) -> sourceview5::View {
     apply_scheme(&style_manager);
     style_manager.connect_dark_notify(apply_scheme);
 
-    let view = crate::view::new(&buffer, CODE_BLOCK_SHADE);
+    let view = crate::view::new(&buffer, CODE_BLOCK_SHADE, DRAWN_OVER);
     view.set_wrap_mode(gtk::WrapMode::WordChar);
     view.set_top_margin(16);
     view.set_bottom_margin(24);
@@ -247,34 +250,54 @@ fn apply_edit(buffer: &gtk::TextBuffer, body: &str, edit: Edit, selected: Option
     }
 }
 
-/// Toggles a task box when the owner clicks it.
+/// Toggles a task box that the view draws when the owner clicks it, without moving the cursor, and
+/// shows the pointer as an arrow over it, as over a button. A box showing its source edits as text.
 fn attach_checkbox_clicks(view: &sourceview5::View) {
-    let click = gtk::GestureClick::new();
-    click.connect_released(glib::clone!(
+    let box_at = |view: &sourceview5::View, x: f64, y: f64| {
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        crate::view::box_at(view.upcast_ref(), x, y)
+    };
+    // The capture phase claims the press before the view's own gestures move the cursor.
+    let click = gtk::GestureClick::builder()
+        .button(gdk::BUTTON_PRIMARY)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    let claimed = Rc::new(Cell::new(false));
+    click.connect_pressed(glib::clone!(
         #[weak]
         view,
-        move |gesture, presses, x, y| {
-            if presses != 1 || !view.is_editable() {
-                return;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let (bx, by) =
-                view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-            let Some(iter) = view.iter_at_location(bx, by) else { return };
-            let buffer = view.buffer();
-            let body = text(&buffer);
-            let byte = byte_at(&body, iter.offset());
-            let on_box = spans(&body).iter().any(|span| {
-                matches!(span.style, Style::Checkbox(_))
-                    && span.range.start <= byte
-                    && byte < span.range.end
-            });
-            if on_box && toggle_checkbox_at(&buffer, iter.offset()) {
+        #[strong]
+        claimed,
+        move |gesture, _, x, y| {
+            claimed.set(view.is_editable() && box_at(&view, x, y).is_some());
+            if claimed.get() {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
             }
         }
     ));
+    click.connect_released(glib::clone!(
+        #[weak]
+        view,
+        move |_, _, x, y| {
+            if let Some(at) = box_at(&view, x, y).filter(|_| claimed.replace(false)) {
+                toggle_checkbox_at(&view.buffer(), at.offset() + 1);
+            }
+        }
+    ));
     view.add_controller(click);
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_motion(glib::clone!(
+        #[weak]
+        view,
+        move |_, x, y| {
+            let name = if box_at(&view, x, y).is_some() { "default" } else { "text" };
+            if view.cursor().and_then(|cursor| cursor.name()).as_deref() != Some(name) {
+                view.set_cursor_from_name(Some(name));
+            }
+        }
+    ));
+    view.add_controller(motion);
 }
 
 /// Checks or unchecks the list item at the character `offset`, or gives it a box if it has none,
@@ -319,6 +342,41 @@ impl Preview {
             self.char_bytes[offset.min(self.char_bytes.len() - 1)]
         };
         byte(start.offset())..byte(end.offset())
+    }
+
+    /// What a move by `count` `step`s from the character offset `cursor` needs to correct where
+    /// GTK puts the cursor.
+    fn before_move(&self, cursor: usize, step: gtk::MovementStep, count: i32) -> BeforeMove {
+        let hidden = self
+            .drawn
+            .iter()
+            .zip(&self.drawn_revealed)
+            .filter(|(drawn, revealed)| drawn.block && !**revealed)
+            .map(|(drawn, _)| self.chars(&drawn.range))
+            .collect();
+        let positions = matches!(
+            step,
+            gtk::MovementStep::LogicalPositions | gtk::MovementStep::VisualPositions
+        );
+        let shown = || self.spans.iter().zip(&self.revealed).filter(|(_, revealed)| !**revealed);
+        let syntax = if count > 0 && positions {
+            shown()
+                // Math hides behind its drawing, which a move from either side lands outside, and
+                // bullets and boxes keep their room, so a move steps through them.
+                .filter(|(span, _)| span.style != Style::Math && !drawn_over(span.style))
+                .flat_map(|(span, _)| span.syntax.iter().map(|syntax| self.chars(syntax)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let boxes = shown()
+            .filter(|(span, _)| matches!(span.style, Style::Checkbox(_)))
+            .filter_map(|(span, _)| {
+                Some((self.chars(&span.range), self.chars(span.syntax.get(1)?)))
+            })
+            .collect();
+        let left = count < 0 && positions;
+        BeforeMove { cursor, hidden, syntax, boxes, left }
     }
 }
 
@@ -411,6 +469,7 @@ fn add_tags(table: &gtk::TextTagTable) {
             .foreground_rgba(&dim)
             .build(),
         gtk::TextTag::builder().name(tag(Style::ListPrefix)).family("monospace").build(),
+        gtk::TextTag::builder().name(tag(Style::ListMarker)).build(),
         gtk::TextTag::builder().name(HIDDEN).invisible(true).build(),
     ] {
         table.add(&added);
@@ -425,6 +484,13 @@ fn add_tags(table: &gtk::TextTagTable) {
     if let Some(syntax) = table.lookup(SYNTAX) {
         syntax.set_priority(table.size() - 1);
     }
+    // Above every color, the syntax's included.
+    table.add(
+        &gtk::TextTag::builder()
+            .name(DRAWN_OVER)
+            .foreground_rgba(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.004))
+            .build(),
+    );
 }
 
 /// The tag that styles a span.
@@ -443,6 +509,7 @@ fn style_tag(style: Style) -> &'static str {
         Style::Heading(_) => "markup-heading-4",
         Style::Highlight => "markup-highlight",
         Style::Link => "markup-link",
+        Style::ListMarker => "markup-list-marker",
         Style::ListPrefix => "markup-list-prefix",
         Style::Math => "markup-math",
         Style::Strikethrough => "markup-strikethrough",
@@ -451,8 +518,19 @@ fn style_tag(style: Style) -> &'static str {
     }
 }
 
+/// The tag that covers the `index`th piece of a span's syntax while the cursor is away: one that
+/// hides it, or for a list marker and the first piece of a task box, one that leaves it unseen for
+/// the view to draw over.
+fn cover(style: Style, index: usize) -> &'static str {
+    if drawn_over(style) && index == 0 { DRAWN_OVER } else { HIDDEN }
+}
+
+fn drawn_over(style: Style) -> bool {
+    matches!(style, Style::Checkbox(_) | Style::ListMarker)
+}
+
 /// Every style the editor applies, for clearing them before a restyle.
-const STYLES: [Style; 18] = [
+const STYLES: [Style; 19] = [
     Style::BlockQuote,
     Style::Checkbox(false),
     Style::Checkbox(true),
@@ -466,6 +544,7 @@ const STYLES: [Style; 18] = [
     Style::Heading(4),
     Style::Highlight,
     Style::Link,
+    Style::ListMarker,
     Style::ListPrefix,
     Style::Math,
     Style::Strikethrough,
@@ -611,11 +690,15 @@ fn clicked_place(at: &gtk::TextIter, hidden: &gtk::TextTag) -> Option<gtk::TextI
 }
 
 /// Where the cursor was before a move, the character ranges of the blocks that were hidden, and,
-/// for a move right, those of the hidden syntax.
+/// for a move right, those of the hidden syntax. Then the character ranges of the task boxes that
+/// take their markers' places, with those of each one's hidden source, and whether the move is
+/// left.
 struct BeforeMove {
     cursor: usize,
     hidden: Vec<Range<usize>>,
     syntax: Vec<Range<usize>>,
+    boxes: Vec<(Range<usize>, Range<usize>)>,
+    left: bool,
 }
 
 /// Corrects where GTK puts the cursor when a key moves it into hidden source.
@@ -629,6 +712,11 @@ struct BeforeMove {
 /// closing syntax but outside its opening syntax. A move right onto hidden syntax goes past it,
 /// so the cursor lands inside the span from either side, as a click does. Math is the exception,
 /// and the cursor lands outside its drawing from either side.
+///
+/// A move left onto the hidden box of a task that takes its marker's place lands before the item's
+/// text, with the box still drawn, rather than past the box, where GTK puts it. The next move left
+/// lands just after the box's `]`, which shows its source. Any other move onto the hidden box, such
+/// as Up or Down from the start of another item's text, lands before the text too.
 fn attach_cursor_moves(
     view: &sourceview5::View,
     preview: &Rc<RefCell<Preview>>,
@@ -678,39 +766,25 @@ fn attach_cursor_moves(
                 }
                 return;
             }
-            let hidden = preview
-                .drawn
-                .iter()
-                .zip(&preview.drawn_revealed)
-                .filter(|(drawn, revealed)| drawn.block && !**revealed)
-                .map(|(drawn, _)| preview.chars(&drawn.range))
-                .collect();
-            let right = count > 0
-                && matches!(
-                    step,
-                    gtk::MovementStep::LogicalPositions | gtk::MovementStep::VisualPositions
-                );
-            let syntax = if right {
-                preview
-                    .spans
-                    .iter()
-                    .zip(&preview.revealed)
-                    // Math hides behind its drawing, which a move from either side lands outside.
-                    .filter(|(span, revealed)| !**revealed && span.style != Style::Math)
-                    .flat_map(|(span, _)| span.syntax.iter().map(|syntax| preview.chars(syntax)))
-                    .collect()
-            } else {
-                Vec::new()
-            };
             let cursor = usize::try_from(cursor.offset()).unwrap_or(0);
-            *before.borrow_mut() = Some(BeforeMove { cursor, hidden, syntax });
+            *before.borrow_mut() = Some(preview.before_move(cursor, step, count));
         }
     });
     view.connect_local("move-cursor", true, move |values| {
-        let BeforeMove { cursor: from, hidden, syntax } = before.borrow_mut().take()?;
+        let BeforeMove { cursor: from, hidden, syntax, boxes, left } =
+            before.borrow_mut().take()?;
         let view = values.first()?.get::<sourceview5::View>().ok()?;
         let buffer = view.buffer();
         let mut cursor = usize::try_from(buffer.cursor_position()).unwrap_or(0);
+        let onto_box = boxes.iter().find(|(chars, source)| {
+            let start = if left { chars.start } else { source.start };
+            start <= cursor && cursor < source.end && (!left || source.end <= from)
+        });
+        if let Some((chars, source)) = onto_box {
+            let to = if left && from == source.end { chars.end } else { source.end };
+            buffer.place_cursor(&buffer.iter_at_offset(offset(to)));
+            return None;
+        }
         let entered = hidden
             .iter()
             .find(|chars| from < chars.start && chars.start <= cursor && cursor <= chars.end);
@@ -740,7 +814,7 @@ fn contain_panic(f: impl FnOnce()) {
 /// Styles every span from scratch, after the text changes.
 fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings) {
     let (start, end) = buffer.bounds();
-    let names = [CODE_BLOCK_SHADE, HIDDEN, QUOTE_MARGIN, SYNTAX]
+    let names = [CODE_BLOCK_SHADE, DRAWN_OVER, HIDDEN, QUOTE_MARGIN, SYNTAX]
         .into_iter()
         .chain(HEADING_COLORS)
         .chain(STYLES.into_iter().map(style_tag));
@@ -789,12 +863,12 @@ fn restyle(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings)
                 start = start.max(syntax.end);
             }
         }
-        for syntax in &span.syntax {
-            if !matches!(span.style, Style::Heading(_)) {
+        for (index, syntax) in span.syntax.iter().enumerate() {
+            if !matches!(span.style, Style::Heading(_)) && !drawn_over(span.style) {
                 apply(buffer, SYNTAX, preview.chars(syntax));
             }
             if !revealed {
-                apply(buffer, HIDDEN, preview.chars(syntax));
+                apply(buffer, cover(span.style, index), preview.chars(syntax));
             }
         }
     }
@@ -824,14 +898,16 @@ fn reveal(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings) 
             continue;
         }
         preview.revealed[i] = revealed;
-        for syntax in &preview.spans[i].syntax {
+        let style = preview.spans[i].style;
+        for (index, syntax) in preview.spans[i].syntax.iter().enumerate() {
+            let cover = cover(style, index);
             let range = preview.chars(syntax);
             let start = buffer.iter_at_offset(offset(range.start));
             let end = buffer.iter_at_offset(offset(range.end));
             if revealed {
-                buffer.remove_tag_by_name(HIDDEN, &start, &end);
+                buffer.remove_tag_by_name(cover, &start, &end);
             } else {
-                buffer.apply_tag_by_name(HIDDEN, &start, &end);
+                buffer.apply_tag_by_name(cover, &start, &end);
             }
         }
     }

@@ -1,5 +1,6 @@
 //! What an editor needs to show markdown styled as it's written: the styled elements of a body,
-//! with the syntax to hide while the cursor is away, and the edit that toggles a task box.
+//! with the syntax to hide or draw over while the cursor is away, and the edit that toggles a task
+//! box.
 
 use std::ops::Range;
 
@@ -12,7 +13,9 @@ use crate::lists::{Edit, Item as ListItem};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Style {
     BlockQuote,
-    /// A task item's box, `[ ]` or `[x]`, and whether it's checked.
+    /// A task item's box, `[ ]` or `[x]`, and whether it's checked. While the cursor is away, an
+    /// editor draws a box to click over its first syntax, and hides the rest. In a bulleted list,
+    /// the box takes the place of the item's marker.
     Checkbox(bool),
     Code,
     CodeBlock,
@@ -28,6 +31,9 @@ pub enum Style {
     /// line that continues one. Editors draw these in a monospace font, so that continuation lines
     /// and nested items line up with the text above them.
     ListPrefix,
+    /// The `*`, `-`, or `+` that starts an item of a bulleted list. Its syntax is the marker, which
+    /// an editor draws as a bullet while the cursor is away, rather than hiding it.
+    ListMarker,
     Math,
     Strikethrough,
     Strong,
@@ -40,8 +46,8 @@ pub struct Span {
     /// Byte range of the whole element, including its syntax.
     pub range: Range<usize>,
     pub style: Style,
-    /// Byte ranges of the syntax to hide while the cursor is away from the element. None of them
-    /// contain a line break.
+    /// Byte ranges of the syntax to hide while the cursor is away from the element, or for a task
+    /// box or list marker, to draw something else over. None of them contain a line break.
     pub syntax: Vec<Range<usize>>,
 }
 
@@ -116,20 +122,17 @@ pub fn spans(body: &str) -> Vec<Span> {
             Event::InlineMath(_) | Event::DisplayMath(_) => {
                 spans.push(delimited(body, range, b'$', Style::Math));
             }
-            Event::TaskListMarker(checked) => {
-                if checked {
-                    let line_end =
-                        body[range.end..].find('\n').map_or(body.len(), |i| range.end + i);
-                    let rest = &body[range.end..line_end];
-                    let text_start = line_end - rest.trim_start().len();
-                    spans.push(span(body, text_start..line_end, Style::Completed, Vec::new()));
-                }
-                spans.push(span(body, range, Style::Checkbox(checked), Vec::new()));
+            Event::TaskListMarker(true) => {
+                let line_end = body[range.end..].find('\n').map_or(body.len(), |i| range.end + i);
+                let rest = &body[range.end..line_end];
+                let text_start = line_end - rest.trim_start().len();
+                spans.push(span(body, text_start..line_end, Style::Completed, Vec::new()));
             }
             _ => {}
         }
     }
     marks(body, &mut spans);
+    spans.extend(list_markers(body));
     spans.extend(list_prefixes(body));
     for link in body::wikilinks(body) {
         let Range { start, end } = link.range;
@@ -394,6 +397,55 @@ pub fn toggle_checkbox(body: &str, offset: usize) -> Option<(Range<usize>, &'sta
         .filter(|(item, _)| item.start <= offset && offset <= item.end)
         .min_by_key(|(item, _)| item.len())
         .map(|(_, edit)| edit)
+}
+
+/// The `*`, `-`, and `+` markers of the items of bulleted lists, and the task boxes. A task box in
+/// a bulleted list takes its item's marker's place: the span's first syntax is the marker and the
+/// white space after it, which an editor draws the box over, and its second is the box and the
+/// white space after it, which an editor hides, so the item's text starts at its content column.
+/// Elsewhere, the box is the span's only syntax, and an editor draws over it.
+fn list_markers(body: &str) -> Vec<Span> {
+    let mut markers = Vec::new();
+    // Whether each list that holds the current event is bulleted.
+    let mut lists = Vec::new();
+    // Where the marker of each item that holds the current event starts, when it's a bullet.
+    let mut items: Vec<Option<usize>> = Vec::new();
+    for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::List(start)) => lists.push(start.is_none()),
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                let bullet = lists.last() == Some(&true)
+                    && matches!(body.as_bytes().get(range.start), Some(b'*' | b'-' | b'+'));
+                items.push(bullet.then_some(range.start));
+                if bullet {
+                    let marker = range.start..range.start + 1;
+                    markers.push(span(body, marker.clone(), Style::ListMarker, vec![marker]));
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                items.pop();
+            }
+            Event::TaskListMarker(checked) => {
+                let style = Style::Checkbox(checked);
+                let Some(&Some(marker)) = items.last() else {
+                    markers.push(span(body, range.clone(), style, vec![range]));
+                    continue;
+                };
+                // The parser reports the box before anything else in its item, so the item's
+                // marker is the last one found.
+                markers.pop();
+                let after = &body[range.end..];
+                let text = range.end + after.len() - after.trim_start_matches([' ', '\t']).len();
+                let syntax = vec![marker..range.start, range.start..text];
+                markers.push(span(body, marker..range.end, style, syntax));
+            }
+            _ => {}
+        }
+    }
+    markers
 }
 
 fn list_prefixes(body: &str) -> Vec<Span> {
@@ -677,11 +729,36 @@ mod tests {
         assert_eq!(
             hidden("- [x] done"),
             [
+                (Style::Checkbox(true), vec!["- ", "[x] "]),
                 (Style::ListPrefix, vec![]),
-                (Style::Checkbox(true), vec![]),
                 (Style::Completed, vec![])
             ]
         );
+        // A numbered task keeps its number, and the box is drawn where it is.
+        assert_eq!(
+            hidden("1. [ ] to do\n   - [ ] nested"),
+            [
+                (Style::ListPrefix, vec![]),
+                (Style::Checkbox(false), vec!["[ ]"]),
+                (Style::ListPrefix, vec![]),
+                (Style::Checkbox(false), vec!["- ", "[ ] "]),
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_bullets() {
+        let markers = |body: &str| {
+            spans(body)
+                .into_iter()
+                .filter(|span| span.style == Style::ListMarker)
+                .map(|span| span.range.start)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(markers("* a\n  - b\n    + c"), [0, 6, 14]);
+        assert_eq!(markers("> - quoted\n\n1. one\n   - two"), [2, 22]);
+        // A rule, a numbered item, and a marker in code aren't bullets.
+        assert_eq!(markers("* * *\n\n2. a\n\n```\n- code\n```"), Vec::<usize>::new());
     }
 
     /// Types `typed` at the `|` in `before`, and returns the result with `|` at the new cursor.
