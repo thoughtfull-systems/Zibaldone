@@ -262,7 +262,7 @@ pub fn confirm_request(
     state: Arc<State>,
     peer: Party,
     code: String,
-    reply: oneshot::Sender<Option<Vec<Id>>>,
+    reply: oneshot::Sender<Option<Vec<(Id, String)>>>,
 ) {
     let window = window.cloned();
     glib::spawn_future_local(async move {
@@ -280,20 +280,21 @@ pub fn confirm_request(
     });
 }
 
-/// Asks the owner to confirm, with a checkbox for each space to share.
+/// Asks the owner to confirm, with a checkbox for each space to share, and returns the spaces
+/// chosen with their pet names, which the other machine suggests to its owner.
 async fn choose_spaces(
     window: &Window,
     heading: &str,
     body: &str,
     spaces: &[(Id, String)],
-) -> Option<Vec<Id>> {
+) -> Option<Vec<(Id, String)>> {
     let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    let checks: Vec<(Id, gtk::CheckButton)> = spaces
+    let checks: Vec<(Id, String, gtk::CheckButton)> = spaces
         .iter()
         .map(|(id, name)| {
             let check = gtk::CheckButton::with_label(name);
             list.append(&check);
-            (*id, check)
+            (*id, name.clone(), check)
         })
         .collect();
     let dialog = adw::AlertDialog::new(Some(heading), Some(body));
@@ -301,8 +302,13 @@ async fn choose_spaces(
     dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
     dialog.set_extra_child(Some(&list));
     let response = dialog.choose_future(Some(&window.gtk_window())).await;
-    (response == "ok")
-        .then(|| checks.iter().filter(|(_, c)| c.is_active()).map(|(id, _)| *id).collect())
+    (response == "ok").then(|| {
+        checks
+            .iter()
+            .filter(|(_, _, c)| c.is_active())
+            .map(|(id, name, _)| (*id, name.clone()))
+            .collect()
+    })
 }
 
 /// A QR code as a texture, with a quiet zone of four modules and eight pixels a module.

@@ -98,6 +98,9 @@ pub enum Message {
     Offer {
         space: Id,
         machine: Id,
+        /// The offering machine's pet name for the space, which the other suggests to its owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     Offered {
         space: Id,
@@ -307,7 +310,8 @@ pub enum LiveEvent {
 
 /// Runs a live editing session on a stream where both sides have the note open: it catches the
 /// other side up, then sends each local change as it comes and imports each remote one. It ends
-/// when `local` closes, when the other side sends `unwatch`, or when the stream breaks.
+/// when `local` closes, when the other side sends `unwatch`, or when the stream breaks, and reports
+/// `Ended` however it ends, so the app drops the other machine's cursors.
 pub async fn live<S>(
     stream: S,
     space: &Mutex<Space>,
@@ -322,48 +326,51 @@ where
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let _ = events.send(LiveEvent::Started { machine: peer }).await;
-    if let Some(updates) = space.lock().await.updates_since(peer_version)? {
-        send(&mut writer, &Message::Updates { updates }).await?;
-    }
-    let result = loop {
-        tokio::select! {
-            update = local.recv() => match update {
-                Ok(updates) => send(&mut writer, &Message::Updates { updates }).await?,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Too many changes queued: send everything at once instead.
-                    let all = space.lock().await.updates_since(&VersionVector::new().encode())?;
-                    if let Some(updates) = all {
-                        send(&mut writer, &Message::Updates { updates }).await?;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    let _ = send(&mut writer, &Message::Unwatch).await;
-                    break Ok(());
-                }
-            },
-            cursor = cursors.recv() => match cursor {
-                Ok((note, selections)) => {
-                    send(&mut writer, &Message::Cursor { note, selections }).await?;
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => {
-                    let _ = send(&mut writer, &Message::Unwatch).await;
-                    break Ok(());
-                }
-            },
-            message = frame::read::<_, Message>(&mut reader, MAX_FRAME) => match message? {
-                Some(Message::Updates { updates }) => {
-                    space.lock().await.import_checked(&updates)?;
-                    let _ = events.send(LiveEvent::Changed { machine: peer }).await;
-                }
-                Some(Message::Cursor { selections, .. }) => {
-                    let _ = events.send(LiveEvent::Cursor { machine: peer, selections }).await;
-                }
-                Some(Message::Unwatch) | None => break Ok(()),
-                Some(other) => break Err(Error::Protocol(format!("unexpected {other:?}"))),
-            },
+    let result = async {
+        if let Some(updates) = space.lock().await.updates_since(peer_version)? {
+            send(&mut writer, &Message::Updates { updates }).await?;
         }
-    };
+        loop {
+            tokio::select! {
+                update = local.recv() => match update {
+                    Ok(updates) => send(&mut writer, &Message::Updates { updates }).await?,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Too many changes queued: send everything at once instead.
+                        let all = space.lock().await.updates_since(&VersionVector::new().encode())?;
+                        if let Some(updates) = all {
+                            send(&mut writer, &Message::Updates { updates }).await?;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _ = send(&mut writer, &Message::Unwatch).await;
+                        break Ok(());
+                    }
+                },
+                cursor = cursors.recv() => match cursor {
+                    Ok((note, selections)) => {
+                        send(&mut writer, &Message::Cursor { note, selections }).await?;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _ = send(&mut writer, &Message::Unwatch).await;
+                        break Ok(());
+                    }
+                },
+                message = frame::read::<_, Message>(&mut reader, MAX_FRAME) => match message? {
+                    Some(Message::Updates { updates }) => {
+                        space.lock().await.import_checked(&updates)?;
+                        let _ = events.send(LiveEvent::Changed { machine: peer }).await;
+                    }
+                    Some(Message::Cursor { selections, .. }) => {
+                        let _ = events.send(LiveEvent::Cursor { machine: peer, selections }).await;
+                    }
+                    Some(Message::Unwatch) | None => break Ok(()),
+                    Some(other) => break Err(Error::Protocol(format!("unexpected {other:?}"))),
+                },
+            }
+        }
+    }
+    .await;
     let _ = events.send(LiveEvent::Ended { machine: peer }).await;
     result
 }
@@ -436,6 +443,23 @@ pub enum SyncState {
     NotSynced,
     PartlySynced,
     Synced,
+}
+
+/// Whether `member` lacks a change that this machine made to the space, by the version vector it
+/// last recorded for that member. `own_peers` are the Loro peers this machine has written with.
+pub fn lacks_changes(
+    space: &Space,
+    own_peers: &[u64],
+    recorded: &BTreeMap<Id, Vec<u8>>,
+    member: Id,
+) -> bool {
+    let current = space.doc().oplog_vv();
+    let Some(vv) = recorded.get(&member).and_then(|bytes| VersionVector::decode(bytes).ok()) else {
+        return own_peers.iter().any(|peer| current.get(peer).copied().unwrap_or(0) > 0);
+    };
+    own_peers
+        .iter()
+        .any(|peer| vv.get(peer).copied().unwrap_or(0) < current.get(peer).copied().unwrap_or(0))
 }
 
 /// The sync status of a space, as the sync specification defines it. `own_peers` are the Loro
@@ -551,6 +575,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_the_end_of_a_broken_session() {
+        // Sync specification, live editing: a stream that breaks ends live editing too.
+        let p = pair();
+        let version = p.b.lock().await.version();
+        let (one, mut two) = tokio::io::duplex(1 << 16);
+        let (_local_tx, local_rx) = broadcast::channel(16);
+        let (_cursor_tx, cursor_rx) = broadcast::channel(4);
+        let (events_tx, mut events) = mpsc::channel(16);
+        let a = p.a.clone();
+        let b_id = p.b.lock().await.machine();
+        let session = tokio::spawn(async move {
+            live(one, &a, b_id, &version, local_rx, cursor_rx, events_tx).await
+        });
+        assert_eq!(events.recv().await, Some(LiveEvent::Started { machine: b_id }));
+        // Half a frame, then nothing: the connection broke mid-message.
+        tokio::io::AsyncWriteExt::write_all(&mut two, &[0, 0, 0, 10, 1]).await.unwrap();
+        drop(two);
+        assert!(session.await.unwrap().is_err());
+        loop {
+            match events.recv().await {
+                Some(LiveEvent::Ended { machine }) => {
+                    assert_eq!(machine, b_id);
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("the session ended without saying so"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn streams_live_changes() {
         let p = pair();
         let note = p.a.lock().await.create_note(schema::NOTE, "shared").unwrap();
@@ -606,6 +661,20 @@ mod tests {
         drop(b_cursor_tx);
         b_session.await.unwrap().unwrap();
         a_session.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn knows_which_members_lack_changes() {
+        // Instance specification, quitting: only members that lack a change here need an exchange.
+        let p = pair();
+        let mut a = p.a.lock().await;
+        let b = p.b.lock().await.machine();
+        let peers = [a.doc().peer_id()];
+        let mut recorded = BTreeMap::new();
+        a.create_note(schema::NOTE, "made here").unwrap();
+        assert!(lacks_changes(&a, &peers, &recorded, b));
+        recorded.insert(b, a.version());
+        assert!(!lacks_changes(&a, &peers, &recorded, b));
     }
 
     #[tokio::test]

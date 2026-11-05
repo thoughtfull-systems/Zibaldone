@@ -13,6 +13,7 @@ use crate::address::MachineKey;
 use crate::channel::Dirs;
 use crate::pairing::Party;
 use crate::space::Policy;
+use crate::time::Timestamp;
 use crate::{Error, Id, Result, Space};
 
 const MACHINE: &str = "machine.json";
@@ -37,6 +38,10 @@ pub struct MachineConfig {
     /// member, for sync status and smaller exchanges.
     #[serde(default)]
     pub versions: BTreeMap<Id, BTreeMap<Id, Vec<u8>>>,
+    /// When each member last finished an exchange with this machine, by space and member, for the
+    /// sync details.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub last_synced: BTreeMap<Id, BTreeMap<Id, Timestamp>>,
     /// The Loro peers this machine has written each space with, which sync status compares
     /// against what other members hold.
     #[serde(default)]
@@ -116,6 +121,7 @@ impl Store {
                     relay: None,
                     spaces: BTreeMap::new(),
                     versions: BTreeMap::new(),
+                    last_synced: BTreeMap::new(),
                     peers: BTreeMap::new(),
                     last_space: None,
                     page: Page::default(),

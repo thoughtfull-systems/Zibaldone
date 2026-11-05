@@ -16,9 +16,9 @@ use zib_core::pairing::{Invite, Paired, Party};
 use zib_core::render::{Image, Kind, Renderer};
 use zib_core::schema::Value;
 use zib_core::search::{Hit, Index};
-use zib_core::space::{FileHash, Policy};
+use zib_core::space::{FileHash, Machine, Policy};
 use zib_core::store::Store;
-use zib_core::sync::SyncState;
+use zib_core::sync::{Exchanged, SyncState};
 use zib_core::{Channel, Error, Id, Result, Space};
 
 use crate::derive;
@@ -29,6 +29,8 @@ pub const POLICY: Policy = Policy::All;
 const DEFAULT_SPACE: &str = "Default";
 /// How many times a machine tries to receive a space that another shared with it while pairing.
 const RECEIVE_TRIES: u32 = 6;
+/// How long the instance gathers changes made on the machine before it syncs them.
+const LOCAL_GATHER: Duration = Duration::from_secs(2);
 /// How long the instance syncs what it can before it quits.
 const QUIT_SYNC: Duration = Duration::from_secs(10);
 /// How often changed spaces go to disk.
@@ -46,11 +48,32 @@ pub enum UiEvent {
     /// A space's content changed through sync or a derivation.
     Changed(Id),
     /// Another machine asks to pair: show the code and ask which spaces to share.
-    ConfirmPairing { peer: Party, code: String, reply: oneshot::Sender<Option<Vec<Id>>> },
+    /// The reply holds the spaces to share, each with its pet name.
+    ConfirmPairing { peer: Party, code: String, reply: oneshot::Sender<Option<Vec<(Id, String)>>> },
     /// Pairing or joining finished, with a message for the owner.
     Notice(String),
     /// A space arrived from another machine with the name `arrived`: ask the owner for one.
     NameSpace { space: Id, from: String, arrived: String },
+}
+
+/// A space's sync state, as the sync details show it.
+#[derive(Clone, Debug)]
+pub struct SpaceSync {
+    pub name: String,
+    /// `None` when the space is shared with no other machine.
+    pub state: Option<SyncState>,
+    pub members: Vec<MemberSync>,
+}
+
+/// Another member of a space, as the sync details show it.
+#[derive(Clone, Debug)]
+pub struct MemberSync {
+    pub name: String,
+    pub key: MachineKey,
+    /// When it last finished an exchange with this machine.
+    pub last: Option<zib_core::time::Timestamp>,
+    /// Whether it lacks a change made on this machine.
+    pub lacks: bool,
 }
 
 /// A note, as the note list shows it.
@@ -79,6 +102,18 @@ pub struct State {
     records: Mutex<HashMap<Id, GarbageRecords>>,
     pairing: Arc<UiPairing>,
     nearby: Mutex<Option<Nearby>>,
+    syncing: StdMutex<Syncing>,
+    /// Wakes the sync loop after a change made on this machine.
+    soon: Notify,
+}
+
+/// The exchanges with members that run now, and how many times in a row each failed, by space
+/// and member.
+#[derive(Default)]
+struct Syncing {
+    running: HashSet<(Id, Id)>,
+    /// How many exchanges in a row failed, and when the last one did.
+    failures: HashMap<(Id, Id), (u32, std::time::Instant)>,
 }
 
 /// Pairing as the window decides it: requests wait for the owner on the Add machine screen.
@@ -90,11 +125,31 @@ pub struct UiPairing {
 }
 
 impl Pairing for UiPairing {
+    fn exchanged(
+        &self,
+        space: Id,
+        exchanged: Exchanged,
+        changed: bool,
+    ) -> impl Future<Output = ()> + Send {
+        let state = self.state.get().and_then(std::sync::Weak::upgrade);
+        async move {
+            let Some(state) = state else { return };
+            state.record_exchange(space, exchanged).await;
+            if changed {
+                state.arrived(space).await;
+            }
+        }
+    }
+
     fn accepting(&self) -> bool {
         self.accepting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn confirm(&self, peer: &Party, code: &str) -> impl Future<Output = Option<Vec<Id>>> + Send {
+    fn confirm(
+        &self,
+        peer: &Party,
+        code: &str,
+    ) -> impl Future<Output = Option<Vec<(Id, String)>>> + Send {
         let state = self.state.get().and_then(std::sync::Weak::upgrade);
         let (peer, code) = (peer.clone(), code.to_owned());
         async move {
@@ -102,7 +157,8 @@ impl Pairing for UiPairing {
             let (reply, answer) = oneshot::channel();
             state.send_ui(UiEvent::ConfirmPairing { peer, code, reply });
             let shared = answer.await.ok().flatten();
-            *state.pairing.last.lock().expect("unpoisoned") = shared.clone().unwrap_or_default();
+            *state.pairing.last.lock().expect("unpoisoned") =
+                shared.iter().flatten().map(|(id, _)| *id).collect();
             shared
         }
     }
@@ -116,7 +172,12 @@ impl Pairing for UiPairing {
         }
     }
 
-    fn offered(&self, space: Id, from: MachineKey) -> impl Future<Output = bool> + Send {
+    fn offered(
+        &self,
+        space: Id,
+        from: MachineKey,
+        name: Option<String>,
+    ) -> impl Future<Output = bool> + Send {
         let state = self.state.get().and_then(std::sync::Weak::upgrade);
         async move {
             let Some(state) = state else { return false };
@@ -124,7 +185,7 @@ impl Pairing for UiPairing {
             let Some(party) = party else { return false };
             tokio::spawn(async move {
                 let address = Address { key: from, hints: Vec::new() };
-                if let Err(error) = state.receive_space(space, &address, &party.name).await {
+                if let Err(error) = state.receive_space(space, &address, &party.name, name).await {
                     state.send_ui(UiEvent::Notice(format!(
                         "Couldn't receive a space from {}: {error}",
                         party.name
@@ -165,6 +226,8 @@ impl State {
             records: Mutex::new(HashMap::new()),
             pairing: pairing.clone(),
             nearby: Mutex::new(None),
+            syncing: StdMutex::default(),
+            soon: Notify::new(),
         });
         let _ = pairing.state.set(Arc::downgrade(&state));
         state.open_spaces().await?;
@@ -247,6 +310,12 @@ impl State {
 
     fn mark_dirty(&self, space: Id) {
         self.dirty.lock().expect("unpoisoned").insert(space);
+    }
+
+    /// Marks a space that changed on this machine, which syncs with its members soon after.
+    fn changed_here(&self, space: Id) {
+        self.mark_dirty(space);
+        self.soon.notify_one();
     }
 
     /// The machine's spaces, by pet name.
@@ -369,7 +438,7 @@ impl State {
         let mut space = space.lock().await;
         let id = space.create_note(zib_core::schema::NOTE, body)?;
         self.reindex_note(space_id, &space, id);
-        self.mark_dirty(space_id);
+        self.changed_here(space_id);
         Ok(id)
     }
 
@@ -380,7 +449,7 @@ impl State {
         space.set_body(id, body)?;
         space.commit();
         self.reindex_note(space_id, &space, id);
-        self.mark_dirty(space_id);
+        self.changed_here(space_id);
         Ok(())
     }
 
@@ -389,7 +458,7 @@ impl State {
         let mut space = space.lock().await;
         space.delete_note(id)?;
         self.reindex_note(space_id, &space, id);
-        self.mark_dirty(space_id);
+        self.changed_here(space_id);
         Ok(())
     }
 
@@ -434,7 +503,7 @@ impl State {
             self.reindex_note(space_id, &space, id);
             id
         };
-        self.mark_dirty(space_id);
+        self.changed_here(space_id);
         let _ = self.derive(space_id).await;
         Ok(id)
     }
@@ -534,6 +603,39 @@ impl State {
             .map_err(|e| Error::Render(e.to_string()))?
     }
 
+    /// Each space's sync state, and each other member with when it last synced and whether it
+    /// lacks a change made here, for the sync details. A space shared with no other machine has no
+    /// state.
+    pub async fn sync_details(&self) -> Vec<SpaceSync> {
+        let spaces: Vec<(Id, Arc<Mutex<Space>>)> =
+            self.node.spaces().lock().await.iter().map(|(id, s)| (*id, s.clone())).collect();
+        let store = self.store.lock().await;
+        let mut details = Vec::new();
+        for (id, space) in spaces {
+            let space = space.lock().await;
+            let peers = store.config.peers.get(&id).cloned().unwrap_or_default();
+            let recorded = store.config.versions.get(&id).cloned().unwrap_or_default();
+            let last = store.config.last_synced.get(&id);
+            let members: Vec<MemberSync> = space
+                .members()
+                .into_iter()
+                .filter(|m| m.id != space.machine())
+                .map(|m| MemberSync {
+                    name: m.name.clone(),
+                    key: m.key,
+                    last: last.and_then(|l| l.get(&m.id)).copied(),
+                    lacks: zib_core::sync::lacks_changes(&space, &peers, &recorded, m.id),
+                })
+                .collect();
+            let state =
+                (!members.is_empty()).then(|| zib_core::sync::status(&space, &peers, &recorded));
+            let name = store.config.spaces.get(&id).map(|e| e.name.clone()).unwrap_or_default();
+            details.push(SpaceSync { name, state, members });
+        }
+        details.sort_by_key(|d| d.name.to_lowercase());
+        details
+    }
+
     /// The sync status across every space, the least synced first.
     pub async fn status(&self) -> SyncState {
         let spaces: Vec<(Id, Arc<Mutex<Space>>)> =
@@ -541,9 +643,14 @@ impl State {
         let store = self.store.lock().await;
         let mut state = SyncState::Synced;
         for (id, space) in spaces {
+            let space = space.lock().await;
+            // A space this machine shares with no other has nothing to sync.
+            if space.members().iter().all(|m| m.id == space.machine()) {
+                continue;
+            }
             let peers = store.config.peers.get(&id).cloned().unwrap_or_default();
             let recorded = store.config.versions.get(&id).cloned().unwrap_or_default();
-            state = state.min(zib_core::sync::status(&*space.lock().await, &peers, &recorded));
+            state = state.min(zib_core::sync::status(&space, &peers, &recorded));
         }
         state
     }
@@ -606,9 +713,10 @@ impl State {
         address: Address,
         code: oneshot::Sender<String>,
         confirmed: oneshot::Receiver<bool>,
-        share: Vec<Id>,
+        share: Vec<(Id, String)>,
     ) -> Result<()> {
-        let shared = share.clone();
+        let ids = share.iter().map(|(id, _)| *id).collect();
+        let shared = share;
         let paired = self
             .node
             .pair(&address, async move |_: &Party, shown: &str| {
@@ -616,7 +724,7 @@ impl State {
                 confirmed.await.unwrap_or(false).then_some(shared)
             })
             .await?;
-        self.finish_pairing(paired, Some(address), share).await;
+        self.finish_pairing(paired, Some(address), ids).await;
         Ok(())
     }
 
@@ -646,7 +754,9 @@ impl State {
             }
         }
         for space_id in &paired.received {
-            if let Err(error) = self.receive_space(*space_id, &address, &paired.peer.name).await {
+            let suggested = paired.names.get(space_id).cloned();
+            let received = self.receive_space(*space_id, &address, &paired.peer.name, suggested);
+            if let Err(error) = received.await {
                 self.send_ui(UiEvent::Notice(format!(
                     "Couldn't receive a space from {}: {error}",
                     paired.peer.name
@@ -679,7 +789,8 @@ impl State {
         space.lock().await.add_machine(party.machine, party.key, &party.name, party.policy)?;
         self.mark_dirty(space_id);
         self.save_dirty().await;
-        self.node.offer(space_id, &Address { key: party.key, hints: Vec::new() }).await
+        let name = self.store.lock().await.config.spaces.get(&space_id).map(|e| e.name.clone());
+        self.node.offer(space_id, name, &Address { key: party.key, hints: Vec::new() }).await
     }
 
     /// Moves a note to another space with its files, as decision ZIB0005 describes moving one.
@@ -706,8 +817,8 @@ impl State {
             self.reindex_note(from, &source, note);
             self.reindex_note(to, &target, note);
         }
-        self.mark_dirty(from);
-        self.mark_dirty(to);
+        self.changed_here(from);
+        self.changed_here(to);
         self.send_ui(UiEvent::Changed(from));
         self.send_ui(UiEvent::Changed(to));
         Ok(())
@@ -727,7 +838,15 @@ impl State {
         std::mem::take(&mut *self.pairing.last.lock().expect("unpoisoned"))
     }
 
-    async fn receive_space(&self, space_id: Id, address: &Address, from: &str) -> Result<()> {
+    /// Receives a space that `from` shared, and names it `suggested`, the pet name it has there,
+    /// until the owner names it.
+    async fn receive_space(
+        &self,
+        space_id: Id,
+        address: &Address,
+        from: &str,
+        suggested: Option<String>,
+    ) -> Result<()> {
         if self.node.spaces().lock().await.contains_key(&space_id) {
             return Ok(());
         }
@@ -746,7 +865,10 @@ impl State {
         };
         let mut store = self.store.lock().await;
         let guard = space.lock().await;
-        let arrived = format!("Shared by {from}");
+        let arrived = suggested
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("Shared by {from}"));
         store.add_space(&guard, &arrived)?;
         store.record_peer(&guard)?;
         self.index(space_id, &guard)?;
@@ -770,6 +892,7 @@ impl State {
             space,
             &Address { key: invite.key, hints: invite.hints.clone() },
             "an invite",
+            None,
         )
         .await?;
         Ok(space)
@@ -778,68 +901,143 @@ impl State {
     /// Syncs every space with every member every 30 seconds, with longer waits for members that
     /// keep failing, and fetches the files this machine lacks.
     async fn sync_forever(self: Arc<Self>) {
-        let mut failures: HashMap<(Id, Id), u32> = HashMap::new();
         loop {
-            self.sync_once(&mut failures).await;
-            tokio::time::sleep(zib_core::sync::PERIOD).await;
+            self.start_exchanges(false).await;
+            tokio::select! {
+                () = tokio::time::sleep(zib_core::sync::PERIOD) => {}
+                () = self.soon.notified() => tokio::time::sleep(LOCAL_GATHER).await,
+            }
         }
     }
 
-    async fn sync_once(&self, failures: &mut HashMap<(Id, Id), u32>) {
-        let paired: HashSet<MachineKey> =
-            self.store.lock().await.paired().into_iter().map(|p| p.key).collect();
+    /// Starts an exchange of each space with each member that's due one and has none running, each
+    /// on its own task, so a member that's away never holds up the others. With `quitting`, it
+    /// starts one only with each member that lacks a change made here and answered last time, and
+    /// waits for them, so the instance quits as soon as what it made has gone where it can go.
+    async fn start_exchanges(self: &Arc<Self>, quitting: bool) {
+        let (paired, own_peers, recorded) = {
+            let store = self.store.lock().await;
+            let paired: HashSet<MachineKey> = store.paired().into_iter().map(|p| p.key).collect();
+            (paired, store.config.peers.clone(), store.config.versions.clone())
+        };
         let spaces: Vec<(Id, Arc<Mutex<Space>>)> =
             self.node.spaces().lock().await.iter().map(|(id, s)| (*id, s.clone())).collect();
+        let mut started = tokio::task::JoinSet::new();
         for (id, space) in spaces {
-            let (members, before) = {
+            let members = {
                 let space = space.lock().await;
-                let members = space
+                let me = space.machine();
+                let peers = own_peers.get(&id).map_or(&[][..], Vec::as_slice);
+                let recorded = recorded.get(&id).cloned().unwrap_or_default();
+                space
                     .members()
                     .into_iter()
-                    .filter(|m| m.id != space.machine())
-                    .collect::<Vec<_>>();
-                (members, space.version())
+                    .filter(|m| m.id != me)
+                    .filter(|m| {
+                        !quitting || zib_core::sync::lacks_changes(&space, peers, &recorded, m.id)
+                    })
+                    .collect::<Vec<_>>()
             };
             for member in members {
-                let count = failures.get(&(id, member.id)).copied().unwrap_or(0);
-                if count > 0 && !due(count) {
-                    failures.insert((id, member.id), count + 1);
-                    continue;
-                }
+                let pair = (id, member.id);
+                let count = {
+                    let mut syncing = self.syncing.lock().expect("unpoisoned");
+                    if syncing.running.contains(&pair) {
+                        continue;
+                    }
+                    let (count, last) = syncing
+                        .failures
+                        .get(&pair)
+                        .copied()
+                        .map_or((0, None), |(c, t)| (c, Some(t)));
+                    if quitting && count > 0 {
+                        continue;
+                    }
+                    if !quitting && last.is_some_and(|last| last.elapsed() < retry_wait(count)) {
+                        continue;
+                    }
+                    syncing.running.insert(pair);
+                    count
+                };
                 // A paired machine that failed may lack the space, so it hears the offer again.
-                if count > 0 && paired.contains(&member.key) {
-                    let address = Address { key: member.key, hints: Vec::new() };
-                    let _ = self.node.offer(id, &address).await;
-                }
-                match self.node.sync(&space, &Address { key: member.key, hints: Vec::new() }).await
-                {
-                    Ok(exchanged) => {
-                        failures.remove(&(id, member.id));
-                        let mut store = self.store.lock().await;
-                        store
-                            .config
-                            .versions
-                            .entry(id)
-                            .or_default()
-                            .insert(exchanged.machine, exchanged.version);
-                        let _ = store.save();
-                    }
-                    Err(_) => {
-                        failures.insert((id, member.id), count + 1);
-                    }
-                }
+                let offer = count > 0 && paired.contains(&member.key);
+                let (state, space) = (self.clone(), space.clone());
+                started.spawn(async move {
+                    state.exchange(id, &space, member, offer, !quitting).await;
+                });
             }
-            if self.node.fetch_missing(id).await > 0 {
-                self.mark_dirty(id);
+        }
+        if quitting {
+            started.join_all().await;
+        } else {
+            started.detach_all();
+        }
+    }
+
+    /// Exchanges a space's changes with one member, then, with `fetch`, fetches the files this
+    /// machine lacks, and tells the window when the space changed.
+    async fn exchange(
+        &self,
+        id: Id,
+        space: &Arc<Mutex<Space>>,
+        member: Machine,
+        offer: bool,
+        fetch: bool,
+    ) {
+        let before = space.lock().await.version();
+        let address = Address { key: member.key, hints: Vec::new() };
+        if offer {
+            let name = self.store.lock().await.config.spaces.get(&id).map(|e| e.name.clone());
+            let _ = self.node.offer(id, name, &address).await;
+        }
+        let result = self.node.sync(space, &address).await;
+        let pair = (id, member.id);
+        let succeeded = {
+            let mut syncing = self.syncing.lock().expect("unpoisoned");
+            syncing.running.remove(&pair);
+            if result.is_ok() {
+                syncing.failures.remove(&pair);
+            } else {
+                let count = syncing.failures.get(&pair).map_or(0, |(c, _)| *c);
+                syncing.failures.insert(pair, (count + 1, std::time::Instant::now()));
             }
-            let changed = space.lock().await.version() != before;
-            if changed {
-                self.mark_dirty(id);
-                let guard = space.lock().await;
-                let _ = self.index(id, &guard);
-                drop(guard);
-                self.send_ui(UiEvent::Changed(id));
-            }
+            result.is_ok()
+        };
+        if let Ok(exchanged) = result {
+            self.record_exchange(id, exchanged).await;
+        }
+        if fetch && succeeded && self.node.fetch_missing(id).await > 0 {
+            self.mark_dirty(id);
+        }
+        if space.lock().await.version() != before {
+            self.arrived(id).await;
+        }
+    }
+
+    /// Records the version vector a member holds after an exchange, in either direction.
+    async fn record_exchange(&self, id: Id, exchanged: Exchanged) {
+        let mut store = self.store.lock().await;
+        let now = zib_core::time::now();
+        store.config.last_synced.entry(id).or_default().insert(exchanged.machine, now);
+        store.config.versions.entry(id).or_default().insert(exchanged.machine, exchanged.version);
+        let _ = store.save();
+    }
+
+    /// Saves, indexes, and shows changes that arrived from another member.
+    async fn arrived(&self, id: Id) {
+        self.mark_dirty(id);
+        if let Ok(space) = self.space(id).await {
+            let _ = self.index(id, &*space.lock().await);
+        }
+        self.send_ui(UiEvent::Changed(id));
+    }
+
+    /// Saves and indexes a space after a live edit from another machine arrived, which the
+    /// editor shows by itself.
+    pub async fn live_changed(&self, id: Id) {
+        self.mark_dirty(id);
+        if let Ok(space) = self.space(id).await {
+            let _ = self.index(id, &*space.lock().await);
         }
     }
 
@@ -855,8 +1053,10 @@ impl State {
         let dirty: Vec<Id> = self.dirty.lock().expect("unpoisoned").drain().collect();
         for id in dirty {
             if let Ok(space) = self.space(id).await {
-                let space = space.lock().await;
-                let _ = self.store.lock().await.save_space(&space);
+                // The store before the space, as everywhere else, or two tasks could each hold
+                // one and wait for the other forever.
+                let store = self.store.lock().await;
+                let _ = store.save_space(&*space.lock().await);
             }
         }
     }
@@ -910,7 +1110,7 @@ impl State {
         }
         record.save(&self.records_path(space_id))?;
         if changed {
-            self.mark_dirty(space_id);
+            self.changed_here(space_id);
             self.send_ui(UiEvent::Changed(space_id));
         }
         Ok(())
@@ -931,15 +1131,16 @@ impl State {
         )?;
         record.save(&self.records_path(space_id))?;
         if !deleted.is_empty() {
-            self.mark_dirty(space_id);
+            self.changed_here(space_id);
         }
         Ok(())
     }
 
     /// Syncs what it can within 10 seconds, saves every space, and closes the endpoint.
-    pub async fn finish(&self) {
-        let mut failures = HashMap::new();
-        let _ = tokio::time::timeout(QUIT_SYNC, self.sync_once(&mut failures)).await;
+    pub async fn finish(self: &Arc<Self>) {
+        // Everything goes to disk first, so nothing waits on the network to be safe.
+        self.save_dirty().await;
+        let _ = tokio::time::timeout(QUIT_SYNC, self.start_exchanges(true)).await;
         self.save_dirty().await;
         let spaces: Vec<Arc<Mutex<Space>>> =
             self.node.spaces().lock().await.values().cloned().collect();
@@ -961,13 +1162,11 @@ fn fs_text(blobs: &Blobs, hash: FileHash) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Whether a member that failed `count` times in a row is due another try: the wait doubles from
-/// one period up to 10 minutes.
-fn due(count: u32) -> bool {
-    let period = zib_core::sync::PERIOD.as_secs();
-    let wait = (zib_core::sync::FIRST_RETRY.as_secs() << count.min(5))
-        .min(zib_core::sync::LAST_RETRY.as_secs());
-    u64::from(count) * period >= wait
+/// How long to wait before trying a member again after `count` failures in a row: 30 seconds,
+/// doubling with each failure, up to 10 minutes, as the sync specification sets.
+fn retry_wait(count: u32) -> Duration {
+    let first = zib_core::sync::FIRST_RETRY;
+    first.saturating_mul(1 << count.saturating_sub(1).min(5)).min(zib_core::sync::LAST_RETRY)
 }
 
 /// The directory where a path lives, for messages.

@@ -53,7 +53,9 @@ it.
 - **Closing the window.** Closing the window leaves the instance running, with its tray icon.
 - **Quitting.** The instance quits when the owner presses Ctrl+Q in its window, chooses Quit from
   the tray icon's menu, or sends `stop` through the `zib` command. Before it exits, it syncs what it
-  can within 10 seconds.
+  can within 10 seconds. It saves its spaces first, then exchanges each space only with the members
+  that lack a change made on the machine and whose last exchange succeeded, and exits as soon as
+  those exchanges finish.
 - **No display.** On a machine without a display, such as a small server, the instance runs with
   neither a tray icon nor a window, and quits only on `stop` or when the system stops it.
 - **Tray icon.** The icon uses the StatusNotifierItem interface over D-Bus, which Waybar's tray

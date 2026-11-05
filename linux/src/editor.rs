@@ -74,7 +74,28 @@ pub fn new_view(draw: Draw) -> sourceview5::View {
     attach_list_keys(&view);
     attach_wrap_keys(&view);
     attach_checkbox_clicks(&view);
+    attach_primary_selection(&view);
     view
+}
+
+/// Offers the selected text as the primary selection, which a middle click pastes, without tying
+/// the selection to it. GTK's text buffer drops its selection whenever another window or program
+/// takes the primary selection, so with several windows open, selecting in one would deselect the
+/// rest.
+fn attach_primary_selection(view: &sourceview5::View) {
+    view.connect_realize(|view| {
+        view.buffer().remove_selection_clipboard(&view.primary_clipboard());
+    });
+    let weak = view.downgrade();
+    view.buffer().connect_mark_set(move |buffer, _, mark| {
+        let Some(view) = weak.upgrade() else { return };
+        if mark != &buffer.get_insert() && mark != &buffer.selection_bound() {
+            return;
+        }
+        if let Some((start, end)) = buffer.selection_bounds() {
+            view.primary_clipboard().set_text(&buffer.text(&start, &end, false));
+        }
+    });
 }
 
 /// Returns the buffer's whole text, including the syntax that the editor hides.

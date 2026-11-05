@@ -57,9 +57,11 @@ pub struct Inner {
     back_button: gtk::Button,
     forward_button: gtk::Button,
     open_file: gtk::Button,
-    status: gtk::Button,
+    status: gtk::MenuButton,
     editor: RefCell<Option<Editor>>,
     loading: Cell<bool>,
+    /// Whether the note that opens next takes the focus, as a new note does.
+    focus_body: Cell<bool>,
     /// Other machines' cursors in the open note.
     remote: Rc<crate::remote::Remote>,
 }
@@ -155,7 +157,10 @@ impl Window {
         forward_button.set_tooltip_text(Some("Forward"));
         let delete = gtk::Button::from_icon_name("user-trash-symbolic");
         delete.set_tooltip_text(Some("Delete the note"));
-        let status = gtk::Button::from_icon_name("emblem-synchronizing-symbolic");
+        let status = gtk::MenuButton::builder()
+            .icon_name("emblem-synchronizing-symbolic")
+            .popover(&crate::status::popover(state.clone()))
+            .build();
         status.add_css_class("flat");
         content_header.pack_start(&back_button);
         content_header.pack_start(&forward_button);
@@ -232,6 +237,7 @@ impl Window {
             status,
             editor: RefCell::default(),
             loading: Cell::new(false),
+            focus_body: Cell::new(false),
             remote: crate::remote::Remote::new(view.upcast_ref()),
         }));
         this.connect(&new_note, &add_file, &delete, &view);
@@ -584,6 +590,7 @@ impl Window {
         glib::spawn_future_local(async move {
             if let Ok(note) = core(async move { state.create_note(space, "").await }).await {
                 w.reload_notes();
+                w.inner().focus_body.set(true);
                 w.open_note(space, note);
             }
         });
@@ -679,6 +686,9 @@ impl Window {
                 .set_visible(loaded.type_name == "file" || loaded.type_name == "image");
             w.update_title();
             w.show_mode();
+            if w.inner().focus_body.take() {
+                w.inner().view.grab_focus();
+            }
             let opened = core({
                 let state = state.clone();
                 async move { state.open_note(space, note).await }
@@ -701,6 +711,34 @@ impl Window {
     fn set_text(&self, text: &str) {
         self.inner().loading.set(true);
         self.inner().buffer.set_text(text);
+        self.inner().loading.set(false);
+    }
+
+    /// Changes the text to `text` by replacing only what differs between the parts the two share
+    /// at the start and at the end. The owner's cursor and selection, and other machines' cursors,
+    /// then keep their place in the text around them, as another machine's edit arrives.
+    fn replace_text(&self, text: &str) {
+        let buffer = &self.inner().buffer;
+        let old: Vec<char> = editor::text(buffer).chars().collect();
+        let new: Vec<char> = text.chars().collect();
+        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(new[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let offset = |chars: usize| i32::try_from(chars).unwrap_or(i32::MAX);
+        let middle: String = new[prefix..new.len() - suffix].iter().collect();
+        self.inner().loading.set(true);
+        buffer.begin_irreversible_action();
+        let (mut from, mut to) = (
+            buffer.iter_at_offset(offset(prefix)),
+            buffer.iter_at_offset(offset(old.len() - suffix)),
+        );
+        buffer.delete(&mut from, &mut to);
+        buffer.insert(&mut buffer.iter_at_offset(offset(prefix)), &middle);
+        buffer.end_irreversible_action();
         self.inner().loading.set(false);
     }
 
@@ -871,6 +909,10 @@ impl Window {
             LiveEvent::Changed { machine } => {
                 remote.started(machine);
                 self.refresh_open(space, note);
+                let state = self.inner().state.clone();
+                glib::spawn_future_local(async move {
+                    core(async move { state.live_changed(space).await }).await;
+                });
             }
             LiveEvent::Cursor { machine, selections } => {
                 let name = self.inner().state.clone();
@@ -928,10 +970,7 @@ impl Window {
                 editor.titles = titles;
                 text
             };
-            let buffer = &w.inner().buffer;
-            let cursor = buffer.cursor_position();
-            w.set_text(&text);
-            buffer.place_cursor(&buffer.iter_at_offset(cursor.min(buffer.char_count())));
+            w.replace_text(&text);
             w.update_title();
             // Replacing the text moved every mark, so the cursors go back where they belong.
             w.place_remote(space);

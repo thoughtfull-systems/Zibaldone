@@ -113,7 +113,8 @@ machine remembers the machines it paired with, as the pairing specification defi
 - **Adding.** The member adds the machine to the space's `machines` in one commit, as pairing does,
   before it offers the space.
 - **Offer.** The member opens a `zib/sync` stream to the machine and sends `offer`, with `space` and
-  its own `machine` identifier.
+  its own `machine` identifier. It may add `name`, its pet name for the space, which the machine
+  offers its owner as the first answer when it asks for a pet name.
 - **Accepting.** The machine accepts only when the key the connection authenticated belongs to a
   machine it paired with. It replies `offered`, with the same `space`, then receives the space as
   pairing receives a shared space, and asks its owner for a pet name. A machine that already holds
@@ -131,6 +132,7 @@ a space with every member:
 
 - every 30 seconds;
 - when the instance starts, when the network changes, and after the machine wakes from sleep;
+- about two seconds after a change made on the machine, gathering the changes made in that time;
 - at once, when the owner opens one of the space's notes to edit.
 
 After a failed exchange, it waits 30 seconds before trying that member again, then doubles the wait
@@ -182,7 +184,8 @@ the space's `holders` entries.
   every member with the `all` policy holds every blob created on it.
 
 The app's icon shows the least synced state across the machine's spaces, and opening it shows the
-state of each space and when each member last synced.
+state of each space and when each member last synced. A space that the machine shares with no other
+machine has nothing to sync, so it has no sync state and the icon leaves it out.
 
 ## Platforms
 

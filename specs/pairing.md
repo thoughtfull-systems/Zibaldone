@@ -75,7 +75,10 @@ open. The two exchange these messages in order:
   declines, or doesn't answer within 2 minutes, it sends `cancel`.
 - **Share.** Once each side has sent and received `confirm`, each sends `share`, with `spaces`: a
   list of the identifiers of the spaces its owner chose to share with the other machine, which may
-  be empty. A side doesn't share a space it doesn't hold.
+  be empty. A side doesn't share a space it doesn't hold. `share` may also carry `names`, a map from
+  each shared space's identifier to the sharing owner's pet name for it. The receiving machine
+  offers that name as the first answer when it asks its owner for a pet name, and a side that
+  receives no name for a space suggests one of its own.
 
 For each space that a side shares, it adds the other machine to the space's `machines` in one
 commit, with the other's `key`, `name`, and `policy`, and then syncs the space with it as the sync

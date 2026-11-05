@@ -142,7 +142,10 @@ impl Remote {
 
     /// Records the selections `machine` sent, which still need placing.
     pub fn received(&self, machine: Id, name: String, selections: Vec<Selection>) {
-        self.sessions.borrow_mut().insert(machine);
+        // A cursor finishes arriving after its session may have ended, and then it's stale.
+        if !self.sessions.borrow().contains(&machine) {
+            return;
+        }
         let mut peers = self.peers.borrow_mut();
         let peer = peers.entry(machine).or_insert_with(|| Peer {
             name: String::new(),

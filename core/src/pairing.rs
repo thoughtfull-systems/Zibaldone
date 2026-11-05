@@ -1,5 +1,6 @@
 //! Pairing and invites, as the pairing specification defines them.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,9 @@ pub enum Message {
     Cancel,
     Share {
         spaces: Vec<Id>,
+        /// The sharing machine's pet name for each space, which the other suggests to its owner.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        names: BTreeMap<Id, String>,
     },
     Invite {
         #[serde(with = "serde_bytes")]
@@ -79,6 +83,8 @@ pub struct Paired {
     pub peer: Party,
     /// The spaces the other machine shared with this one, which arrive through sync.
     pub received: Vec<Id>,
+    /// The other machine's pet name for each space it shared, to suggest as this one's.
+    pub names: BTreeMap<Id, String>,
 }
 
 /// The six-digit code that both machines show, from both keys and both nonces.
@@ -125,8 +131,8 @@ fn policy(name: &str) -> Result<Policy> {
 }
 
 /// Pairs as the machine that picked the other. `confirm` shows the code and the other machine's
-/// name, and returns the spaces the owner chose to share once the owner says the codes match, or
-/// `None` when the owner declines.
+/// name, and returns the spaces the owner chose to share, each with its pet name, once the owner
+/// says the codes match, or `None` when the owner declines.
 pub async fn initiate<S, C>(
     stream: S,
     me: &Party,
@@ -135,7 +141,7 @@ pub async fn initiate<S, C>(
 ) -> Result<Paired>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    C: AsyncFnOnce(&Party, &str) -> Option<Vec<Id>>,
+    C: AsyncFnOnce(&Party, &str) -> Option<Vec<(Id, String)>>,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let nonce: [u8; 32] = random()?;
@@ -171,7 +177,7 @@ pub async fn respond<S, C>(
 ) -> Result<Paired>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    C: AsyncFnOnce(&Party, &str) -> Option<Vec<Id>>,
+    C: AsyncFnOnce(&Party, &str) -> Option<Vec<(Id, String)>>,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let Message::Request { machine, name, policy: their_policy, commitment } =
@@ -213,7 +219,7 @@ async fn finish<R, W, C>(
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
-    C: AsyncFnOnce(&Party, &str) -> Option<Vec<Id>>,
+    C: AsyncFnOnce(&Party, &str) -> Option<Vec<(Id, String)>>,
 {
     let confirmed =
         tokio::time::timeout(CONFIRM_TIMEOUT, confirm(&peer, code)).await.ok().flatten();
@@ -225,11 +231,13 @@ where
     let Message::Confirm = receive(reader).await? else {
         return Err(Error::Protocol("expected confirm".into()));
     };
-    send(writer, &Message::Share { spaces: share }).await?;
-    let Message::Share { spaces } = receive(reader).await? else {
+    let spaces = share.iter().map(|(id, _)| *id).collect();
+    let names = share.into_iter().collect();
+    send(writer, &Message::Share { spaces, names }).await?;
+    let Message::Share { spaces, names } = receive(reader).await? else {
         return Err(Error::Protocol("expected share".into()));
     };
-    Ok(Paired { peer, received: spaces })
+    Ok(Paired { peer, received: spaces, names })
 }
 
 /// An invite to join one space, as its link holds it.
@@ -402,7 +410,7 @@ mod tests {
         let paired = initiate(one, &a, b.key, async move |peer: &Party, code: &str| {
             assert_eq!(peer.name, "M2");
             c1.lock().unwrap().push(code.to_owned());
-            Some(vec![space])
+            Some(vec![(space, "Work".to_owned())])
         })
         .await
         .unwrap();
@@ -413,6 +421,7 @@ mod tests {
         assert_eq!(codes[0].len(), 6);
         assert_eq!(paired.peer.policy, Policy::OnDemand);
         assert_eq!(other.received, vec![space]);
+        assert_eq!(other.names[&space], "Work");
     }
 
     #[tokio::test]
