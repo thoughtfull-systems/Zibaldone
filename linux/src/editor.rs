@@ -56,7 +56,7 @@ pub fn new_view(draw: Draw) -> sourceview5::View {
     apply_scheme(&style_manager);
     style_manager.connect_dark_notify(apply_scheme);
 
-    let view = sourceview5::View::with_buffer(&buffer);
+    let view = crate::view::new(&buffer, CODE_BLOCK_SHADE);
     view.set_wrap_mode(gtk::WrapMode::WordChar);
     view.set_top_margin(16);
     view.set_bottom_margin(24);

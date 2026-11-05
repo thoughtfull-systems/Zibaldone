@@ -14,6 +14,7 @@ pub mod state;
 pub mod status;
 pub mod tables;
 pub mod tray;
+pub mod view;
 pub mod window;
 
 use zib_core::Channel;
