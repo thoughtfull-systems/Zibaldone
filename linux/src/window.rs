@@ -1129,7 +1129,8 @@ impl Window {
     /// paste. A clipboard that also holds text, as a copied spreadsheet range does, pastes the
     /// text.
     fn paste_image(&self) -> bool {
-        let Some(space) = self.inner().editor.borrow().as_ref().map(|e| e.space) else {
+        let Some((space, open)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
+        else {
             return false;
         };
         let clipboard = self.inner().view.clipboard();
@@ -1149,14 +1150,15 @@ impl Window {
         let w = self.clone();
         let state = self.inner().state.clone();
         glib::spawn_future_local(async move {
+            let now = glib::DateTime::now_local().and_then(|t| t.format("%F %H.%M.%S"));
+            let name = now.map_or_else(
+                |_| "Pasted image.png".to_owned(),
+                |now| format!("Pasted image {now}.png"),
+            );
             let added = match clipboard.read_texture_future().await {
                 Ok(Some(texture)) => {
                     let bytes = texture.save_to_png_bytes().to_vec();
-                    let now = glib::DateTime::now_local().and_then(|t| t.format("%F %H.%M.%S"));
-                    let name = now.map_or_else(
-                        |_| "Pasted image.png".to_owned(),
-                        |now| format!("Pasted image {now}.png"),
-                    );
+                    let (state, name) = (state.clone(), name.clone());
                     let media = "image/png".to_owned();
                     core(async move { state.add_bytes(space, bytes, name, media).await })
                         .await
@@ -1165,18 +1167,31 @@ impl Window {
                 Ok(None) => Err("the clipboard is empty".to_owned()),
                 Err(error) => Err(error.to_string()),
             };
-            match added {
-                Ok(note) => {
-                    w.reload_notes();
-                    w.insert_link(&start, &end, note, None, true);
-                }
+            let note = match added {
+                Ok(note) => note,
                 Err(error) => {
                     let buffer = &w.inner().buffer;
                     buffer.delete_mark(&start);
                     buffer.delete_mark(&end);
                     w.toast(&format!("Couldn't paste the image: {error}"));
+                    return;
                 }
+            };
+            // The embed commits before the thumbnail's derivation changes the space, since the
+            // editor reloads the stored text when a space changes.
+            let embed = format!("!{}", w.titled_link(note, name));
+            if w.place_link(&start, &end, &embed, Some(open)) {
+                let pending = w.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
+                if let Some(timer) = pending {
+                    timer.remove();
+                }
+                w.commit();
             }
+            w.reload_notes();
+            // A future of its own starts after the one that saves the commit.
+            glib::spawn_future_local(async move {
+                let _ = core(async move { state.derive(space).await }).await;
+            });
         });
         true
     }
@@ -1429,7 +1444,7 @@ impl Window {
                 if let Some(target) = target
                     && !chosen.replace(true)
                 {
-                    w.insert_link(&start, &end, target, label.clone(), false);
+                    w.insert_link(&start, &end, target, label.clone());
                 }
                 popover.popdown();
             }
@@ -1490,16 +1505,15 @@ impl Window {
             .collect()
     }
 
-    /// Replaces the text between two marks with a link to `target`, or an embed of it, and deletes
-    /// the marks. A link without a label the owner chose shows its target's title, which the
-    /// editor removes again when it commits.
+    /// Replaces the text between two marks with a link to `target`, and deletes the marks. A link
+    /// without a label the owner chose shows its target's title, which the editor removes again
+    /// when it commits.
     fn insert_link(
         &self,
         start: &gtk::TextMark,
         end: &gtk::TextMark,
         target: Id,
         label: Option<String>,
-        embed: bool,
     ) {
         let w = self.clone();
         let state = self.inner().state.clone();
@@ -1510,32 +1524,49 @@ impl Window {
                 body::wikilink(target, Some(&label))
             } else {
                 let titles = core(async move { state.titles(&[target]).await }).await;
-                let title = titles.get(&target).cloned().unwrap_or_default();
-                if let Some(editor) = w.inner().editor.borrow_mut().as_mut() {
-                    editor.shown.remember(target, &title);
-                    editor.titles.insert(target, title.clone());
-                }
-                if title.is_empty() {
-                    body::wikilink(target, None)
-                } else {
-                    format!("[[{target}|{}]]", body::escape_label(&title))
-                }
+                w.titled_link(target, titles.get(&target).cloned().unwrap_or_default())
             };
-            let buffer = &w.inner().buffer;
-            let mut from = buffer.iter_at_mark(&start);
-            let mut to = buffer.iter_at_mark(&end);
-            buffer.delete_mark(&start);
-            buffer.delete_mark(&end);
-            // Another note took the editor while the title loaded.
-            if w.inner().editor.borrow().as_ref().map(|e| e.note) != open {
-                return;
-            }
-            buffer.begin_user_action();
-            buffer.delete(&mut from, &mut to);
-            buffer.insert(&mut from, &if embed { format!("!{link}") } else { link });
-            buffer.end_user_action();
-            buffer.place_cursor(&from);
+            w.place_link(&start, &end, &link, open);
         });
+    }
+
+    /// A link to `target` that shows `title`, which the editor remembers giving it.
+    fn titled_link(&self, target: Id, title: String) -> String {
+        let link = if title.is_empty() {
+            body::wikilink(target, None)
+        } else {
+            format!("[[{target}|{}]]", body::escape_label(&title))
+        };
+        if let Some(editor) = self.inner().editor.borrow_mut().as_mut() {
+            editor.shown.remember(target, &title);
+            editor.titles.insert(target, title);
+        }
+        link
+    }
+
+    /// Replaces the text between two marks with `link`, and deletes the marks. Returns whether it
+    /// did, which it doesn't once a note other than `open` has the editor.
+    fn place_link(
+        &self,
+        start: &gtk::TextMark,
+        end: &gtk::TextMark,
+        link: &str,
+        open: Option<Id>,
+    ) -> bool {
+        let buffer = &self.inner().buffer;
+        let mut from = buffer.iter_at_mark(start);
+        let mut to = buffer.iter_at_mark(end);
+        buffer.delete_mark(start);
+        buffer.delete_mark(end);
+        if self.inner().editor.borrow().as_ref().map(|e| e.note) != open {
+            return false;
+        }
+        buffer.begin_user_action();
+        buffer.delete(&mut from, &mut to);
+        buffer.insert(&mut from, link);
+        buffer.end_user_action();
+        buffer.place_cursor(&from);
+        true
     }
 
     /// Fills the popover of notes that link to the open note.

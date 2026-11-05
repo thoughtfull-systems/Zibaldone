@@ -496,11 +496,14 @@ impl State {
         let name = path
             .file_name()
             .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned());
-        self.add_file_note(space_id, hash, size, &name, &media_type).await
+        let id = self.add_file_note(space_id, hash, size, &name, &media_type).await?;
+        let _ = self.derive(space_id).await;
+        Ok(id)
     }
 
     /// Adds bytes that aren't in a file, such as a pasted image, to a space as a note named `name`,
-    /// and returns the note.
+    /// and returns the note. It leaves the note's derived fields to `derive`, which changes the
+    /// space again, so the caller can use the note first.
     pub async fn add_bytes(
         &self,
         space_id: Id,
@@ -533,7 +536,6 @@ impl State {
             id
         };
         self.changed_here(space_id);
-        let _ = self.derive(space_id).await;
         Ok(id)
     }
 
