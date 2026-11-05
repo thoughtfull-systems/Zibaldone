@@ -31,7 +31,7 @@ pub struct WikiLink {
 }
 
 /// The byte ranges of code spans, code blocks, and HTML, where Zib's additions don't apply.
-fn code_ranges(body: &str) -> Vec<Range<usize>> {
+pub(crate) fn code_ranges(body: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut block: Option<usize> = None;
     for (event, range) in Parser::new_ext(body, options()).into_offset_iter() {

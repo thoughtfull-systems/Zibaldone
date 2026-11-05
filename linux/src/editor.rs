@@ -10,9 +10,10 @@ use adw::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
 use sourceview5::prelude::*;
 use zib_core::editing::{
-    Drawn, Span, Style, drawings as find_drawings, spans, table_cell_in_body, toggle_checkbox,
+    Drawn, Span, Style, complete_block_opening, drawings as find_drawings, fence_selection, spans,
+    table_cell_in_body, toggle_checkbox,
 };
-use zib_core::lists::{ListKey, list_edit};
+use zib_core::lists::{Edit, ListKey, list_edit};
 
 use crate::drawings::{Draw, Drawings};
 
@@ -107,7 +108,9 @@ pub fn text(buffer: &gtk::TextBuffer) -> String {
 }
 
 /// Wraps the selection in markdown delimiters when the owner types one, rather than replacing it,
-/// and keeps the text inside selected, so typing the delimiter again doubles it.
+/// and keeps the text inside selected, so typing the delimiter again doubles it. Around lines of
+/// text, a third backtick or a second `$` makes a code block or display math instead. Without a
+/// selection, the same keys at the start of a line open the block, and close it below.
 fn attach_wrap_keys(view: &sourceview5::View) {
     // The capture phase sees the key before the view replaces the selection with it.
     let keys = gtk::EventControllerKey::builder()
@@ -130,7 +133,16 @@ fn attach_wrap_keys(view: &sourceview5::View) {
             };
             let buffer = view.buffer();
             let Some((mut start, mut end)) = buffer.selection_bounds() else {
-                return glib::Propagation::Proceed;
+                // A third backtick or a second `$` at the start of a line opens a block.
+                let body = text(&buffer);
+                let cursor = byte_at(&body, buffer.cursor_position());
+                return match complete_block_opening(&body, cursor, open) {
+                    Some(edit) => {
+                        apply_edit(&buffer, &body, edit, None);
+                        glib::Propagation::Stop
+                    }
+                    None => glib::Propagation::Proceed,
+                };
             };
             // Line breaks at either end of the selection stay outside the delimiters, which can't
             // pair across lines.
@@ -147,6 +159,13 @@ fn attach_wrap_keys(view: &sourceview5::View) {
             }
             if start == end {
                 return glib::Propagation::Proceed;
+            }
+            // A third backtick or a second `$` around text that fills its lines makes a block.
+            let body = text(&buffer);
+            let selection = byte_at(&body, start.offset())..byte_at(&body, end.offset());
+            if let Some((edit, selected)) = fence_selection(&body, selection, open) {
+                apply_edit(&buffer, &body, edit, Some(selected));
+                return glib::Propagation::Stop;
             }
             let (start_offset, end_offset) = (start.offset(), end.offset());
             let selected = buffer.text(&start, &end, true);
@@ -208,16 +227,24 @@ fn apply_list_edit(buffer: &gtk::TextBuffer, key: ListKey) -> bool {
     let Some(edit) = list_edit(&body, cursor, key) else {
         return false;
     };
-    if edit.range.is_empty() && edit.text.is_empty() {
-        return true;
+    if !edit.range.is_empty() || !edit.text.is_empty() {
+        apply_edit(buffer, &body, edit, None);
     }
-    let range = char_range(&body, edit.range.clone());
-    let mut changed = body;
-    changed.replace_range(edit.range, &edit.text);
-    let new_cursor = changed[..edit.cursor].chars().count();
-    replace(buffer, range, &edit.text);
-    buffer.place_cursor(&buffer.iter_at_offset(offset(new_cursor)));
     true
+}
+
+/// Makes `edit` to `body`, the buffer's text, as one undoable step. Then it selects `selected`, a
+/// byte range of the changed text, or puts the cursor where the edit says.
+fn apply_edit(buffer: &gtk::TextBuffer, body: &str, edit: Edit, selected: Option<Range<usize>>) {
+    let range = char_range(body, edit.range.clone());
+    let mut changed = body.to_owned();
+    changed.replace_range(edit.range, &edit.text);
+    let chars = |byte: usize| buffer.iter_at_offset(offset(changed[..byte].chars().count()));
+    replace(buffer, range, &edit.text);
+    match selected {
+        Some(selected) => buffer.select_range(&chars(selected.end), &chars(selected.start)),
+        None => buffer.place_cursor(&chars(edit.cursor)),
+    }
 }
 
 /// Toggles a task box when the owner clicks it.

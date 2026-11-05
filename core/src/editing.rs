@@ -7,7 +7,7 @@ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
 use crate::Id;
 use crate::body::{self, Mark};
-use crate::lists::Item as ListItem;
+use crate::lists::{Edit, Item as ListItem};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Style {
@@ -476,6 +476,87 @@ fn span(body: &str, mut range: Range<usize>, style: Style, syntax: Vec<Range<usi
     Span { range, style, syntax }
 }
 
+/// The edit that typing `typed` at byte `cursor` makes when it completes the opening of a block
+/// at the start of a line: a third backtick opens a code block, with the cursor after the fence
+/// for its language, and a second `$` opens display math, with the cursor inside. The closing line
+/// follows at the opening's indentation, so a block in a list item stays in it.
+pub fn complete_block_opening(body: &str, cursor: usize, typed: char) -> Option<Edit> {
+    let run = match typed {
+        '`' => "``",
+        '$' => "$",
+        _ => return None,
+    };
+    let line_end = body[cursor..].find('\n').map_or(body.len(), |i| cursor + i);
+    if !body[..cursor].ends_with(run) || !body[cursor..line_end].trim().is_empty() {
+        return None;
+    }
+    let start = cursor - run.len();
+    if body[..start].ends_with(typed) || in_code_block(body, start) {
+        return None;
+    }
+    let column = block_column(body, start)?;
+    let indent = " ".repeat(column);
+    let (text, into) = match typed {
+        '`' => (format!("`\n{indent}```"), 1),
+        _ => (format!("$\n{indent}\n{indent}$$"), 2 + indent.len()),
+    };
+    Some(Edit { cursor: cursor + into, range: cursor..line_end, text })
+}
+
+/// The edit that typing `typed` makes with the byte range `selection` selected, when the inline
+/// form of a block wraps it and fills the rest of its lines: a third backtick around a code span
+/// makes a code block, and a second `$` around inline math makes display math. The selection
+/// becomes the block's content and stays selected. Returns the edit and the selection's range
+/// after it.
+pub fn fence_selection(
+    body: &str,
+    selection: Range<usize>,
+    typed: char,
+) -> Option<(Edit, Range<usize>)> {
+    let (wrap, fence) = match typed {
+        '`' => ("``", "```"),
+        '$' => ("$", "$$"),
+        _ => return None,
+    };
+    let open = selection.start.checked_sub(wrap.len())?;
+    let close = selection.end + wrap.len();
+    if body.get(open..selection.start)? != wrap || body.get(selection.end..close)? != wrap {
+        return None;
+    }
+    let line_end = body[close..].find('\n').map_or(body.len(), |i| close + i);
+    if body[..open].ends_with(typed)
+        || body[close..].starts_with(typed)
+        || !body[close..line_end].trim().is_empty()
+        || in_code_block(body, open)
+    {
+        return None;
+    }
+    let column = block_column(body, open)?;
+    let indent = " ".repeat(column);
+    let selected = &body[selection];
+    let text = format!("{fence}\n{indent}{selected}\n{indent}{fence}");
+    let start = open + fence.len() + 1 + indent.len();
+    let selected = start..start + selected.len();
+    Some((Edit { cursor: selected.end, range: open..line_end, text }, selected))
+}
+
+/// Whether byte `at` falls inside a code block or another construct whose text is literal, past
+/// its start.
+fn in_code_block(body: &str, at: usize) -> bool {
+    body::code_ranges(body).iter().any(|range| range.start < at && at < range.end)
+}
+
+/// The column of byte `at` in its line, when only indentation, or a list item's marker and box,
+/// come before it there, so a block can start at it.
+fn block_column(body: &str, at: usize) -> Option<usize> {
+    let line_start = body[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = body[at..].find('\n').map_or(body.len(), |i| at + i);
+    let before = &body[line_start..at];
+    let after_marker = ListItem::parse(&body[line_start..line_end])
+        .is_some_and(|item| item.content_start == before.len());
+    (before.trim().is_empty() || after_marker).then(|| before.chars().count())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +682,64 @@ mod tests {
                 (Style::Completed, vec![])
             ]
         );
+    }
+
+    /// Types `typed` at the `|` in `before`, and returns the result with `|` at the new cursor.
+    fn type_at(before: &str, typed: char) -> Option<String> {
+        let cursor = before.find('|').unwrap();
+        let body = before.replacen('|', "", 1);
+        let edit = complete_block_opening(&body, cursor, typed)?;
+        let mut after = body;
+        after.replace_range(edit.range, &edit.text);
+        after.insert(edit.cursor, '|');
+        Some(after)
+    }
+
+    #[test]
+    fn completes_block_openings() {
+        assert_eq!(type_at("``|", '`').as_deref(), Some("```|\n```"));
+        assert_eq!(type_at("text\n``|\nmore", '`').as_deref(), Some("text\n```|\n```\nmore"));
+        let nested = "- something\n  - another\n    ``|";
+        let fenced = "- something\n  - another\n    ```|\n    ```";
+        assert_eq!(type_at(nested, '`').as_deref(), Some(fenced));
+        assert_eq!(type_at("- [ ] ``|", '`').as_deref(), Some("- [ ] ```|\n      ```"));
+        assert_eq!(type_at("$|", '$').as_deref(), Some("$$\n|\n$$"));
+        assert_eq!(type_at("- a\n  $|", '$').as_deref(), Some("- a\n  $$\n  |\n  $$"));
+        // Not after text, before text, past a longer run, or inside a code block.
+        assert_eq!(type_at("a ``|", '`'), None);
+        assert_eq!(type_at("``| a", '`'), None);
+        assert_eq!(type_at("```|", '`'), None);
+        assert_eq!(type_at("$$|", '$'), None);
+        assert_eq!(type_at("```\n``|", '`'), None);
+    }
+
+    #[test]
+    fn fences_selections() {
+        let fence = |before: &str| {
+            let start = before.find('[').unwrap();
+            let end = before.find(']').unwrap() - 1;
+            let body = before.replacen('[', "", 1).replacen(']', "", 1);
+            let typed = if body[..start].ends_with('$') { '$' } else { '`' };
+            let (edit, selected) = fence_selection(&body, start..end, typed)?;
+            let mut after = body;
+            after.replace_range(edit.range, &edit.text);
+            after.insert(selected.end, ']');
+            after.insert(selected.start, '[');
+            Some(after)
+        };
+        let text = "this is an **example** for you";
+        let fenced = format!("```\n[{text}]\n```");
+        assert_eq!(fence(&format!("``[{text}]``")), Some(fenced));
+        assert_eq!(fence("- a\n  ``[b]``").as_deref(), Some("- a\n  ```\n  [b]\n  ```"));
+        assert_eq!(fence("- ``[b]``").as_deref(), Some("- ```\n  [b]\n  ```"));
+        // A selection that shares its line with other text gets an inline code span instead.
+        assert_eq!(fence("a ``[b]``"), None);
+        assert_eq!(fence("``[b]`` c"), None);
+        assert_eq!(fence("`[b]`"), None);
+        assert_eq!(fence("$[f=19^{2}]$").as_deref(), Some("$$\n[f=19^{2}]\n$$"));
+        assert_eq!(fence("- a\n  $[x]$").as_deref(), Some("- a\n  $$\n  [x]\n  $$"));
+        assert_eq!(fence("$$[x]$$"), None);
+        assert_eq!(fence("a $[x]$"), None);
     }
 
     #[test]
