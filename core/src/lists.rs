@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListKey {
@@ -28,11 +28,84 @@ pub struct Edit {
 
 /// Returns the edit that `key` makes with the cursor at byte `cursor`, or `None` if the cursor
 /// isn't in a list item, so the key should do what it does in ordinary text. In a list, Tab and
-/// Shift+Tab always return an edit, which may change nothing, so they never insert a tab.
+/// Shift+Tab always return an edit, which may change nothing, so they never insert a tab. Lists in
+/// code blocks are code, except in a `table` block, whose content is a list table's list.
 pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
-    if in_code_block(body, cursor) {
-        return None;
+    match code_block(body, cursor) {
+        Code::Outside => edit(body, cursor, key),
+        Code::Inside => None,
+        Code::Table { content, indent } => {
+            // The content edits as a note of its own, without the indentation of a table nested
+            // in a list item, which would otherwise read as an indented code block. It may hold
+            // code blocks of its own, such as a table in a cell.
+            let lines = Dedented::new(&body[content.clone()], indent);
+            let at = lines.dedented(cursor - content.start);
+            let edit = list_edit(&lines.text, at, key)?;
+            let shift = |at: usize| content.start + lines.original(at);
+            let range = shift(edit.range.start)..shift(edit.range.end);
+            let text = edit.text.replace('\n', &format!("\n{}", " ".repeat(indent)));
+            let into = edit.cursor - edit.range.start;
+            let cursor = if into <= edit.text.len() {
+                // In the new text, which its newlines' indentation lengthened.
+                range.start + into + edit.text[..into].matches('\n').count() * indent
+            } else {
+                // After it, where the text was as it is now.
+                let unchanged = edit.cursor - edit.text.len() + edit.range.len();
+                shift(unchanged) + text.len() - range.len()
+            };
+            Some(Edit { cursor, range, text })
+        }
     }
+}
+
+/// Text with up to `indent` spaces taken from the start of each line, and the way back to the
+/// original's offsets.
+struct Dedented {
+    text: String,
+    /// For each line, where it starts in the dedented text and in the original, and how many
+    /// spaces it lost.
+    lines: Vec<(usize, usize, usize)>,
+}
+
+impl Dedented {
+    fn new(original: &str, indent: usize) -> Self {
+        let mut text = String::with_capacity(original.len());
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for line in original.split('\n') {
+            if start > 0 {
+                text.push('\n');
+            }
+            let removed = (line.len() - line.trim_start_matches(' ').len()).min(indent);
+            lines.push((text.len(), start, removed));
+            text.push_str(&line[removed..]);
+            start += line.len() + 1;
+        }
+        Self { text, lines }
+    }
+
+    fn line(&self, at: usize, original: bool) -> (usize, usize, usize) {
+        let index = self.lines.partition_point(|&(dedented, from, removed)| {
+            if original { from + removed <= at } else { dedented <= at }
+        });
+        self.lines[index.saturating_sub(1)]
+    }
+
+    /// The dedented offset of the original's offset `at`, which lies past its line's
+    /// indentation.
+    fn dedented(&self, at: usize) -> usize {
+        let (dedented, from, removed) = self.line(at, true);
+        dedented + at.saturating_sub(from + removed)
+    }
+
+    /// The original's offset of the dedented offset `at`.
+    fn original(&self, at: usize) -> usize {
+        let (dedented, from, removed) = self.line(at, false);
+        from + removed + (at - dedented)
+    }
+}
+
+fn edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
     let lines = lines(body);
     let current = lines.iter().position(|line| line.start <= cursor && cursor <= line.end)?;
     let (owner, item) = owner(&lines, current)?;
@@ -149,12 +222,48 @@ fn lines(body: &str) -> Vec<Line<'_>> {
     lines
 }
 
-fn in_code_block(body: &str, cursor: usize) -> bool {
-    Parser::new_ext(body, Options::empty()).into_offset_iter().any(|(event, range)| {
-        matches!(event, Event::Start(Tag::CodeBlock(_)))
-            && range.start <= cursor
-            && cursor < range.end
-    })
+/// Where the cursor lies relative to code blocks.
+enum Code {
+    Outside,
+    Inside,
+    /// In the content of a `table` block, which spans the byte range `content`, between its
+    /// fences, whose lines are indented by `indent` spaces, to the column of its opening fence.
+    Table {
+        content: Range<usize>,
+        indent: usize,
+    },
+}
+
+fn code_block(body: &str, cursor: usize) -> Code {
+    for (event, range) in Parser::new_ext(body, Options::empty()).into_offset_iter() {
+        let Event::Start(Tag::CodeBlock(kind)) = event else { continue };
+        // The end of the closing fence's line is in the block too.
+        let block = body[range.clone()].trim_end_matches(['\n', '\r']);
+        if !(range.start <= cursor && cursor <= range.start + block.len()) {
+            continue;
+        }
+        let CodeBlockKind::Fenced(info) = kind else { return Code::Inside };
+        if info.split_whitespace().next() != Some("table") {
+            return Code::Inside;
+        }
+        let Some(opening) = block.find('\n') else { return Code::Inside };
+        let start = range.start + opening + 1;
+        // The closing fence, when the block has one, isn't content.
+        let last_line = block.rfind('\n').map_or(0, |i| i + 1);
+        let closing = block[last_line..].trim_start();
+        let closed =
+            last_line > opening && (closing.starts_with("```") || closing.starts_with("~~~"));
+        let end = range.start + if closed { last_line - 1 } else { block.len() };
+        if start <= cursor && cursor <= end && start <= end {
+            let line_start = body[..range.start].rfind('\n').map_or(0, |i| i + 1);
+            // A fence on a list item's line, after its marker, sits at the item's content column,
+            // where its later lines are indented to.
+            let indent = body[line_start..range.start].chars().count();
+            return Code::Table { content: start..end, indent };
+        }
+        return Code::Inside;
+    }
+    Code::Outside
 }
 
 /// Finds the item that the line at `current` belongs to: the item it starts, or the item it
@@ -408,8 +517,75 @@ mod tests {
     }
 
     #[test]
+    fn edits_lists_in_table_blocks() {
+        for (before, key, after) in [
+            (
+                "```table\n- - this\n  - that|\n```",
+                ListKey::Enter,
+                "```table\n- - this\n  - that\n  - |\n```",
+            ),
+            (
+                "```table\n- - a\n  - b\n  - |\n```",
+                ListKey::Enter,
+                "```table\n- - a\n  - b\n- |\n```",
+            ),
+            ("```table\n- - a\n- b|\n```", ListKey::Tab, "```table\n- - a\n  - b|\n```"),
+            ("```table\n- row\n  - a|", ListKey::Enter, "```table\n- row\n  - a\n  - |"),
+            (
+                "x\n\n```table\n- a\n  - b|\n```\n\n- c",
+                ListKey::ShiftTab,
+                "x\n\n```table\n- a\n- b|\n```\n\n- c",
+            ),
+        ] {
+            assert_eq!(press(before, key).as_deref(), Some(after), "{before:?} {key:?}");
+        }
+        // A table in a cell edits within its own fences.
+        let nested =
+            |lines: &str| format!("```table\n- r\n  - 4\n\n    ```table\n{lines}\n    ```\n```");
+        for (before, key, after) in [
+            (
+                "    - a\n      - 1\n      - 2|",
+                ListKey::Enter,
+                "    - a\n      - 1\n      - 2\n      - |",
+            ),
+            ("    - a\n      - 1\n    - 2|", ListKey::Tab, "    - a\n      - 1\n      - 2|"),
+            ("    - a\n      - 1|\n        - x", ListKey::ShiftTab, "    - a\n    - 1|\n      - x"),
+            ("    - a\n      - 1\n      - |", ListKey::Enter, "    - a\n      - 1\n    - |"),
+        ] {
+            let pressed = press(&nested(before), key);
+            assert_eq!(pressed, Some(nested(after)), "{before:?} {key:?}");
+        }
+        // A table that starts on a cell's line.
+        let cell = concat!(
+            "```table\n- row1\n  - ```table\n",
+            "    - heading row\n      - a\n      - b|\n    ```\n```",
+        );
+        let expected = cell.replace("- b|", "- b\n      - |");
+        assert_eq!(press(cell, ListKey::Enter), Some(expected));
+        // The note that showed the problem.
+        let note = concat!(
+            "```table\n- row1\n  - this\n- row3\n  - 3\n  - 4\n    \n    and five\n    \n",
+            "    ```table\n    - code\n      - blah\n    - another\n",
+            "      - 1\n      - 2|\n    ```\n```",
+        );
+        let expected = note.replace("- 2|", "- 2\n      - |");
+        assert_eq!(press(note, ListKey::Enter), Some(expected));
+        // The fences aren't content.
+        for before in ["```table|\n- a\n```", "```table\n- a\n```|"] {
+            assert_eq!(press(before, ListKey::Enter), None, "{before:?}");
+        }
+    }
+
+    #[test]
     fn leaves_other_text_alone() {
-        for before in ["plain|", "- a\n\nafter|", "```\n- code|\n```", "---|", "-not|"] {
+        for before in [
+            "plain|",
+            "- a\n\nafter|",
+            "```\n- code|\n```",
+            "```math\n- code|\n```",
+            "---|",
+            "-not|",
+        ] {
             for key in [ListKey::Enter, ListKey::ShiftEnter, ListKey::Tab, ListKey::ShiftTab] {
                 assert_eq!(press(before, key), None, "{before:?} {key:?}");
             }
