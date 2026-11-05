@@ -29,11 +29,17 @@ pub struct Edit {
 /// Returns the edit that `key` makes with the cursor at byte `cursor`, or `None` if the cursor
 /// isn't in a list item, so the key should do what it does in ordinary text. In a list, Tab and
 /// Shift+Tab always return an edit, which may change nothing, so they never insert a tab. Lists in
-/// code blocks are code, except in a `table` block, whose content is a list table's list.
+/// code blocks are code, except in a `table` block, whose content is a list table's list. In other
+/// code, Enter and Shift+Enter keep the line's indentation, and Tab and Shift+Tab move the list
+/// item that holds the block.
 pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
+    let tab = matches!(key, ListKey::Tab | ListKey::ShiftTab);
     match code_block(body, cursor) {
-        Code::Outside => edit(body, cursor, key),
-        Code::Inside => None,
+        Code::Outside => edit(body, cursor, key, None),
+        Code::Inside { fence, .. } if tab => edit(body, cursor, key, Some(fence)),
+        Code::Inside { indent, .. } => code_newline(body, cursor, indent),
+        // A new item or a continuation line can follow a code block in a list item.
+        Code::Closed { fence } => edit(body, cursor, key, Some(fence)),
         Code::Table { content, indent } => {
             // The content edits as a note of its own, without the indentation of a table nested
             // in a list item, which would otherwise read as an indented code block. It may hold
@@ -105,14 +111,31 @@ impl Dedented {
     }
 }
 
-fn edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
+/// The edit that `key` makes outside code. In a code block or after its closing fence, `fence` is
+/// the byte offset of its opening fence, and the item is the one that holds the fence.
+fn edit(body: &str, cursor: usize, key: ListKey, fence: Option<usize>) -> Option<Edit> {
     let lines = lines(body);
-    let current = lines.iter().position(|line| line.start <= cursor && cursor <= line.end)?;
-    let (owner, item) = owner(&lines, current)?;
+    let line_at = |at: usize| lines.iter().position(|line| line.start <= at && at <= line.end);
+    let current = line_at(cursor)?;
+    let (from, at) = match fence {
+        Some(fence) => (line_at(fence)?, fence),
+        None => (current, cursor),
+    };
+    let found = owner(&lines, from);
+    // A line of text or a code block can belong to its item past blank lines, by its indentation.
+    // So can a blank line, for the continuation line that Shift+Enter starts on it, and for Tab
+    // and Shift+Tab to move its item. Enter on it stays a line break.
+    let past_blank_lines = !lines[from].is_blank() || key != ListKey::Enter;
+    let (owner, item) =
+        if past_blank_lines { found.or_else(|| enclosing(&lines, from, at))? } else { found? };
+    // A fence left of the item's content ends the list rather than continuing the item.
+    if fence.is_some_and(|fence| fence - lines[from].start < item.content_column) {
+        return None;
+    }
     match key {
         ListKey::Enter => Some(enter(body, &lines, current, owner, &item, cursor)),
         ListKey::ShiftEnter => {
-            let text = format!("\n{}", " ".repeat(item.content_start));
+            let text = format!("\n{}", " ".repeat(item.content_column));
             Some(Edit { cursor: cursor + text.len(), range: cursor..cursor, text })
         }
         ListKey::Tab => Some(indent(body, &lines, owner, &item, cursor)),
@@ -143,10 +166,11 @@ impl Line<'_> {
 #[derive(Clone, Debug)]
 pub(crate) struct Item {
     pub(crate) checkbox: bool,
-    /// Column just past the marker and its space, where nested items start.
+    /// Column just past the marker and its space, where nested items and continuation lines start.
+    /// A task box is part of the item's text, so a fence or quote indented past the box would read
+    /// as text.
     content_column: usize,
-    /// Byte offset within the line where the item's text starts, past any checkbox. Continuation
-    /// lines start here too, to line up with the text.
+    /// Byte offset within the line where the item's text starts, past any checkbox.
     pub(crate) content_start: usize,
     indent: usize,
     marker: Marker,
@@ -225,7 +249,16 @@ fn lines(body: &str) -> Vec<Line<'_>> {
 /// Where the cursor lies relative to code blocks.
 enum Code {
     Outside,
-    Inside,
+    /// In a code block, whose opening fence or first line starts at byte `fence`, `indent` columns
+    /// into its line.
+    Inside {
+        fence: usize,
+        indent: usize,
+    },
+    /// At the end of the closing fence of a code block whose opening fence starts at byte `fence`.
+    Closed {
+        fence: usize,
+    },
     /// In the content of a `table` block, which spans the byte range `content`, between its
     /// fences, whose lines are indented by `indent` spaces, to the column of its opening fence.
     Table {
@@ -242,28 +275,48 @@ fn code_block(body: &str, cursor: usize) -> Code {
         if !(range.start <= cursor && cursor <= range.start + block.len()) {
             continue;
         }
-        let CodeBlockKind::Fenced(info) = kind else { return Code::Inside };
-        if info.split_whitespace().next() != Some("table") {
-            return Code::Inside;
-        }
-        let Some(opening) = block.find('\n') else { return Code::Inside };
+        let line_start = body[..range.start].rfind('\n').map_or(0, |i| i + 1);
+        // A fence on a list item's line, after its marker, sits at the item's content column,
+        // where its later lines are indented to.
+        let indent = body[line_start..range.start].chars().count();
+        let inside = Code::Inside { fence: range.start, indent };
+        let CodeBlockKind::Fenced(info) = kind else { return inside };
+        let Some(opening) = block.find('\n') else { return inside };
         let start = range.start + opening + 1;
         // The closing fence, when the block has one, isn't content.
         let last_line = block.rfind('\n').map_or(0, |i| i + 1);
         let closing = block[last_line..].trim_start();
         let closed =
             last_line > opening && (closing.starts_with("```") || closing.starts_with("~~~"));
+        if closed && cursor == range.start + block.len() {
+            return Code::Closed { fence: range.start };
+        }
+        if info.split_whitespace().next() != Some("table") {
+            return inside;
+        }
         let end = range.start + if closed { last_line - 1 } else { block.len() };
         if start <= cursor && cursor <= end && start <= end {
-            let line_start = body[..range.start].rfind('\n').map_or(0, |i| i + 1);
-            // A fence on a list item's line, after its marker, sits at the item's content column,
-            // where its later lines are indented to.
-            let indent = body[line_start..range.start].chars().count();
             return Code::Table { content: start..end, indent };
         }
-        return Code::Inside;
+        return inside;
     }
     Code::Outside
+}
+
+/// The edit that Enter and Shift+Enter make in a code block whose fence starts `indent` columns
+/// into its line: a new line indented like the cursor's, and at least as far as the fence, so a
+/// block in a list item stays in it. Before the text of a line, or with no indentation to keep,
+/// they make a plain line break.
+fn code_newline(body: &str, cursor: usize, indent: usize) -> Option<Edit> {
+    let line_start = body[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = body[cursor..].find('\n').map_or(body.len(), |i| cursor + i);
+    let line = &body[line_start..line_end];
+    let spaces = line.len() - line.trim_start_matches(' ').len();
+    if spaces.max(indent) == 0 || cursor < line_start + spaces && !line.trim().is_empty() {
+        return None;
+    }
+    let text = format!("\n{}", " ".repeat(spaces.max(indent)));
+    Some(Edit { cursor: cursor + text.len(), range: cursor..cursor, text })
 }
 
 /// Finds the item that the line at `current` belongs to: the item it starts, or the item it
@@ -281,6 +334,26 @@ fn owner(lines: &[Line], current: usize) -> Option<(usize, Item)> {
         }
         if let Some(item) = Item::parse(lines[index].text) {
             return Some((index, item));
+        }
+    }
+    None
+}
+
+/// Finds the item that the line at `current` belongs to past blank lines, as `CommonMark` does by
+/// indentation: the nearest item above whose content column every line down to `current` reaches,
+/// counting a blank `current` as indented up to the cursor.
+fn enclosing(lines: &[Line], current: usize, cursor: usize) -> Option<(usize, Item)> {
+    let line = lines[current];
+    let mut reach = if line.is_blank() { cursor - line.start } else { line.indent() };
+    for index in (0..current).rev() {
+        let line = lines[index];
+        if let Some(item) = Item::parse(line.text)
+            && item.content_column <= reach
+        {
+            return Some((index, item));
+        }
+        if !line.is_blank() {
+            reach = reach.min(line.indent());
         }
     }
     None
@@ -355,7 +428,8 @@ fn enter(
         return Edit { cursor: cursor + text.len(), range: line.start..line.start, text };
     }
     if body[cursor..line.end].trim().is_empty() {
-        let last = last_continuation(lines, owner);
+        // From the cursor's line, which a code block's blank lines can separate from the item's.
+        let last = last_continuation(lines, current);
         let at = lines[last].end;
         let child = lines.get(last + 1).and_then(|next| Item::parse(next.text));
         let prefix = match child.filter(|child| child.indent > item.indent) {
@@ -381,8 +455,10 @@ fn indent(body: &str, lines: &[Line], owner: usize, item: &Item, cursor: usize) 
         return Edit { cursor, range: cursor..cursor, text: String::new() };
     };
     let shift = sibling.content_column - item.indent;
+    // A blank line keeps any indentation it has in step with the item's, and an empty one stays
+    // empty.
     reindent(body, lines, owner, item, cursor, |line| {
-        if line.is_blank() { (0, String::new()) } else { (0, " ".repeat(shift)) }
+        if line.text.is_empty() { (0, String::new()) } else { (0, " ".repeat(shift)) }
     })
 }
 
@@ -486,7 +562,102 @@ mod tests {
         assert_eq!(press("- one|", ListKey::ShiftEnter).as_deref(), Some("- one\n  |"));
         assert_eq!(press("10. one|", ListKey::ShiftEnter).as_deref(), Some("10. one\n    |"));
         assert_eq!(press("- a\n  b|", ListKey::ShiftEnter).as_deref(), Some("- a\n  b\n  |"));
-        assert_eq!(press("- [ ] a|", ListKey::ShiftEnter).as_deref(), Some("- [ ] a\n      |"));
+        assert_eq!(press("- [ ] a|", ListKey::ShiftEnter).as_deref(), Some("- [ ] a\n  |"));
+        // Past a blank line, and after a code block, indentation still places a line in its item.
+        let blank = "- a\n  b\n  |";
+        assert_eq!(press(blank, ListKey::ShiftEnter).as_deref(), Some("- a\n  b\n  \n  |"));
+        let nested = "- a\n  - b\n\n  c\n  |";
+        assert_eq!(
+            press(nested, ListKey::ShiftEnter).as_deref(),
+            Some("- a\n  - b\n\n  c\n  \n  |")
+        );
+        let code = "- a\n  ```\n  x\n\n  ```|\n- b";
+        assert_eq!(
+            press(code, ListKey::ShiftEnter).as_deref(),
+            Some("- a\n  ```\n  x\n\n  ```\n  |\n- b")
+        );
+        assert_eq!(press("- a\n\n|", ListKey::ShiftEnter), None);
+    }
+
+    #[test]
+    fn tabs_move_items_from_blank_lines_and_code() {
+        for (flat, nested) in [
+            (
+                "- new parent\n- some|thing\n  a continuation\n  \n  more",
+                "- new parent\n  - some|thing\n    a continuation\n    \n    more",
+            ),
+            (
+                "- new parent\n- something\n  a continuation\n  |\n  more",
+                "- new parent\n  - something\n    a continuation\n    |\n    more",
+            ),
+        ] {
+            assert_eq!(press(flat, ListKey::Tab).as_deref(), Some(nested));
+            assert_eq!(press(nested, ListKey::ShiftTab).as_deref(), Some(flat));
+        }
+        // An empty line stays empty.
+        assert_eq!(
+            press("- a\n- b|\n\n  c", ListKey::Tab).as_deref(),
+            Some("- a\n  - b|\n\n    c")
+        );
+        let code = "- a\n- b\n  ```\n  x|\n  ```";
+        let moved = "- a\n  - b\n    ```\n    x|\n    ```";
+        assert_eq!(press(code, ListKey::Tab).as_deref(), Some(moved));
+        assert_eq!(press(moved, ListKey::ShiftTab).as_deref(), Some(code));
+        assert_eq!(
+            press("- a\n- b\n  ```\n  x\n  ```|", ListKey::Tab).as_deref(),
+            Some(moved.replace("x|\n    ```", "x\n    ```|").as_str())
+        );
+        // Code that no item holds takes its tabs.
+        assert_eq!(press("```\nx|\n```", ListKey::Tab), None);
+    }
+
+    #[test]
+    fn keys_find_items_past_blank_lines() {
+        let after_blank = "- done\n  \n  a continuation|\n- next";
+        assert_eq!(
+            press(after_blank, ListKey::Enter).as_deref(),
+            Some("- done\n  \n  a continuation\n- |\n- next")
+        );
+        let nested = "- a\n- b\n\n  c|";
+        assert_eq!(press(nested, ListKey::Tab).as_deref(), Some("- a\n  - b\n\n    c|"));
+        // Text at the left margin after a blank line ends the list, and a blank line is no item's.
+        assert_eq!(press("- a\n\nb|", ListKey::Enter), None);
+        assert_eq!(press("- a\n\n  |", ListKey::Enter), None);
+    }
+
+    #[test]
+    fn enter_after_a_code_block_starts_an_item() {
+        let code = "- a\n  ```\n  x\n  ```|";
+        assert_eq!(press(code, ListKey::Enter).as_deref(), Some("- a\n  ```\n  x\n  ```\n- |"));
+        let blank = "- [ ] a\n  ```\n  x\n\n  y\n  ```|\n- [ ] b";
+        let after = "- [ ] a\n  ```\n  x\n\n  y\n  ```\n- [ ] |\n- [ ] b";
+        assert_eq!(press(blank, ListKey::Enter).as_deref(), Some(after));
+        let more = "- a\n  ```\n  x\n  ```|\n  more";
+        assert_eq!(
+            press(more, ListKey::Enter).as_deref(),
+            Some("- a\n  ```\n  x\n  ```\n  more\n- |")
+        );
+        assert_eq!(press("```\nx\n```|", ListKey::Enter), None);
+        assert_eq!(press("- a\n```\nx\n```|", ListKey::Enter), None);
+    }
+
+    #[test]
+    fn newlines_in_code_keep_indentation() {
+        for key in [ListKey::Enter, ListKey::ShiftEnter] {
+            let code = "- a\n  ```mermaid\n  flowchart LR|\n  ```";
+            let after = "- a\n  ```mermaid\n  flowchart LR\n  |\n  ```";
+            assert_eq!(press(code, key).as_deref(), Some(after));
+            let deeper = "- a\n  ```\n  if x:\n      y|\n  ```";
+            assert_eq!(
+                press(deeper, key).as_deref(),
+                Some("- a\n  ```\n  if x:\n      y\n      |\n  ```")
+            );
+            let opening = "- a\n  ```|\n  ```";
+            assert_eq!(press(opening, key).as_deref(), Some("- a\n  ```\n  |\n  ```"));
+            assert_eq!(press("```\nx|\n```", key), None);
+            // Before a line's text, the line breaks where the cursor is.
+            assert_eq!(press("- a\n  ```\n|  x\n  ```", key), None);
+        }
     }
 
     #[test]
