@@ -1025,11 +1025,13 @@ fn reveal(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings) 
         return;
     }
     let selection = preview.selection(buffer);
+    let mut spans_changed = false;
     for i in 0..preview.spans.len() {
         let revealed = preview.shows(&preview.spans[i], &selection);
         if revealed == preview.revealed[i] {
             continue;
         }
+        spans_changed = true;
         preview.revealed[i] = revealed;
         let style = preview.spans[i].style;
         for (index, syntax) in preview.spans[i].syntax.iter().enumerate() {
@@ -1050,6 +1052,10 @@ fn reveal(buffer: &gtk::TextBuffer, preview: &mut Preview, drawings: &Drawings) 
             preview.drawn_revealed[i] = revealed;
             drawings.reveal(buffer, i, revealed);
         }
+    }
+    // What the spans hide decides where blocks make their room.
+    if spans_changed {
+        drawings.reapply(buffer);
     }
 }
 

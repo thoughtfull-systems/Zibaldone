@@ -54,13 +54,33 @@ impl Default for Fit {
     }
 }
 
+/// Where a block makes its room. GTK aborts when it looks for the position at a point in the room
+/// below a line that holds hidden text, as `GtkSourceView` does at the edges of the view while it
+/// draws, and as a click does, so only a line without hidden text holds room below it. Room above
+/// a line is safe, but GTK gives none to a line that's hidden whole.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Room {
+    /// Below the last line of the source.
+    #[default]
+    Below,
+    /// Above the last line of the source, with the drawing above any text on it.
+    Above,
+    /// Above the line after the source, with the drawing below any text before the source.
+    AboveNext,
+}
+
 struct Overlay {
     id: u64,
     drawn: Drawn,
     start: gtk::TextMark,
     end: gtk::TextMark,
-    /// Makes room for the drawing.
+    /// Shrinks and hides the character that holds a block's room, or makes an inline drawing's
+    /// room.
     tag: gtk::TextTag,
+    /// Makes room for a block, as space above or below a line, which GTK takes from the tags at
+    /// the start of the line.
+    room: gtk::TextTag,
+    room_at: Cell<Room>,
     revealed: bool,
     /// The drawing, with its natural size, once it's ready.
     widget: Option<(gtk::Widget, i32, i32)>,
@@ -182,8 +202,11 @@ impl Drawings {
         for overlay in old {
             self.remove(buffer, overlay);
         }
-        for overlay in &overlays {
-            self.apply(buffer, overlay);
+        // Twice, since where a block makes its room depends on what the drawings after it hide.
+        for _ in 0..2 {
+            for overlay in &overlays {
+                self.apply(buffer, overlay);
+            }
         }
         *self.overlays.borrow_mut() = overlays;
         for (id, drawing) in redraw {
@@ -207,12 +230,22 @@ impl Drawings {
         crate::tables::cell_at(widget, view.upcast_ref(), point)
     }
 
+    /// Applies every drawing again, after the text that hides around them changed, which moves
+    /// where blocks make their room.
+    pub fn reapply(&self, buffer: &gtk::TextBuffer) {
+        for overlay in self.overlays.borrow().iter() {
+            self.apply(buffer, overlay);
+        }
+        self.schedule_place();
+    }
+
     /// Shows or hides the source of the `index`th drawing as the cursor comes and goes.
     pub fn reveal(&self, buffer: &gtk::TextBuffer, index: usize, revealed: bool) {
         let mut overlays = self.overlays.borrow_mut();
         let Some(overlay) = overlays.get_mut(index) else { return };
         overlay.revealed = revealed;
         self.apply(buffer, overlay);
+        self.apply_before(buffer, &overlays, index);
         drop(overlays);
         self.schedule_place();
     }
@@ -222,6 +255,8 @@ impl Drawings {
         self.next_id.set(id + 1);
         let tag = gtk::TextTag::new(None);
         buffer.tag_table().add(&tag);
+        let room = gtk::TextTag::new(None);
+        buffer.tag_table().add(&room);
         let start = buffer.create_mark(None, &buffer.start_iter(), true);
         let end = buffer.create_mark(None, &buffer.start_iter(), false);
         let holder = self.spare.borrow_mut().pop().unwrap_or_else(|| {
@@ -242,6 +277,8 @@ impl Drawings {
             start,
             end,
             tag,
+            room,
+            room_at: Cell::default(),
             revealed: false,
             widget: None,
             shown: None,
@@ -264,6 +301,7 @@ impl Drawings {
             buffer.remove_tag(&self.unshaded, &first_line, &end);
         }
         buffer.tag_table().remove(&overlay.tag);
+        buffer.tag_table().remove(&overlay.room);
         buffer.delete_mark(&overlay.start);
         buffer.delete_mark(&overlay.end);
     }
@@ -285,7 +323,8 @@ impl Drawings {
         let Some(view) = self.view.upgrade() else { return };
         let buffer = view.buffer();
         let mut overlays = self.overlays.borrow_mut();
-        let Some(overlay) = overlays.iter_mut().find(|o| o.id == id) else { return };
+        let Some(index) = overlays.iter().position(|o| o.id == id) else { return };
+        let overlay = &mut overlays[index];
         if overlay.drawn.drawing != *drawing {
             return;
         }
@@ -309,14 +348,26 @@ impl Drawings {
             (widget, width, height)
         });
         self.apply(&buffer, overlay);
+        self.apply_before(&buffer, &overlays, index);
         drop(overlays);
         self.schedule_place();
+    }
+
+    /// Applies the drawing before the `index`th again, as a block, whose room can move when what
+    /// the `index`th hides changes.
+    fn apply_before(&self, buffer: &gtk::TextBuffer, overlays: &[Overlay], index: usize) {
+        if let Some(before) = index.checked_sub(1).and_then(|i| overlays.get(i))
+            && before.drawn.block
+        {
+            self.apply(buffer, before);
+        }
     }
 
     /// Hides the source that a drawing covers, and makes room for it.
     fn apply(&self, buffer: &gtk::TextBuffer, overlay: &Overlay) {
         let (start, end) = (buffer.iter_at_mark(&overlay.start), buffer.iter_at_mark(&overlay.end));
         buffer.remove_tag(&overlay.tag, &buffer.start_iter(), &buffer.end_iter());
+        buffer.remove_tag(&overlay.room, &buffer.start_iter(), &buffer.end_iter());
         // A drawing can turn from inline to a block and back, as a line break before `$$` makes
         // it fill its line, so nothing that the other kind set stays.
         for property in
@@ -325,6 +376,7 @@ impl Drawings {
                 .chain(["pixels-below-lines-set"])
         {
             overlay.tag.set_property(property, false);
+            overlay.room.set_property(property, false);
         }
         let mut first_line = start;
         first_line.set_line_offset(0);
@@ -368,16 +420,30 @@ impl Drawings {
                     buffer.apply_tag(&self.unshaded, &first_line, &end);
                 }
             }
-            if room_above(overlay, &end) {
-                overlay.tag.set_pixels_above_lines(height + 2 * PAD);
+            let room = room(overlay, &end);
+            overlay.room_at.set(room);
+            let (mut line, mut line_end) = (last_line, end);
+            if room == Room::AboveNext {
+                line.forward_line();
+                line_end = line;
+                line_end.forward_char();
+            }
+            if room == Room::Below {
+                overlay.room.set_pixels_below_lines(height + 2 * PAD);
             } else {
-                overlay.tag.set_pixels_below_lines(height + 2 * PAD);
+                overlay.room.set_pixels_above_lines(height + 2 * PAD);
             }
-            let mut tiny = last_line;
-            if overlay.revealed || !tiny.backward_char() || tiny < start {
-                tiny = last_line;
+            buffer.apply_tag(&overlay.room, &line, &line_end);
+            if !overlay.revealed {
+                // Only the source shrinks, and not text before it on its line, such as a list
+                // item's marker or the text before display math.
+                let mut tiny = last_line;
+                if !tiny.backward_char() || tiny < start {
+                    tiny = end;
+                    tiny.backward_char();
+                }
+                buffer.apply_tag(&overlay.tag, &tiny, &end);
             }
-            buffer.apply_tag(&overlay.tag, &tiny, &end.max(last_line));
         } else if !overlay.revealed {
             let mut last = end;
             last.backward_char();
@@ -459,7 +525,11 @@ impl Drawings {
             let (x, y) = if overlay.drawn.block {
                 let mut last_line = end;
                 last_line.set_line_offset(0);
-                let (top, line_height) = view.line_yrange(&last_line);
+                let mut room_line = last_line;
+                if overlay.room_at.get() == Room::AboveNext {
+                    room_line.forward_line();
+                }
+                let (top, line_height) = view.line_yrange(&room_line);
                 let left = view.left_margin();
                 // A block in a list item starts where its source does, past the item's indentation.
                 let indent = indent(&view, overlay);
@@ -468,10 +538,10 @@ impl Drawings {
                     Drawing::Embed(_) | Drawing::Table(_) => left,
                     _ => left + (text_width(&view) - width).max(0) / 2,
                 };
-                let y = if room_above(overlay, &end) {
-                    top + PAD
-                } else {
+                let y = if overlay.room_at.get() == Room::Below {
                     top + line_height - height - PAD
+                } else {
+                    top + PAD
                 };
                 (x, y)
             } else {
@@ -587,6 +657,30 @@ fn font_px(widget: &impl IsA<gtk::Widget>) -> f64 {
 
 fn offset(chars: usize) -> i32 {
     i32::try_from(chars).unwrap_or(i32::MAX)
+}
+
+/// Where a block makes its room, once its source hides: above its last line when text follows the
+/// source there, or else below it, unless the line holds hidden text. Then the room goes above the
+/// next line, which puts the drawing below the text before the source, or above its own line
+/// when no line with anything shown follows.
+fn room(overlay: &Overlay, end: &gtk::TextIter) -> Room {
+    if room_above(overlay, end) {
+        return Room::Above;
+    }
+    let mut line = *end;
+    line.set_line_offset(0);
+    let mut next = line;
+    // A line after the last one holds no characters, so no tag can give it room.
+    let followed = next.forward_line();
+    if line.visible_text(&next) == line.text(&next) {
+        return Room::Below;
+    }
+    let mut after = next;
+    after.forward_line();
+    if followed && !next.visible_text(&after).is_empty() {
+        return Room::AboveNext;
+    }
+    Room::Above
 }
 
 /// Whether a block's drawing sits above the last line of its source rather than below it: when
