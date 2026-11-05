@@ -1,7 +1,7 @@
 //! The note editor, which styles markdown as it's written and shows the syntax of whatever the
 //! cursor touches.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
@@ -61,7 +61,7 @@ pub fn new_view(draw: Draw) -> sourceview5::View {
     view.set_left_margin(24);
     view.set_right_margin(24);
     view.set_vexpand(true);
-    attach_preview(&buffer, Drawings::new(view.upcast_ref(), draw, HIDDEN));
+    attach_preview(&view, Drawings::new(view.upcast_ref(), draw, HIDDEN));
     // A tag's margin replaces the view's margin rather than adding to it, so the quote margin
     // follows the view's.
     let indent_quotes = |view: &sourceview5::View| {
@@ -444,21 +444,113 @@ const STYLES: [Style; 18] = [
     Style::Underline,
 ];
 
-fn attach_preview(buffer: &sourceview5::Buffer, drawings: Rc<Drawings>) {
+/// Restyles the buffer as its text changes, and shows or hides syntax as the cursor moves. While a
+/// mouse button is down in `view`, syntax stays as it is until the button comes up: text that
+/// moved under the pointer between press and release would turn a click into a selection.
+fn attach_preview(view: &sourceview5::View, drawings: Rc<Drawings>) {
+    let buffer = view.buffer();
     let preview = Rc::new(RefCell::new(Preview::default()));
+    let pressed = Rc::new(Cell::new(false));
     buffer.connect_changed({
         let (preview, drawings) = (preview.clone(), drawings.clone());
         move |buffer| {
             contain_panic(|| {
-                restyle(buffer.upcast_ref(), &mut preview.borrow_mut(), &drawings);
+                restyle(buffer, &mut preview.borrow_mut(), &drawings);
             });
         }
     });
-    buffer.connect_mark_set(move |buffer, _, mark| {
-        if *mark == buffer.get_insert() || *mark == buffer.selection_bound() {
-            contain_panic(|| reveal(buffer.upcast_ref(), &mut preview.borrow_mut(), &drawings));
+    buffer.connect_mark_set({
+        let (preview, drawings, pressed) = (preview.clone(), drawings.clone(), pressed.clone());
+        move |buffer, _, mark| {
+            let moved = *mark == buffer.get_insert() || *mark == buffer.selection_bound();
+            if moved && !pressed.get() {
+                contain_panic(|| reveal(buffer, &mut preview.borrow_mut(), &drawings));
+            }
         }
     });
+    // A legacy controller sees every press and release without taking part in the view's own
+    // gestures, which would otherwise cancel it.
+    let buttons = gtk::EventControllerLegacy::builder()
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    buttons.connect_event(glib::clone!(
+        #[weak]
+        buffer,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, event| {
+            match event.event_type() {
+                gdk::EventType::ButtonPress => pressed.set(true),
+                gdk::EventType::ButtonRelease if pressed.replace(false) => {
+                    place_click(&buffer, &preview.borrow());
+                    contain_panic(|| reveal(&buffer, &mut preview.borrow_mut(), &drawings));
+                }
+                _ => {}
+            }
+            glib::Propagation::Proceed
+        }
+    ));
+    view.add_controller(buttons);
+}
+
+/// Puts a cursor that a click left at hidden syntax beside the shown character the owner clicked.
+/// GTK finds that character, but then counts the side of it the click fell on in the buffer's
+/// characters, hidden ones included. A click before the first character after hidden syntax lands
+/// at the start of the syntax, and a click after that character lands one character into the
+/// syntax. Once the syntax shows, the cursor would sit before or inside it. A click on a drawing
+/// lands in the source it covers, and goes to the start of that source, or for a block, such as
+/// display math or a diagram, to the start of its second line, just inside its opening `$$` or
+/// fence. A click on a block lands on its last line, where its room is, so at the end of its range.
+fn place_click(buffer: &gtk::TextBuffer, preview: &Preview) {
+    let Some(hidden) = buffer.tag_table().lookup(HIDDEN) else { return };
+    if buffer.has_selection() {
+        return;
+    }
+    let at = buffer.iter_at_mark(&buffer.get_insert());
+    // The drawings are stale while the text changes before the buffer reports it.
+    if preview.char_bytes.len() == usize::try_from(buffer.char_count()).unwrap_or(0) + 1 {
+        let clicked = usize::try_from(at.offset()).unwrap_or(0);
+        let drawn = preview.drawn.iter().zip(&preview.drawn_revealed);
+        for (drawn, _) in drawn.filter(|(_, revealed)| !**revealed) {
+            let chars = preview.chars(&drawn.range);
+            let on = if drawn.block { chars.end >= clicked } else { chars.end > clicked };
+            if chars.start <= clicked && on {
+                let mut start = buffer.iter_at_offset(offset(chars.start));
+                let mut inside = start;
+                if drawn.block && inside.forward_line() && inside.offset() < offset(chars.end) {
+                    start = inside;
+                }
+                buffer.place_cursor(&start);
+                return;
+            }
+        }
+    }
+    if let Some(placed) = clicked_place(&at, &hidden) {
+        buffer.place_cursor(&placed);
+    }
+}
+
+/// Where a click that GTK placed at `at` belongs, when that differs.
+fn clicked_place(at: &gtk::TextIter, hidden: &gtk::TextTag) -> Option<gtk::TextIter> {
+    if !at.has_tag(hidden) {
+        return None;
+    }
+    let mut before = *at;
+    let starts_run = !before.backward_char() || !before.has_tag(hidden);
+    // Syntax at the start of a line or after white space opens a span, such as a heading's `# `
+    // or the `**` before a strong word. Syntax after a word closes one, and a click at the end of
+    // the word belongs before it.
+    if starts_run && before != *at && !before.char().is_whitespace() {
+        return None;
+    }
+    let mut placed = *at;
+    while placed.has_tag(hidden) && !placed.is_end() && placed.char() != '\n' {
+        placed.forward_char();
+    }
+    if !starts_run && !placed.is_end() && placed.char() != '\n' {
+        placed.forward_char();
+    }
+    Some(placed)
 }
 
 /// Runs `f`, and stops a panic in it from going further. A panic can't unwind through a GTK signal

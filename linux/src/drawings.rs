@@ -30,6 +30,26 @@ const MAX_IMAGE_HEIGHT: i32 = 480;
 /// before its letter spacing, both in ems.
 const LINE_HEIGHT: f64 = 1.3;
 const GLYPH_WIDTH: f64 = 0.55;
+/// How many times the editor measures and corrects the room for an inline drawing.
+const FIT_TRIES: u8 = 8;
+
+/// Corrections to the room an inline drawing holds. Pango's line heights and letter spacing don't
+/// follow the font size exactly, so the editor measures the room it got and corrects it until the
+/// drawing covers no other text.
+#[derive(Clone, Copy)]
+struct Fit {
+    /// How much to scale the font of the character that holds the room.
+    scale: f64,
+    /// Letter spacing to add to it, in pixels.
+    spacing: i32,
+    tries: u8,
+}
+
+impl Default for Fit {
+    fn default() -> Self {
+        Self { scale: 1.0, spacing: 0, tries: 0 }
+    }
+}
 
 struct Overlay {
     id: u64,
@@ -43,6 +63,7 @@ struct Overlay {
     widget: Option<(gtk::Widget, i32, i32)>,
     /// The size it shows at.
     shown: Option<(i32, i32)>,
+    fit: Fit,
     /// The overlay of the view that holds the drawing.
     holder: gtk::Box,
 }
@@ -157,6 +178,9 @@ impl Drawings {
         let holder = self.spare.borrow_mut().pop().unwrap_or_else(|| {
             let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
             holder.set_visible(false);
+            // Clicks go through to the text view, which puts the cursor in the source that the
+            // drawing covers, so its source shows, and keeps its own clicks and selections whole.
+            holder.set_can_target(false);
             if let Some(view) = self.view.upgrade() {
                 view.add_overlay(&holder, 0, 0);
             }
@@ -172,6 +196,7 @@ impl Drawings {
             revealed: false,
             widget: None,
             shown: None,
+            fit: Fit::default(),
             holder,
         }
     }
@@ -214,6 +239,7 @@ impl Drawings {
         }
         overlay.holder.set_visible(false);
         overlay.shown = None;
+        overlay.fit = Fit::default();
         overlay.widget = widget.map(|widget| {
             // A picture asks for the size it shows at, which its texture, drawn at twice the size,
             // would otherwise set.
@@ -224,33 +250,12 @@ impl Drawings {
                     (natural.width(), natural.height())
                 }
             };
-            self.clickable(&widget, &overlay.start);
             overlay.holder.append(&widget);
             (widget, width, height)
         });
         self.apply(&buffer, overlay);
         drop(overlays);
         self.schedule_place();
-    }
-
-    /// Lets a click on a drawing put the cursor in its source, which then shows.
-    fn clickable(&self, widget: &gtk::Widget, start: &gtk::TextMark) {
-        let click = gtk::GestureClick::new();
-        let (view, start) = (self.view.clone(), start.clone());
-        click.connect_released(move |gesture, _, _, _| {
-            let Some(view) = view.upgrade() else { return };
-            if start.is_deleted() {
-                return;
-            }
-            let buffer = view.buffer();
-            let mut at = buffer.iter_at_mark(&start);
-            at.forward_char();
-            buffer.place_cursor(&at);
-            view.grab_focus();
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-        });
-        widget.add_controller(click);
-        widget.set_cursor_from_name(Some("pointer"));
     }
 
     /// Hides the source that a drawing covers, and makes room for it.
@@ -283,11 +288,12 @@ impl Drawings {
             let (width, height) =
                 overlay.shown.or_else(|| Self::size(&view, overlay)).unwrap_or((0, 0));
             // The character grows to make its line as tall as the drawing.
-            let font = font_px(&view).max(f64::from(height) / LINE_HEIGHT);
+            let font = font_px(&view).max(f64::from(height) / LINE_HEIGHT) * overlay.fit.scale;
             overlay.tag.set_size_points(font * 72.0 / 96.0);
             #[allow(clippy::cast_possible_truncation)]
             let glyph = (font * GLYPH_WIDTH).round() as i32;
-            overlay.tag.set_letter_spacing((width - glyph).max(0) * pango::SCALE);
+            let spacing = (width - glyph + overlay.fit.spacing).max(0);
+            overlay.tag.set_letter_spacing(spacing * pango::SCALE);
             // GTK draws a fully transparent color as black.
             overlay.tag.set_foreground_rgba(Some(&gdk::RGBA::new(0.5, 0.5, 0.5, 0.004)));
             buffer.apply_tag(&overlay.tag, &last, &end);
@@ -335,6 +341,7 @@ impl Drawings {
             let Some((width, height)) = Self::size(&view, overlay) else { continue };
             if overlay.shown != Some((width, height)) {
                 overlay.shown = Some((width, height));
+                overlay.fit.tries = 0;
                 widget.set_size_request(width, height);
                 self.apply(&buffer, overlay);
                 resized = true;
@@ -355,6 +362,10 @@ impl Drawings {
                 // GTK places text after hidden text as if it showed, but places hidden text where
                 // the next shown character is, which is the one that holds the room.
                 let place = view.iter_location(&buffer.iter_at_mark(&overlay.start));
+                if !overlay.revealed && refit(&mut overlay.fit, &place, width, height) {
+                    self.apply(&buffer, overlay);
+                    resized = true;
+                }
                 (place.x() + (place.width() - width) / 2, place.y() + (place.height() - height) / 2)
             };
             view.move_overlay(&overlay.holder, x, y);
@@ -363,6 +374,24 @@ impl Drawings {
             self.schedule_place();
         }
     }
+}
+
+/// Corrects the room for an inline drawing of `width` and `height` when `place`, the room it got,
+/// misses that size. Returns whether the correction changed.
+fn refit(fit: &mut Fit, place: &gdk::Rectangle, width: i32, height: i32) -> bool {
+    if fit.tries >= FIT_TRIES {
+        return false;
+    }
+    // The text around the drawing can make its line taller than the drawing, which leaves the
+    // font as it is.
+    let ratio = f64::from(height) / f64::from(place.height().max(1));
+    let scale = if ratio > 1.0 { fit.scale * ratio } else { (fit.scale * ratio).max(1.0) };
+    let spacing = fit.spacing + width - place.width();
+    if (scale - fit.scale).abs() < 0.005 && (spacing - fit.spacing).abs() <= 1 {
+        return false;
+    }
+    *fit = Fit { scale, spacing, tries: fit.tries + 1 };
+    true
 }
 
 fn char_range(buffer: &gtk::TextBuffer, overlay: &Overlay) -> Range<usize> {
