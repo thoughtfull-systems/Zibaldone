@@ -209,6 +209,20 @@ In `attach_wrap_keys`, with the core's `editing::complete_block_opening` and
 
 ## Files and images
 
+- [ ] An image sits on the text's baseline, between words, in list items, or alone on a line. It
+  keeps its natural size and shrinks in proportion to fit the text width. Its embed source shows
+  inline at the same text position when the selection touches it, and the picture moves up by a text
+  line. The source and picture reserve the width of whichever is wider. Clicking the image lands at
+  the source's start. (core: `editor::display`, widget: `editor_widget::tests`)
+- [ ] Revealing source keeps the surrounding text's baseline steady as the picture moves up.
+  Following text moves right or wraps if the source is wider than the picture. Repeated moves into
+  and out of the source don't make the view drift. (widget: `editor_widget::tests`)
+- [ ] Invalidating or restoring an image embed keeps the caret at its screen position. Document
+  edges leave room when scrolling alone can't preserve it, and undo reclaims that room. (widget:
+  `editor_widget::tests`)
+- [ ] Selections fill each visual row's height, including rows with images. Adjacent selected list
+  items have no gaps between their highlights. Selecting a whole embed highlights its picture.
+  Selecting part of its source highlights only those characters. (widget: `editor_widget::tests`)
 - [ ] Pasting an image with no text on the clipboard makes an `image` note in the open note's space,
   named for the time of the paste, and an embed of it in place of the selection.
 - [ ] Dropping files on the editor adds each as a note in the current space, and opens the last.

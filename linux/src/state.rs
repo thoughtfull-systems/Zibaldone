@@ -580,6 +580,24 @@ impl State {
         Ok(Some((hash, media)))
     }
 
+    /// An image already on this machine: its original, or its thumbnail while the original arrives.
+    pub async fn image_preview(&self, target: Id) -> Option<PathBuf> {
+        let space = self.find_note(target).await?;
+        if self.note(space, target).await.ok()?.type_name != "image" {
+            return None;
+        }
+        let blobs = self.blobs(space);
+        // The original takes precedence over the thumbnail, regardless of their names.
+        for field in ["image", "thumbnail"] {
+            if let Some((hash, _)) = self.note_file(space, target, field).await.ok()?
+                && blobs.has(hash)
+            {
+                return Some(blobs.path(hash));
+            }
+        }
+        None
+    }
+
     /// Prints notes to a PDF, as the instance specification's `print` request describes: each note
     /// in order, and with `linked`, the notes each one links to, unless the PDF already holds them.
     pub async fn print(&self, notes: &[Id], linked: bool) -> Result<Vec<u8>> {

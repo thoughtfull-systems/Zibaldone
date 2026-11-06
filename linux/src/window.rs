@@ -19,7 +19,7 @@ use zib_core::{Channel, Id};
 use crate::app::core;
 use crate::drawings::Draw;
 use crate::editor;
-use crate::editor_widget::{self, EditorWidget};
+use crate::editor_widget::{self, EditorWidget, PasteTarget};
 use crate::state::State;
 use crate::tables;
 
@@ -269,6 +269,10 @@ impl Window {
             widget.connect_open_link(move |target| w.open_link(target));
             let w = this.clone();
             widget.connect_pick_link(move |range| w.open_widget_link_picker(range));
+            let w = this.clone();
+            widget.connect_paste_image(move |clipboard, target| {
+                w.paste_widget_image(clipboard, target);
+            });
         }
         this.update_history();
         this.reload_spaces();
@@ -576,6 +580,7 @@ impl Window {
         }
         self.reload_notes();
         self.refresh_link_titles();
+        self.refresh_images(true);
         let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
         if let Some((open_space, note)) = open.filter(|(s, _)| *s == space) {
             self.refresh_open(open_space, note);
@@ -713,6 +718,7 @@ impl Window {
                     Ok(body) => {
                         widget.set_editor(Some(zib_core::editor::Editor::new(body)));
                         widget.set_titles(titles);
+                        w.refresh_images(false);
                     }
                     Err(error) => w.toast(&format!("Couldn't open the note: {error}")),
                 }
@@ -928,6 +934,7 @@ impl Window {
         };
         self.update_title();
         self.refresh_link_titles();
+        self.refresh_images(false);
         if let Some(timer) = self.inner().body_timer.take() {
             timer.remove();
         }
@@ -959,6 +966,28 @@ impl Window {
                 widget.set_titles(titles);
             }
         });
+    }
+
+    /// Shows a local preview first, then replaces it with the original once it arrives.
+    fn refresh_images(&self, reload: bool) {
+        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let (generation, targets) = widget.image_requests(reload);
+        for target in targets {
+            let (widget, state) = (widget.clone(), self.inner().state.clone());
+            glib::spawn_future_local(async move {
+                let preview = core({
+                    let state = state.clone();
+                    async move { state.image_preview(target).await }
+                })
+                .await
+                .and_then(|path| gdk::Texture::from_filename(path).ok());
+                if preview.is_some() {
+                    widget.set_image(generation, target, preview.clone());
+                }
+                let original = embedded_texture(state, target).await;
+                widget.set_image(generation, target, original.or(preview));
+            });
+        }
     }
 
     /// Reports the new editor's edits now if a report waits.
@@ -1062,6 +1091,7 @@ impl Window {
             }
             self.update_title();
             self.refresh_link_titles();
+            self.refresh_images(false);
             return;
         }
         let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
@@ -1201,15 +1231,21 @@ impl Window {
 
     /// Adds files dropped on the editor, and images pasted into it, as notes.
     fn connect_files(&self, view: &sourceview5::View) {
-        let w = self.clone();
-        let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
-        target.connect_drop(move |_, value, _, _| {
-            if let Ok(files) = value.get::<gdk::FileList>() {
-                w.add_files(files.files());
-            }
-            true
-        });
-        view.add_controller(target);
+        let mut widgets: Vec<&gtk::Widget> = vec![view.upcast_ref()];
+        if let Some(widget) = &self.inner().new_editor {
+            widgets.push(widget.upcast_ref());
+        }
+        for widget in widgets {
+            let w = self.clone();
+            let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+            target.connect_drop(move |_, value, _, _| {
+                if let Ok(files) = value.get::<gdk::FileList>() {
+                    w.add_files(files.files());
+                }
+                true
+            });
+            widget.add_controller(target);
+        }
         let w = self.clone();
         view.connect_paste_clipboard(move |view| {
             if w.paste_image() {
@@ -1270,10 +1306,7 @@ impl Window {
             return false;
         };
         let clipboard = self.inner().view.clipboard();
-        let formats = clipboard.formats().union_deserialize_types();
-        if !formats.contains_type(gdk::Texture::static_type())
-            || formats.contains_type(glib::Type::STRING)
-        {
+        if !editor_widget::image_only(clipboard.formats()) {
             return false;
         }
         let buffer = &self.inner().buffer;
@@ -1286,25 +1319,8 @@ impl Window {
         let w = self.clone();
         let state = self.inner().state.clone();
         glib::spawn_future_local(async move {
-            let now = glib::DateTime::now_local().and_then(|t| t.format("%F %H.%M.%S"));
-            let name = now.map_or_else(
-                |_| "Pasted image.png".to_owned(),
-                |now| format!("Pasted image {now}.png"),
-            );
-            let added = match clipboard.read_texture_future().await {
-                Ok(Some(texture)) => {
-                    let bytes = texture.save_to_png_bytes().to_vec();
-                    let (state, name) = (state.clone(), name.clone());
-                    let media = "image/png".to_owned();
-                    core(async move { state.add_bytes(space, bytes, name, media).await })
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-                Ok(None) => Err("the clipboard is empty".to_owned()),
-                Err(error) => Err(error.to_string()),
-            };
-            let note = match added {
-                Ok(note) => note,
+            let (note, name) = match pasted_image(state.clone(), space, clipboard).await {
+                Ok(added) => added,
                 Err(error) => {
                     let buffer = &w.inner().buffer;
                     buffer.delete_mark(&start);
@@ -1330,6 +1346,24 @@ impl Window {
             });
         });
         true
+    }
+
+    fn paste_widget_image(&self, clipboard: gdk::Clipboard, target: PasteTarget) {
+        let Some(space) = self.inner().editor.borrow().as_ref().map(|e| e.space) else { return };
+        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            match pasted_image(state.clone(), space, clipboard).await {
+                Ok((note, _)) => {
+                    widget.insert_image(&target, note);
+                    w.report_body_edited();
+                    w.reload_notes();
+                    let _ = core(async move { state.derive(space).await }).await;
+                }
+                Err(error) => w.toast(&format!("Couldn't paste the image: {error}")),
+            }
+        });
     }
 
     /// Opens the file a `file` or `image` note holds in the desktop's app for it.
@@ -2024,6 +2058,15 @@ async fn draw(state: Arc<State>, drawing: Drawing) -> Option<gtk::Widget> {
 
 /// The picture of an image note, for an embed of it. Embeds of other notes stay links.
 async fn embedded_image(state: Arc<State>, target: Id) -> Option<gtk::Widget> {
+    let texture = embedded_texture(state, target).await?;
+    let picture = gtk::Picture::for_paintable(&texture);
+    picture.set_can_shrink(true);
+    picture.set_size_request(texture.width(), texture.height());
+    Some(picture.upcast())
+}
+
+/// The original image, fetching its blob when this machine doesn't hold it yet.
+async fn embedded_texture(state: Arc<State>, target: Id) -> Option<gdk::Texture> {
     let path = core(async move {
         let space = state.find_note(target).await?;
         if state.note(space, target).await.ok()?.type_name != "image" {
@@ -2033,9 +2076,28 @@ async fn embedded_image(state: Arc<State>, target: Id) -> Option<gtk::Widget> {
         state.blob_path(space, hash).await.ok()
     })
     .await?;
-    let texture = gdk::Texture::from_filename(&path).ok()?;
-    let picture = gtk::Picture::for_paintable(&texture);
-    picture.set_can_shrink(true);
-    picture.set_size_request(texture.width(), texture.height());
-    Some(picture.upcast())
+    gdk::Texture::from_filename(&path).ok()
+}
+
+/// Adds a clipboard image through the same file-note path as the existing editor.
+async fn pasted_image(
+    state: Arc<State>,
+    space: Id,
+    clipboard: gdk::Clipboard,
+) -> Result<(Id, String), String> {
+    let now = glib::DateTime::now_local().and_then(|t| t.format("%F %H.%M.%S"));
+    let name =
+        now.map_or_else(|_| "Pasted image.png".to_owned(), |now| format!("Pasted image {now}.png"));
+    let texture = clipboard
+        .read_texture_future()
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the clipboard is empty".to_owned())?;
+    let bytes = texture.save_to_png_bytes().to_vec();
+    let title = name.clone();
+    let note =
+        core(async move { state.add_bytes(space, bytes, title, "image/png".to_owned()).await })
+            .await
+            .map_err(|error| error.to_string())?;
+    Ok((note, name))
 }

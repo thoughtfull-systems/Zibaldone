@@ -63,6 +63,14 @@ describes:
   activates it.
 - A `note` shows its title.
 
+An editor that lays images out inside its text draws each available picture on the text's baseline,
+at its natural size, shrinking it in proportion when it exceeds the text width. The picture stands
+for the entire source range of the embed. The source shows when the selection touches that range,
+including either edge. The source occupies the same inline position as the picture, on the text's
+baseline. The picture moves up by a text line to make room. The inline position reserves the width
+of whichever is wider, the picture or the source, so following text moves right or wraps when the
+source needs more room. A missing or unreadable picture keeps the link text.
+
 ## Platforms
 
 No platform differs in the types it defines. Which derivations each platform runs is in the

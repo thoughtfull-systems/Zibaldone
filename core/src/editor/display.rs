@@ -66,9 +66,28 @@ pub struct Label {
     pub styles: Vec<Styled>,
 }
 
+/// An available image's natural size in pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// An image that takes one place on the text's baseline, standing for its whole embed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Image {
+    pub range: Range<usize>,
+    pub target: Id,
+    pub size: ImageSize,
+    /// The source shows inline with the picture above it while the selection touches it.
+    pub revealed: bool,
+}
+
 /// How a text looks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Display {
+    /// Available embedded images, in source order. Revealing the source keeps the image in place.
+    pub images: Vec<Image>,
     /// Titles for wikilinks without labels, in source order. These never enter the body.
     pub labels: Vec<Label>,
     /// The looks, with every piece of syntax last, so its dimming wins over the color of what
@@ -102,6 +121,17 @@ pub fn with_titles(
     text: &str,
     selection: &Range<usize>,
     title: &mut dyn FnMut(Id) -> Option<String>,
+) -> Display {
+    with_images(text, selection, title, &mut |_| None)
+}
+
+/// How `text` looks with the titles and available images the app supplies. Missing images keep
+/// their link text, and the source shows when the selection touches an embed.
+pub fn with_images(
+    text: &str,
+    selection: &Range<usize>,
+    title: &mut dyn FnMut(Id) -> Option<String>,
+    image: &mut dyn FnMut(Id) -> Option<ImageSize>,
 ) -> Display {
     let mut display = Display::default();
     let mut syntax = Vec::new();
@@ -168,10 +198,24 @@ pub fn with_titles(
     display.shaded.dedup();
     display.hidden = merged(display.hidden);
     display.pads = list_pads(text);
-    for link in body::wikilinks(text).into_iter().filter(|link| link.label.is_none()) {
+    for link in body::wikilinks(text) {
         let touches =
             |range: &Range<usize>| range.start <= selection.end && selection.start <= range.end;
-        if touches(&link.range) || tables.iter().any(|t| t.contains(&link.range.start)) {
+        if tables.iter().any(|t| t.contains(&link.range.start)) {
+            continue;
+        }
+        if link.embed
+            && let Some(size) = image(link.target).filter(|s| s.width > 0 && s.height > 0)
+        {
+            display.images.push(Image {
+                revealed: touches(&link.range),
+                range: link.range,
+                target: link.target,
+                size,
+            });
+            continue;
+        }
+        if touches(&link.range) || link.label.is_some() {
             continue;
         }
         let markdown = title(link.target).unwrap_or_else(|| link.target.to_string());
@@ -298,6 +342,45 @@ mod tests {
         assert_eq!(display(&text, &(text.len()..text.len())).labels[0].text, id.to_string());
         let shown = with_titles(&text, &(text.len()..text.len()), &mut |_| Some(String::new()));
         assert_eq!(shown.labels[0].text, "Untitled");
+    }
+
+    /// Built-in types: Embeds.
+    #[test]
+    fn images_replace_embeds_with_and_without_captions_but_never_links_or_code() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("![[{id}]] ![[{id}|caption]] [[{id}]] `![[{id}]]`\nend");
+        let size = ImageSize { width: 80, height: 40 };
+        let shown = with_images(
+            &text,
+            &(text.len()..text.len()),
+            &mut |_| Some("Title".into()),
+            &mut |_| Some(size),
+        );
+        assert_eq!(shown.images.len(), 2);
+        assert_eq!(shown.images[0], Image { range: 0..31, target: id, size, revealed: false });
+        assert_eq!(&text[shown.images[1].range.clone()], format!("![[{id}|caption]]"));
+        assert_eq!(shown.labels.len(), 1);
+        for at in [0, 5, 31] {
+            let shown = with_images(&text, &(at..at), &mut |_| None, &mut |_| Some(size));
+            assert_eq!(shown.images.len(), 2);
+            assert!(shown.images[0].revealed);
+            assert!(!shown.images[1].revealed);
+        }
+        let missing = with_images(
+            &text,
+            &(text.len()..text.len()),
+            &mut |_| Some("Title".into()),
+            &mut |_| None,
+        );
+        assert_eq!(missing.images, Vec::<Image>::new());
+        assert_eq!(missing.labels.len(), 2);
+        assert_eq!(
+            with_images(&text, &(text.len()..text.len()), &mut |_| None, &mut |_| Some(
+                ImageSize { width: 0, height: 40 }
+            ))
+            .images,
+            Vec::<Image>::new()
+        );
     }
 
     /// The looks of `text`, each with the text it covers.

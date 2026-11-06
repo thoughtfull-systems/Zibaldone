@@ -6,7 +6,7 @@
 //! It shows a note while `ZIB_EDITOR=new` is set in the development build, until it does
 //! everything the text view does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use adw::prelude::*;
@@ -14,8 +14,8 @@ use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
 use zib_core::Id;
 use zib_core::editing::{LinkTarget, link_at};
-use zib_core::editor::display::{Display, Look, Shape};
-use zib_core::editor::{Direction, Editor, ListKey, Unit};
+use zib_core::editor::display::{Display, ImageSize, Look, Shape};
+use zib_core::editor::{Direction, EditTarget, Editor, ListKey, Unit};
 
 /// Space around the text, in pixels, as the text view has.
 const MARGIN_SIDES: f64 = 24.0;
@@ -25,6 +25,8 @@ const MARGIN_BOTTOM: f64 = 24.0;
 const CARET: f32 = 1.5;
 /// The space above a heading, in pixels.
 const HEADING_SPACE: f64 = 6.0;
+/// Room between a revealed image's bottom and its source text.
+const IMAGE_SOURCE_GAP: f64 = 4.0;
 /// The colors of syntax, links, highlights, and the shade behind code, as red, green, blue, and
 /// alpha, as the text view has them.
 const SYNTAX: (f64, f64, f64, f64) = (0.5, 0.5, 0.5, 0.9);
@@ -55,6 +57,39 @@ pub struct Line {
     left: f64,
     /// The bullets and task boxes drawn over its text.
     markers: Vec<(Range<usize>, Shape)>,
+    images: Vec<InlineImage>,
+    backgrounds: Vec<Background>,
+}
+
+/// A background behind glyphs, which doesn't grow to the height of a neighboring image.
+struct Background {
+    range: Range<usize>,
+    color: (f64, f64, f64, f64),
+}
+
+/// An image's source, layout index, texture, and displayed size.
+struct InlineImage {
+    source: usize,
+    index: usize,
+    texture: gdk::Texture,
+    width: f64,
+    height: f64,
+    end: usize,
+    source_layout: Option<pango::Layout>,
+}
+
+/// What a run draws in place of its source.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Content {
+    Source,
+    Label,
+    Image(Id),
+}
+
+/// Where an image paste started, including which open editor it belongs to.
+pub struct PasteTarget {
+    session: u64,
+    selection: EditTarget,
 }
 
 /// A run's source and layout offsets and lengths, in bytes. A title maps every glyph back to
@@ -65,7 +100,7 @@ struct Piece {
     shown: usize,
     len: usize,
     source_len: usize,
-    label: bool,
+    content: Content,
 }
 
 impl Line {
@@ -81,7 +116,11 @@ impl Line {
         for piece in &self.pieces {
             if shown < piece.shown + piece.len {
                 return piece.source
-                    + if piece.label { 0 } else { shown.saturating_sub(piece.shown) };
+                    + if piece.content == Content::Source {
+                        shown.saturating_sub(piece.shown)
+                    } else {
+                        0
+                    };
             }
         }
         self.pieces.last().map_or(self.start, |piece| piece.source + piece.source_len)
@@ -93,10 +132,10 @@ impl Line {
         for piece in self.pieces.iter().rev() {
             if shown > piece.shown {
                 return piece.source
-                    + if piece.label {
-                        piece.source_len
-                    } else {
+                    + if piece.content == Content::Source {
                         shown.saturating_sub(piece.shown).min(piece.len)
+                    } else {
+                        piece.source_len
                     };
             }
         }
@@ -112,14 +151,23 @@ mod imp {
     use gtk::subclass::prelude::*;
     use zib_core::editor::{Editor, Unit};
 
-    use super::{Line, LinkTarget};
+    use super::{HashMap, HashSet, Line, LinkTarget, PasteTarget};
 
     type Callback<T> = RefCell<Option<Box<dyn Fn(T)>>>;
 
     #[derive(Default)]
     pub struct EditorWidget {
         pub editor: RefCell<Option<Editor>>,
+        pub images: RefCell<HashMap<zib_core::Id, gtk::gdk::Texture>>,
+        pub asked_images: RefCell<HashSet<zib_core::Id>>,
+        pub image_generation: Cell<u64>,
+        pub session: Cell<u64>,
+        pub paste_image: Callback<(gtk::gdk::Clipboard, PasteTarget)>,
         pub lines: RefCell<Vec<Line>>,
+        /// Space at the document's edges lets a disappearing drawing leave the caret in place
+        /// even when scrolling alone would hit the start or end of the document.
+        pub bottom_space: Cell<f64>,
+        pub top_space: Cell<f64>,
         /// The width the lines last laid out at.
         pub laid_width: Cell<i32>,
         pub im: RefCell<Option<gtk::IMMulticontext>>,
@@ -193,8 +241,15 @@ impl Default for EditorWidget {
 impl EditorWidget {
     /// Shows `editor`'s text, or nothing.
     pub fn set_editor(&self, editor: Option<Editor>) {
-        *self.imp().editor.borrow_mut() = editor;
-        self.relayout();
+        let imp = self.imp();
+        imp.session.set(imp.session.get().wrapping_add(1));
+        imp.image_generation.set(imp.image_generation.get().wrapping_add(1));
+        imp.asked_images.borrow_mut().clear();
+        imp.images.borrow_mut().clear();
+        imp.bottom_space.set(0.0);
+        imp.top_space.set(0.0);
+        *imp.editor.borrow_mut() = editor;
+        self.rebuild_layout();
     }
 
     /// Calls `f` after each edit the owner makes.
@@ -221,6 +276,64 @@ impl EditorWidget {
         self.edit(|e| {
             e.insert_link(range, expected, target);
         });
+    }
+
+    pub fn connect_paste_image(&self, f: impl Fn(gdk::Clipboard, PasteTarget) + 'static) {
+        *self.imp().paste_image.borrow_mut() = Some(Box::new(move |(clipboard, target)| {
+            f(clipboard, target);
+        }));
+    }
+
+    /// Images not yet requested for this note, or every embed after a space changes.
+    pub fn image_requests(&self, reload: bool) -> (u64, Vec<Id>) {
+        let imp = self.imp();
+        if reload {
+            imp.image_generation.set(imp.image_generation.get().wrapping_add(1));
+            imp.asked_images.borrow_mut().clear();
+        }
+        let targets = imp.editor.borrow().as_ref().map(Editor::image_targets).unwrap_or_default();
+        let mut asked = imp.asked_images.borrow_mut();
+        (imp.image_generation.get(), targets.into_iter().filter(|id| asked.insert(*id)).collect())
+    }
+
+    /// Shows an asynchronously loaded image only in the editor that requested it.
+    pub fn set_image(&self, generation: u64, target: Id, texture: Option<gdk::Texture>) {
+        let imp = self.imp();
+        if generation != imp.image_generation.get() {
+            return;
+        }
+        let mut images = imp.images.borrow_mut();
+        if let Some(texture) = texture {
+            images.insert(target, texture);
+        } else {
+            images.remove(&target);
+        }
+        if let Some(editor) = imp.editor.borrow_mut().as_mut() {
+            editor.set_images(
+                images
+                    .iter()
+                    .map(|(id, texture)| {
+                        (
+                            *id,
+                            ImageSize {
+                                width: u32::try_from(texture.width()).unwrap_or(0),
+                                height: u32::try_from(texture.height()).unwrap_or(0),
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        drop(images);
+        self.relayout();
+    }
+
+    pub fn insert_image(&self, target: &PasteTarget, image: Id) {
+        if target.session == self.imp().session.get() {
+            self.edit(|e| {
+                e.insert_image(&target.selection, image);
+            });
+        }
     }
 
     /// The caret rectangle that anchors the link picker.
@@ -368,7 +481,7 @@ impl EditorWidget {
             let wrap = (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0);
             let column = monospace_width(self.upcast_ref());
             let mut lines = Vec::new();
-            let mut y = MARGIN_TOP;
+            let mut y = MARGIN_TOP + imp.top_space.get();
             let mut start = 0;
             for line in text.split('\n') {
                 let end = start + line.len();
@@ -380,37 +493,10 @@ impl EditorWidget {
                 layout.set_width(units((wrap - pad).max(1.0)));
                 layout.set_wrap(pango::WrapMode::WordChar);
                 let attributes = pango::AttrList::new();
-                let mut heading = false;
-                for styled in &shown.styles {
-                    if styled.range.start >= end.max(start + 1) || styled.range.end <= start {
-                        continue;
-                    }
-                    heading |= matches!(styled.look, Look::Heading(_));
-                    for piece in &pieces {
-                        if piece.label && styled.look == Look::Syntax {
-                            continue;
-                        }
-                        let from = styled.range.start.max(piece.source);
-                        let to = styled.range.end.min(piece.source + piece.source_len);
-                        if from >= to {
-                            continue;
-                        }
-                        let index = |at: usize| {
-                            let offset = if piece.label {
-                                if at == from { 0 } else { piece.len }
-                            } else {
-                                at - piece.source
-                            };
-                            u32::try_from(piece.shown + offset)
-                        };
-                        for mut attribute in attributes_of(styled.look, dark) {
-                            attribute.set_start_index(index(from).unwrap_or(0));
-                            attribute.set_end_index(index(to).unwrap_or(u32::MAX));
-                            attributes.insert(attribute);
-                        }
-                    }
-                }
-                style_labels(&attributes, &pieces, &shown, dark);
+                let mut backgrounds = Vec::new();
+                let heading =
+                    style_source(&attributes, &pieces, &shown, start..end, dark, &mut backgrounds);
+                style_labels(&attributes, &pieces, &shown, dark, &mut backgrounds);
                 // The text under a bullet or a box stays, unseen, to keep its room.
                 let markers: Vec<(Range<usize>, Shape)> = shown
                     .markers
@@ -428,6 +514,15 @@ impl EditorWidget {
                         attributes.insert(attribute);
                     }
                 }
+                let images = shape_images(
+                    &layout,
+                    text,
+                    &attributes,
+                    &pieces,
+                    &shown,
+                    &imp.images.borrow(),
+                    wrap - pad,
+                );
                 layout.set_attributes(Some(&attributes));
                 if heading {
                     y += HEADING_SPACE;
@@ -435,7 +530,19 @@ impl EditorWidget {
                 let shaded = shown.shaded.iter().any(|shaded| shaded.start == start);
                 let height = pixels(layout.size().1);
                 let left = MARGIN_SIDES + pad;
-                lines.push(Line { start, end, pieces, layout, y, height, shaded, left, markers });
+                lines.push(Line {
+                    start,
+                    end,
+                    pieces,
+                    layout,
+                    y,
+                    height,
+                    shaded,
+                    left,
+                    markers,
+                    images,
+                    backgrounds,
+                });
                 y += height;
                 start = end + 1;
             }
@@ -444,12 +551,69 @@ impl EditorWidget {
         let lines = imp.lines.borrow();
         let bottom = lines.last().map_or(MARGIN_TOP, |line| line.y + line.height);
         #[allow(clippy::cast_possible_truncation)]
-        let height = (bottom + MARGIN_BOTTOM).ceil() as i32;
+        let height = (bottom + MARGIN_BOTTOM + imp.bottom_space.get()).ceil() as i32;
         height
     }
 
-    /// Lays the lines out again after the text changed, and redraws.
+    /// Keeps the text's baseline at the selection in place while an image rises above its source.
+    /// Changes elsewhere above the selection keep the view focused on the same text too.
     fn relayout(&self) {
+        let scrolled = self
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_then(|s| s.downcast::<gtk::ScrolledWindow>().ok());
+        let anchor = self.head().and_then(|head| {
+            let lines = self.imp().lines.borrow();
+            let line = line_at(&lines, head)?;
+            // Following words may wrap while source is open. Keep the image's baseline as the
+            // anchor when leaving it, rather than anchoring those words on a different row.
+            let at = if line.images.iter().any(|image| image.source <= head && head <= image.end) {
+                head
+            } else {
+                line.images
+                    .iter()
+                    .find(|image| image.source_layout.is_some())
+                    .map_or(head, |image| image.source)
+            };
+            let y = paragraph_baseline(&lines, at)?;
+            Some((at, y - scrolled.as_ref()?.vadjustment().value()))
+        });
+        self.rebuild_layout();
+        let caret = anchor.and_then(|(head, screen_y)| {
+            paragraph_baseline(&self.imp().lines.borrow(), head).map(|y| (y, screen_y))
+        });
+        if let (Some(scrolled), Some((y, screen_y))) = (scrolled, caret) {
+            self.restore_view(&scrolled, y - screen_y);
+        }
+    }
+
+    /// Scrolling cannot go before the start of a note. Move its origin when necessary, so a
+    /// collapsed image moves earlier content down instead of pulling the caret up. Undo and
+    /// restored images reclaim that space. The same rule keeps the view stable near the end.
+    fn restore_view(&self, scrolled: &gtk::ScrolledWindow, requested: f64) {
+        let imp = self.imp();
+        let adjustment = scrolled.vadjustment();
+        let previous = imp.top_space.get();
+        let space = (previous - requested).max(0.0);
+        let shift = space - previous;
+        imp.top_space.set(space);
+        for line in imp.lines.borrow_mut().iter_mut() {
+            line.y += shift;
+        }
+        let target = (requested + shift).max(0.0);
+        let bottom = imp.lines.borrow().last().map_or(MARGIN_TOP + space, |l| l.y + l.height);
+        let height = bottom + MARGIN_BOTTOM;
+        let bottom_space =
+            if target > 0.0 { (target + adjustment.page_size() - height).max(0.0) } else { 0.0 };
+        imp.bottom_space.set(bottom_space);
+        adjustment.set_upper((height + imp.bottom_space.get()).max(adjustment.page_size()));
+        adjustment.set_value(target);
+        self.queue_resize();
+        self.queue_draw();
+        self.update_im_cursor();
+    }
+
+    /// Lays the lines out again after the text changed, and redraws.
+    fn rebuild_layout(&self) {
         self.imp().lines.borrow_mut().clear();
         // At once, not at GTK's next layout, so a key that comes before then, such as a held
         // arrow key, finds the lines where they are.
@@ -482,7 +646,12 @@ impl EditorWidget {
             snapshot.translate(&graphene::Point::new(line.left as f32, line.y as f32));
             let end = line.end;
             // The line break after a line counts as selected with it.
-            if selected.start <= end && line.start < selected.end {
+            let source_only = line.images.iter().any(|image| {
+                image.source_layout.is_some()
+                    && image.source <= selected.start
+                    && selected.end <= image.end
+            });
+            if !source_only && selected.start <= end && line.start < selected.end {
                 let from = line.shown(selected.start.max(line.start));
                 let to = line.shown(selected.end.min(end));
                 let reaches_break = selected.end > end;
@@ -490,7 +659,22 @@ impl EditorWidget {
                     snapshot.append_color(&highlight, &rect);
                 }
             }
+            for background in &line.backgrounds {
+                let (r, g, b, a) = background.color;
+                let color = gdk::RGBA::new(r as f32, g as f32, b as f32, a as f32);
+                for rect in run_rects(&line.layout, &background.range) {
+                    snapshot.append_color(&color, &rect);
+                }
+            }
             snapshot.append_layout(&line.layout, &color);
+            for image in &line.images {
+                let rect = image_rect(line, image);
+                snapshot.append_texture(&image.texture, &rect);
+                if selected.start <= image.source && image.end <= selected.end {
+                    snapshot.append_color(&highlight, &rect);
+                }
+                draw_image_source(snapshot, line, image, &selected, &highlight, &color);
+            }
             for (range, shape) in &line.markers {
                 draw_marker(snapshot, line, range, *shape, &color);
             }
@@ -525,21 +709,70 @@ impl EditorWidget {
         })
     }
 
+    /// Images map every point of their box to the start of their embed's source.
+    fn image_at(&self, x: f64, y: f64) -> Option<usize> {
+        #[allow(clippy::cast_possible_truncation)]
+        let point = graphene::Point::new(x as f32, y as f32);
+        self.imp().lines.borrow().iter().find_map(|line| {
+            line.images.iter().find_map(|image| {
+                #[allow(clippy::cast_possible_truncation)]
+                let rect = image_rect(line, image).offset_r(line.left as f32, line.y as f32);
+                rect.contains_point(&point).then_some(image.source)
+            })
+        })
+    }
+
+    /// The editable source within an image atom, as both its byte offset and its embed's start.
+    fn source_position(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        #[allow(clippy::cast_possible_truncation)]
+        let point = graphene::Point::new(x as f32, y as f32);
+        self.imp().lines.borrow().iter().find_map(|line| {
+            line.images.iter().find_map(|image| {
+                let layout = image.source_layout.as_ref()?;
+                let rect = source_rect(line, image)?;
+                #[allow(clippy::cast_possible_truncation)]
+                let area = rect.offset_r(line.left as f32, line.y as f32);
+                if !area.contains_point(&point) {
+                    return None;
+                }
+                let (_, at) =
+                    layout_position(layout, x - f64::from(area.x()), y - f64::from(area.y()));
+                Some((image.source + at, image.source))
+            })
+        })
+    }
+
     /// The link under an actual glyph, including any part of a drawn title.
     fn link_at(&self, x: f64, y: f64) -> Option<LinkTarget> {
+        let target =
+            self.source_position(x, y).map(|(_, start)| start).or_else(|| self.image_at(x, y));
+        if let Some(at) = target {
+            let editor = self.imp().editor.borrow();
+            return link_at(editor.as_ref()?.text(), at);
+        }
         let lines = self.imp().lines.borrow();
         let line = lines.iter().find(|l| l.y <= y && y < l.y + l.height)?;
         let (inside, index, _) = line.layout.xy_to_index(units(x - line.left), units(y - line.y));
         if !inside {
             return None;
         }
-        let at = line.source(usize::try_from(index).ok()?);
+        let index = usize::try_from(index).ok()?;
+        if line.images.iter().any(|image| image.index <= index && index < image.index + 3) {
+            return None;
+        }
+        let at = line.source(index);
         let editor = self.imp().editor.borrow();
         link_at(editor.as_ref()?.text(), at)
     }
 
     /// The place in the text nearest a point in the widget.
     fn position_at(&self, x: f64, y: f64) -> usize {
+        if let Some((at, _)) = self.source_position(x, y) {
+            return at;
+        }
+        if let Some(at) = self.image_at(x, y) {
+            return at;
+        }
         let lines = self.imp().lines.borrow();
         // A point in the space above a heading belongs to the line before it, so a move up from
         // the heading's first row reaches that line. Above the first line, it's the first line.
@@ -564,58 +797,95 @@ impl EditorWidget {
     /// the first or last line.
     fn vertical(&self, at: usize, goal: f64, down: bool) -> Option<usize> {
         let lines = self.imp().lines.borrow();
-        // Past the edge of the row the cursor is on, which can be taller than the cursor, as on a
-        // list item, whose monospace prefix is shorter than its text.
-        let (y, height) = row_extents(&lines, at)?;
-        let mut target = if down { y + height + 1.0 } else { y - 1.0 };
-        let last = lines.last()?;
-        if target < MARGIN_TOP || target >= last.y + last.height {
-            return None;
-        }
-        // A move that leaves its line goes past the space above a heading, to the next line's
-        // first row or the last row of the line before.
-        let index = lines.iter().rposition(|line| line.start <= at)?;
-        let current = &lines[index];
-        if down && target >= current.y + current.height {
-            if let Some(next) = lines.get(index + 1) {
-                target = target.max(next.y);
+        let (current_y, height) = row_extents(&lines, at)?;
+        let mut candidates = Vec::new();
+        for line in lines.iter() {
+            let mut layouts = vec![(&line.layout, line.y)];
+            for image in &line.images {
+                if let (Some(layout), Some(rect)) = (&image.source_layout, source_rect(line, image))
+                {
+                    layouts.push((layout, line.y + f64::from(rect.y())));
+                }
             }
-        } else if !down
-            && target < current.y
-            && let Some(before) = index.checked_sub(1).and_then(|i| lines.get(i))
-        {
-            target = target.min(before.y + before.height - 1.0);
+            for (layout, y) in layouts {
+                let mut rows = layout.iter();
+                loop {
+                    let (_, logical) = rows.line_extents();
+                    let top = y + pixels(logical.y());
+                    let bottom = top + pixels(logical.height());
+                    if (down && top >= current_y + height - 0.01)
+                        || (!down && bottom <= current_y + 0.01)
+                    {
+                        candidates.push((top, f64::midpoint(top, bottom)));
+                    }
+                    if !rows.next_line() {
+                        break;
+                    }
+                }
+            }
         }
-        drop(lines);
-        Some(self.position_at(goal, target))
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if !down {
+            candidates.reverse();
+        }
+        for (top, center) in candidates {
+            let next = self.position_at(goal, center);
+            // An image points into its source row below. Skip that non-editable row when moving
+            // out of the source, rather than landing in the source again.
+            if row_extents(&lines, next).is_some_and(|(y, _)| (y - top).abs() < 0.01) {
+                return Some(next);
+            }
+        }
+        None
     }
 
     /// The start or end of the visual line that `at` lies on, as the text wraps.
     fn visual_line_edge(&self, at: usize, end: bool) -> usize {
         let lines = self.imp().lines.borrow();
-        let Some(line) = lines.iter().rev().find(|line| line.start <= at) else { return at };
-        let local = i32::try_from(line.shown(at)).unwrap_or(0);
-        let (number, _) = line.layout.index_to_line_x(local, false);
-        let Some(row) = line.layout.line_readonly(number) else { return at };
-        let start = usize::try_from(row.start_index()).unwrap_or(0);
-        let mut edge = start + usize::try_from(row.length()).unwrap_or(0);
-        let text = line.layout.text();
-        // A row that wraps ends with the space it broke at, and the end goes before it.
-        if edge < text.len() && text[..edge].ends_with(' ') {
-            edge -= 1;
+        let Some(line) = line_at(&lines, at) else { return at };
+        if let Some(image) = source_image(line, at) {
+            let layout = image.source_layout.as_ref().expect("revealed source");
+            return image.source + visual_edge(layout, at - image.source, end);
         }
-        if end && edge > start { line.source_after(edge) } else { line.source(start) }
+        let edge = visual_edge(&line.layout, line.shown(at), end);
+        if end { line.source_after(edge) } else { line.source(edge) }
     }
 
     /// Runs `f` on the editor, and lays out, redraws, and reports the edit after.
     fn edit(&self, f: impl FnOnce(&mut Editor)) {
         let Some(mut editor) = self.imp().editor.borrow_mut().take() else { return };
         let before = editor.text().to_owned();
+        let head = editor.selection().head;
+        let images = images_through(&self.imp().lines.borrow(), head);
+        let viewport = self
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_then(|s| s.downcast::<gtk::ScrolledWindow>().ok());
+        let anchor = viewport.as_ref().and_then(|scrolled| {
+            let (_, y, height) = caret_rect(&self.imp().lines.borrow(), head)?;
+            let adjustment = scrolled.vadjustment();
+            (y >= adjustment.value() && y + height <= adjustment.value() + adjustment.page_size())
+                .then_some(y - adjustment.value())
+        });
         f(&mut editor);
         let changed = before != editor.text();
         *self.imp().editor.borrow_mut() = Some(editor);
         // What hides depends on the selection, so a move can change the layout too.
-        self.relayout();
+        if changed {
+            self.rebuild_layout();
+            let after = self.head().map(|head| {
+                let lines = self.imp().lines.borrow();
+                (images_through(&lines, head), caret_rect(&lines, head))
+            });
+            if let (Some(scrolled), Some(screen_y)) = (viewport, anchor)
+                && !self.imp().keep_view.get()
+                && let Some((after_images, Some((_, y, _)))) = after
+                && images != after_images
+            {
+                self.restore_view(&scrolled, y - screen_y);
+            }
+        } else {
+            self.relayout();
+        }
         if changed && let Some(edited) = self.imp().edited.borrow().as_ref() {
             edited();
         }
@@ -788,6 +1058,18 @@ impl EditorWidget {
     }
 
     fn paste(&self, clipboard: &gdk::Clipboard) {
+        if image_only(clipboard.formats()) {
+            let target = self.imp().editor.borrow().as_ref().map(|editor| PasteTarget {
+                session: self.imp().session.get(),
+                selection: editor.edit_target(),
+            });
+            if let Some(target) = target
+                && let Some(paste) = self.imp().paste_image.borrow().as_ref()
+            {
+                paste((clipboard.clone(), target));
+                return;
+            }
+        }
         let w = self.clone();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |text| {
             if let Ok(Some(text)) = text {
@@ -877,7 +1159,8 @@ impl EditorWidget {
 }
 
 /// The rectangles of the selected bytes `from` to `to` of a laid out line, in its coordinates,
-/// reaching past the line's end when the selection goes on past its line break.
+/// reaching past the line's end when the selection goes on past its line break. Each rectangle
+/// uses the full row height so neighboring font runs and selected lines have no gaps.
 fn selection_rects(
     layout: &pango::Layout,
     from: usize,
@@ -941,12 +1224,133 @@ fn pixels(units: i32) -> f64 {
     f64::from(units) / f64::from(pango::SCALE)
 }
 
+/// The source paragraph that holds an offset.
+fn line_at(lines: &[Line], at: usize) -> Option<&Line> {
+    lines.iter().rev().find(|line| line.start <= at)
+}
+
+/// Images determine the height of earlier paragraphs and of the entire paragraph at the caret.
+/// Source offsets can change during ordinary typing without changing which pictures are there.
+fn images_through(lines: &[Line], at: usize) -> Vec<gdk::Texture> {
+    lines
+        .iter()
+        .take_while(|line| line.start <= at)
+        .flat_map(|line| line.images.iter().map(|image| image.texture.clone()))
+        .collect()
+}
+
+fn source_image(line: &Line, at: usize) -> Option<&InlineImage> {
+    line.images
+        .iter()
+        .find(|image| image.source_layout.is_some() && image.source <= at && at <= image.end)
+}
+
 /// The caret's left edge, top, and height at `at`, in the widget's coordinates.
 fn caret_rect(lines: &[Line], at: usize) -> Option<(f64, f64, f64)> {
-    let line = lines.iter().rev().find(|line| line.start <= at)?;
-    let local = i32::try_from(line.shown(at)).ok()?;
-    let (strong, _) = line.layout.cursor_pos(local);
-    Some((line.left + pixels(strong.x()), line.y + pixels(strong.y()), pixels(strong.height())))
+    let line = line_at(lines, at)?;
+    let (layout, at, left, top) = if let Some(image) = source_image(line, at) {
+        let rect = source_rect(line, image)?;
+        (
+            image.source_layout.as_ref()?,
+            at - image.source,
+            line.left + f64::from(rect.x()),
+            line.y + f64::from(rect.y()),
+        )
+    } else {
+        (&line.layout, line.shown(at), line.left, line.y)
+    };
+    let (strong, _) = layout.cursor_pos(i32::try_from(at).ok()?);
+    Some((left + pixels(strong.x()), top + pixels(strong.y()), pixels(strong.height())))
+}
+
+/// Anchor the text baseline, rather than the top of an image or a source font's caret rectangle.
+fn paragraph_baseline(lines: &[Line], at: usize) -> Option<f64> {
+    let line = line_at(lines, at)?;
+    let local = line
+        .images
+        .iter()
+        .find(|image| image.source <= at && at <= image.end)
+        .map_or_else(|| line.shown(at), |image| image.index);
+    Some(line.y + pixels(baseline_at(&line.layout, local)))
+}
+
+fn baseline_at(layout: &pango::Layout, at: usize) -> i32 {
+    let (row, _) = layout.index_to_line_x(i32::try_from(at).unwrap_or(0), false);
+    let mut rows = layout.iter();
+    for _ in 0..row {
+        if !rows.next_line() {
+            break;
+        }
+    }
+    rows.baseline()
+}
+
+fn visual_edge(layout: &pango::Layout, at: usize, end: bool) -> usize {
+    let (number, _) = layout.index_to_line_x(i32::try_from(at).unwrap_or(0), false);
+    let Some(row) = layout.line_readonly(number) else { return at };
+    let start = usize::try_from(row.start_index()).unwrap_or(0);
+    let mut edge = start + usize::try_from(row.length()).unwrap_or(0);
+    let text = layout.text();
+    if edge < text.len() && text[..edge].ends_with(' ') {
+        edge -= 1;
+    }
+    if end { edge } else { start }
+}
+
+fn layout_position(layout: &pango::Layout, x: f64, y: f64) -> (bool, usize) {
+    let (inside, index, trailing) = layout.xy_to_index(units(x), units(y));
+    let index = usize::try_from(index).unwrap_or(0);
+    let text = layout.text();
+    let after = text[index..]
+        .char_indices()
+        .nth(usize::try_from(trailing).unwrap_or(0))
+        .map_or(text.len(), |(at, _)| index + at);
+    (inside, after)
+}
+
+fn add_background(backgrounds: &mut Vec<Background>, look: Look, range: Range<usize>) {
+    let color = match look {
+        Look::Code => SHADE,
+        Look::Highlight => HIGHLIGHT,
+        _ => return,
+    };
+    backgrounds.push(Background { range, color });
+}
+
+/// The rectangles behind each run's selected bytes, at the run's height. Pango's row extents
+/// include neighboring image shapes, which would stretch text backgrounds.
+fn run_rects(layout: &pango::Layout, range: &Range<usize>) -> Vec<graphene::Rect> {
+    let mut rects = Vec::new();
+    let mut runs = layout.iter();
+    loop {
+        if let Some(run) = runs.run_readonly() {
+            let item = run.item();
+            let start = usize::try_from(item.offset()).unwrap_or(0).max(range.start);
+            let end = usize::try_from(item.offset() + item.length()).unwrap_or(0).min(range.end);
+            if start < end {
+                let (_, logical) = runs.run_extents();
+                if let Some(row) = runs.line_readonly() {
+                    let edges = row.x_ranges(
+                        i32::try_from(start).unwrap_or(0),
+                        i32::try_from(end).unwrap_or(0),
+                    );
+                    for pair in edges.as_chunks::<2>().0 {
+                        #[allow(clippy::cast_possible_truncation)]
+                        rects.push(graphene::Rect::new(
+                            pixels(pair[0]) as f32,
+                            pixels(logical.y()) as f32,
+                            pixels(pair[1] - pair[0]) as f32,
+                            pixels(logical.height()) as f32,
+                        ));
+                    }
+                }
+            }
+        }
+        if !runs.next_run() {
+            break;
+        }
+    }
+    rects
 }
 
 /// The Pango attributes that give text `look`, in the light or `dark` style.
@@ -975,13 +1379,8 @@ fn attributes_of(look: Look, dark: bool) -> Vec<pango::Attribute> {
         Look::Strong => vec![pango::AttrInt::new_weight(pango::Weight::Bold).upcast()],
         Look::Strikethrough => vec![pango::AttrInt::new_strikethrough(true).upcast()],
         Look::Underline => vec![pango::AttrInt::new_underline(pango::Underline::Single).upcast()],
-        Look::Highlight => background(HIGHLIGHT),
-        Look::Code => {
-            let mut attributes = vec![monospace()];
-            attributes.extend(background(SHADE));
-            attributes
-        }
-        Look::Monospace => vec![monospace()],
+        Look::Highlight => Vec::new(),
+        Look::Code | Look::Monospace => vec![monospace()],
         Look::Link => {
             let mut attributes =
                 vec![pango::AttrInt::new_underline(pango::Underline::Single).upcast()];
@@ -1015,17 +1414,210 @@ fn foreground(rgba: (f64, f64, f64, f64)) -> Vec<pango::Attribute> {
     color(rgba, pango::AttrColor::new_foreground, pango::AttrInt::new_foreground_alpha)
 }
 
-fn background(rgba: (f64, f64, f64, f64)) -> Vec<pango::Attribute> {
-    color(rgba, pango::AttrColor::new_background, pango::AttrInt::new_background_alpha)
+/// Whether a clipboard offers an image without text, as the existing editor prefers text.
+pub fn image_only(formats: gdk::ContentFormats) -> bool {
+    let formats = formats.union_deserialize_types();
+    formats.contains_type(gdk::Texture::static_type()) && !formats.contains_type(glib::Type::STRING)
+}
+
+/// Reserves each image's size, scaled down to the text width, above the text's baseline.
+fn shape_images(
+    layout: &pango::Layout,
+    text: &str,
+    attributes: &pango::AttrList,
+    pieces: &[Piece],
+    display: &Display,
+    textures: &HashMap<Id, gdk::Texture>,
+    available: f64,
+) -> Vec<InlineImage> {
+    let mut images: Vec<InlineImage> = pieces
+        .iter()
+        .filter_map(|piece| {
+            let Content::Image(target) = piece.content else { return None };
+            let texture = textures.get(&target)?.clone();
+            let scale = (available.max(1.0) / f64::from(texture.width())).min(1.0);
+            Some(InlineImage {
+                source: piece.source,
+                index: piece.shown,
+                width: f64::from(texture.width()) * scale,
+                height: f64::from(texture.height()) * scale,
+                end: piece.source + piece.source_len,
+                texture,
+                source_layout: None,
+            })
+        })
+        .collect();
+    for image in &images {
+        apply_image_shape(attributes, image);
+    }
+    // Each image starts where the preceding text and images put it. Resolve sources from left
+    // to right, so each one can use the remaining width without moving the next one off the edge.
+    layout.set_attributes(attributes.copy().as_ref());
+    for image in &mut images {
+        if !display.images.iter().any(|found| found.range.start == image.source && found.revealed) {
+            continue;
+        }
+        let (_, x) = layout.index_to_line_x(i32::try_from(image.index).unwrap_or(0), false);
+        let remaining = (available - pixels(x)).max(image.width);
+        let source = pango::Layout::new(&layout.context());
+        source.set_text(&text[image.source..image.end]);
+        let source_style = pango::AttrList::new();
+        for attribute in attributes_of(Look::Monospace, false)
+            .into_iter()
+            .chain(attributes_of(Look::Syntax, false))
+        {
+            source_style.insert(attribute);
+        }
+        source.set_attributes(Some(&source_style));
+        let natural = source.size().0;
+        source.set_width(natural.min(units(remaining.max(1.0))));
+        source.set_wrap(pango::WrapMode::WordChar);
+        image.source_layout = Some(source);
+        apply_image_shape(attributes, image);
+        layout.set_attributes(attributes.copy().as_ref());
+    }
+    images
+}
+
+fn apply_image_shape(attributes: &pango::AttrList, image: &InlineImage) {
+    let (raised, below, reserved) =
+        image.source_layout.as_ref().map_or((0.0, 0.0, image.width), |layout| {
+            let (width, height) = layout.size();
+            let baseline = pixels(layout.baseline());
+            (baseline + IMAGE_SOURCE_GAP, pixels(height) - baseline, image.width.max(pixels(width)))
+        });
+    let rect = pango::Rectangle::new(
+        0,
+        -units(image.height + raised),
+        units(reserved),
+        units(image.height + raised + below),
+    );
+    let mut shape = pango::AttrShape::new(&rect, &rect);
+    shape.set_start_index(u32::try_from(image.index).unwrap_or(0));
+    shape.set_end_index(u32::try_from(image.index + 3).unwrap_or(u32::MAX));
+    attributes.change(shape);
+}
+
+/// The picture rises above its inline source, whose first baseline follows the paragraph's text.
+fn image_rect(line: &Line, image: &InlineImage) -> graphene::Rect {
+    let (_, x) = line.layout.index_to_line_x(i32::try_from(image.index).unwrap_or(0), false);
+    let raised = image
+        .source_layout
+        .as_ref()
+        .map_or(0.0, |source| pixels(source.baseline()) + IMAGE_SOURCE_GAP);
+    #[allow(clippy::cast_possible_truncation)]
+    graphene::Rect::new(
+        pixels(x) as f32,
+        (pixels(baseline_at(&line.layout, image.index)) - image.height - raised) as f32,
+        image.width as f32,
+        image.height as f32,
+    )
+}
+
+fn source_rect(line: &Line, image: &InlineImage) -> Option<graphene::Rect> {
+    let source = image.source_layout.as_ref()?;
+    let picture = image_rect(line, image);
+    let (width, height) = source.size();
+    #[allow(clippy::cast_possible_truncation)]
+    Some(graphene::Rect::new(
+        picture.x(),
+        (pixels(baseline_at(&line.layout, image.index)) - pixels(source.baseline())) as f32,
+        pixels(width) as f32,
+        pixels(height) as f32,
+    ))
+}
+
+fn draw_image_source(
+    snapshot: &gtk::Snapshot,
+    line: &Line,
+    image: &InlineImage,
+    selection: &Range<usize>,
+    highlight: &gdk::RGBA,
+    color: &gdk::RGBA,
+) {
+    let (Some(source), Some(rect)) = (&image.source_layout, source_rect(line, image)) else {
+        return;
+    };
+    snapshot.save();
+    snapshot.translate(&graphene::Point::new(rect.x(), rect.y()));
+    let (start, end) = (selection.start.max(image.source), selection.end.min(image.end));
+    if start < end {
+        for rect in selection_rects(source, start - image.source, end - image.source, false) {
+            snapshot.append_color(highlight, &rect);
+        }
+    }
+    snapshot.append_layout(source, color);
+    snapshot.restore();
+}
+
+/// Applies source styles to visible runs, including inherited styles on drawn titles.
+fn style_source(
+    attributes: &pango::AttrList,
+    pieces: &[Piece],
+    shown: &Display,
+    range: Range<usize>,
+    dark: bool,
+    backgrounds: &mut Vec<Background>,
+) -> bool {
+    let (start, end) = (range.start, range.end);
+    let mut heading = false;
+    for styled in &shown.styles {
+        if styled.range.start >= end.max(start + 1) || styled.range.end <= start {
+            continue;
+        }
+        heading |= matches!(styled.look, Look::Heading(_));
+        for piece in pieces {
+            if matches!(piece.content, Content::Image(_))
+                || (piece.content != Content::Source && styled.look == Look::Syntax)
+            {
+                continue;
+            }
+            let from = styled.range.start.max(piece.source);
+            let to = styled.range.end.min(piece.source + piece.source_len);
+            if from >= to {
+                continue;
+            }
+            let index = |at: usize| {
+                let offset = if piece.content == Content::Source {
+                    at - piece.source
+                } else if at == from {
+                    0
+                } else {
+                    piece.len
+                };
+                u32::try_from(piece.shown + offset)
+            };
+            let range = usize::try_from(index(from).unwrap_or(0)).unwrap_or(0)
+                ..usize::try_from(index(to).unwrap_or(u32::MAX)).unwrap_or(0);
+            add_background(backgrounds, styled.look, range);
+            for mut attribute in attributes_of(styled.look, dark) {
+                attribute.set_start_index(index(from).unwrap_or(0));
+                attribute.set_end_index(index(to).unwrap_or(u32::MAX));
+                attributes.insert(attribute);
+            }
+        }
+    }
+    heading
 }
 
 /// Applies the styles within each title, after the styles inherited from the surrounding source.
-fn style_labels(attributes: &pango::AttrList, pieces: &[Piece], display: &Display, dark: bool) {
-    for piece in pieces.iter().filter(|p| p.label) {
+fn style_labels(
+    attributes: &pango::AttrList,
+    pieces: &[Piece],
+    display: &Display,
+    dark: bool,
+    backgrounds: &mut Vec<Background>,
+) {
+    for piece in pieces.iter().filter(|p| p.content == Content::Label) {
         let Some(label) = display.labels.iter().find(|l| l.range.start == piece.source) else {
             continue;
         };
         for styled in &label.styles {
+            add_background(
+                backgrounds,
+                styled.look,
+                piece.shown + styled.range.start..piece.shown + styled.range.end,
+            );
             for mut attribute in attributes_of(styled.look, dark) {
                 attribute
                     .set_start_index(u32::try_from(piece.shown + styled.range.start).unwrap_or(0));
@@ -1045,13 +1637,24 @@ fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece
     let mut at = start;
     while at < end {
         let shown = shown_text.len();
-        if let Some(label) = display.labels.iter().find(|l| l.range.start == at) {
+        if let Some(image) = display.images.iter().find(|i| i.range.start == at) {
+            let atom = "\u{fffc}";
+            pieces.push(Piece {
+                source: at,
+                shown,
+                len: atom.len(),
+                source_len: image.range.len(),
+                content: Content::Image(image.target),
+            });
+            shown_text.push_str(atom);
+            at = image.range.end;
+        } else if let Some(label) = display.labels.iter().find(|l| l.range.start == at) {
             pieces.push(Piece {
                 source: at,
                 shown,
                 len: label.text.len(),
                 source_len: label.range.len(),
-                label: true,
+                content: Content::Label,
             });
             shown_text.push_str(&label.text);
             at = label.range.end;
@@ -1060,6 +1663,7 @@ fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece
                 .labels
                 .iter()
                 .map(|l| l.range.start)
+                .chain(display.images.iter().map(|i| i.range.start))
                 .filter(|&p| p > at)
                 .min()
                 .unwrap_or(end)
@@ -1071,6 +1675,7 @@ fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece
                 .iter()
                 .map(|r| r.start)
                 .chain(display.labels.iter().map(|l| l.range.start))
+                .chain(display.images.iter().map(|i| i.range.start))
                 .filter(|&p| p > at)
                 .min()
                 .unwrap_or(end)
@@ -1080,14 +1685,20 @@ fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece
                 shown,
                 len: next - at,
                 source_len: next - at,
-                label: false,
+                content: Content::Source,
             });
             shown_text.push_str(&text[at..next]);
             at = next;
         }
     }
     if pieces.is_empty() {
-        pieces.push(Piece { source: end, shown: 0, len: 0, source_len: 0, label: false });
+        pieces.push(Piece {
+            source: end,
+            shown: 0,
+            len: 0,
+            source_len: 0,
+            content: Content::Source,
+        });
     }
     (pieces, shown_text)
 }
@@ -1095,17 +1706,25 @@ fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece
 /// The top and height of the row, as the text wraps, that `at` lies on, in the widget's
 /// coordinates.
 fn row_extents(lines: &[Line], at: usize) -> Option<(f64, f64)> {
-    let line = lines.iter().rev().find(|line| line.start <= at)?;
-    let local = i32::try_from(line.shown(at)).ok()?;
-    let (number, _) = line.layout.index_to_line_x(local, false);
-    let mut rows = line.layout.iter();
+    let line = line_at(lines, at)?;
+    let (layout, local, top) = if let Some(image) = source_image(line, at) {
+        (
+            image.source_layout.as_ref()?,
+            at - image.source,
+            line.y + f64::from(source_rect(line, image)?.y()),
+        )
+    } else {
+        (&line.layout, line.shown(at), line.y)
+    };
+    let (number, _) = layout.index_to_line_x(i32::try_from(local).ok()?, false);
+    let mut rows = layout.iter();
     for _ in 0..number {
         if !rows.next_line() {
             break;
         }
     }
     let (_, logical) = rows.line_extents();
-    Some((line.y + pixels(logical.y()), pixels(logical.height())))
+    Some((top + pixels(logical.y()), pixels(logical.height())))
 }
 
 /// Where the text's byte `at` falls in the text that `pieces` show. Hidden syntax falls where the
@@ -1113,10 +1732,12 @@ fn row_extents(lines: &[Line], at: usize) -> Option<(f64, f64)> {
 fn pieces_shown(pieces: &[Piece], at: usize) -> usize {
     for piece in pieces {
         if at <= piece.source + piece.source_len {
-            let offset = if piece.label {
-                if at <= piece.source { 0 } else { piece.len }
-            } else {
+            let offset = if piece.content == Content::Source {
                 at.saturating_sub(piece.source).min(piece.len)
+            } else if at <= piece.source {
+                0
+            } else {
+                piece.len
             };
             return piece.shown + offset;
         }
@@ -1268,6 +1889,605 @@ mod tests {
         widget.head().unwrap_or_default()
     }
 
+    fn has_image_source(widget: &EditorWidget) -> bool {
+        widget
+            .imp()
+            .lines
+            .borrow()
+            .iter()
+            .any(|line| line.images.iter().any(|image| image.source_layout.is_some()))
+    }
+
+    /// A colored image with a stripe, so rendering checks show its aspect ratio and placement.
+    fn texture(width: i32, height: i32) -> gdk::Texture {
+        let mut bytes = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let color = if x < width / 4 || y < height / 4 {
+                    [45, 130, 210, 255]
+                } else {
+                    [220, 145, 45, 255]
+                };
+                bytes.extend(color);
+            }
+        }
+        gdk::MemoryTexture::new(
+            width,
+            height,
+            gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_owned(bytes),
+            usize::try_from(width * 4).unwrap(),
+        )
+        .upcast()
+    }
+
+    #[test]
+    fn inline_images_share_the_baseline_and_reveal_their_source_on_a_click() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text =
+            format!("before ![[{id}]] after ![[{id}]]\n- [ ] item ![[{id}]] tail\n![[{id}]]\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, targets) = widget.image_requests(false);
+        assert_eq!(targets, [id]);
+        widget.set_image(generation, id, Some(texture(80, 48)));
+        let lines = widget.imp().lines.borrow();
+        assert_eq!(lines[0].images.len(), 2);
+        for line in &lines[..3] {
+            assert!(line.height >= 48.0);
+            for image in &line.images {
+                let rect = image_rect(line, image);
+                assert_eq!(rect.width(), 80.0);
+                assert_eq!(rect.height(), 48.0);
+                assert!(
+                    (f64::from(rect.y() + rect.height()) - pixels(line.layout.baseline())).abs()
+                        < 0.01
+                );
+                let x = line.left + f64::from(rect.x() + rect.width() * 0.9);
+                let y = line.y + f64::from(rect.y() + rect.height() * 0.9);
+                assert_eq!(widget.position_at(x, y), image.source);
+                assert_eq!(widget.link_at(x, y), Some(LinkTarget::Note(id)));
+                let after = line.layout.index_to_pos(i32::try_from(image.index + 3).unwrap());
+                assert!(pixels(after.x()) >= f64::from(rect.x() + rect.width()) - 0.01);
+            }
+        }
+        let source = lines[0].images[0].source;
+        drop(lines);
+        widget.edit(|e| e.move_to(source, false));
+        assert_eq!(widget.imp().lines.borrow()[0].images.len(), 2);
+        assert!(widget.imp().lines.borrow()[0].images[0].source_layout.is_some());
+        assert!(widget.text().unwrap().contains(&format!("![[{id}]]")));
+    }
+
+    #[test]
+    fn revealed_source_occupies_the_image_slot_and_moves_following_text() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("above\nbefore ![[{id}]] after\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(80, 120)));
+        let source = widget.text().unwrap().find('!').unwrap();
+        let before_x = {
+            let lines = widget.imp().lines.borrow();
+            let line = &lines[1];
+            line.layout.index_to_pos(i32::try_from(line.images[0].index + 3).unwrap()).x()
+        };
+        widget.edit(|e| e.move_to(source, false));
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[1];
+        let image = &line.images[0];
+        let picture = image_rect(line, image);
+        let rect = source_rect(line, image).unwrap();
+        let layout = image.source_layout.as_ref().unwrap();
+        assert_eq!(layout.text(), format!("![[{id}]]"));
+        assert_eq!(rect.x(), picture.x());
+        assert!(
+            (f64::from(rect.y() - picture.y() - picture.height()) - IMAGE_SOURCE_GAP).abs() < 0.01
+        );
+        assert!(
+            (f64::from(rect.y()) + pixels(layout.baseline())
+                - pixels(baseline_at(&line.layout, image.index)))
+            .abs()
+                < 0.01
+        );
+        let after_x = line.layout.index_to_pos(i32::try_from(image.index + 3).unwrap()).x();
+        assert!(after_x > before_x + units(80.0));
+        assert!(pixels(after_x) >= f64::from(rect.x() + rect.width()) - 0.01);
+        let x = line.left + f64::from(rect.x()) + 1.0;
+        let y = line.y + f64::from(rect.y()) + 4.0;
+        assert_eq!(widget.position_at(x, y), source);
+        assert_eq!(widget.link_at(x, y), Some(LinkTarget::Note(id)));
+        assert!(caret_rect(&lines, source).unwrap().2 < 40.0);
+        drop(lines);
+        widget.edit(|e| e.move_by(Unit::Grapheme, Direction::Forward, false));
+        assert_eq!(head(&widget), source + 1);
+        let before = row_extents(&widget.imp().lines.borrow(), head(&widget)).unwrap().0;
+        widget.move_vertically(false, false, 1);
+        assert!(row_extents(&widget.imp().lines.borrow(), head(&widget)).unwrap().0 < before);
+    }
+
+    #[test]
+    fn wide_images_keep_following_text_in_the_same_horizontal_position() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}]] after\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(320, 120)));
+        let before = {
+            let lines = widget.imp().lines.borrow();
+            let line = &lines[0];
+            line.layout.index_to_pos(i32::try_from(line.images[0].index + 3).unwrap()).x()
+        };
+        widget.edit(|e| e.move_to(7, false));
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        let image = &line.images[0];
+        assert!(source_rect(line, image).unwrap().width() < 320.0);
+        assert_eq!(line.layout.index_to_pos(i32::try_from(image.index + 3).unwrap()).x(), before);
+        assert_eq!(line.layout.line_count(), 1);
+    }
+
+    #[test]
+    fn inline_source_wraps_as_one_image_slot_and_keeps_its_rows_editable() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}]] after\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(80, 80)));
+        widget.lay_out(240);
+        let before_x = {
+            let lines = widget.imp().lines.borrow();
+            image_rect(&lines[0], &lines[0].images[0]).x()
+        };
+        widget.edit(|e| e.move_to(7, false));
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        let image = &line.images[0];
+        let source = image.source_layout.as_ref().unwrap();
+        let rect = source_rect(line, image).unwrap();
+        let picture = image_rect(line, image);
+        assert!(source.line_count() > 1);
+        assert!(line.layout.line_count() >= 2);
+        assert_eq!(rect.x(), picture.x());
+        assert_eq!(picture.x(), before_x);
+        assert!(rect.x() + rect.width() <= 192.01);
+        assert!(picture.x() + picture.width() <= 192.01);
+        let suffix = line.layout.index_to_pos(i32::try_from(line.shown(image.end + 1)).unwrap());
+        assert!(pixels(suffix.y()) >= f64::from(rect.y() + rect.height()) - 0.01);
+        drop(lines);
+        let first_end = widget.visual_line_edge(7, true);
+        assert!(7 < first_end && first_end < 38);
+        widget.move_vertically(true, false, 1);
+        assert!(7 < head(&widget) && head(&widget) < 38);
+        widget.move_vertically(false, false, 1);
+        assert_eq!(head(&widget), 7);
+    }
+
+    #[test]
+    fn multiple_inline_sources_keep_their_own_offsets_and_room() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}]] and ![[{id}]]\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(80, 80)));
+        widget.edit(Editor::select_all);
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        assert_eq!(line.images.len(), 2);
+        let first = source_rect(line, &line.images[0]).unwrap();
+        let second = source_rect(line, &line.images[1]).unwrap();
+        assert!(first.x() + first.width() <= second.x());
+        assert!(second.x() + second.width() <= 552.01);
+        for image in &line.images {
+            let rect = source_rect(line, image).unwrap();
+            let source = image.source_layout.as_ref().unwrap();
+            let cell = source.index_to_pos(3);
+            let x = line.left + f64::from(rect.x()) + pixels(cell.x()) + 1.0;
+            let y = line.y + f64::from(rect.y()) + pixels(cell.y()) + 4.0;
+            assert_eq!(widget.position_at(x, y), image.source + 3);
+        }
+    }
+
+    fn render(widget: &EditorWidget, renderer: &gtk::gsk::CairoRenderer) -> Vec<u8> {
+        let snapshot = gtk::Snapshot::new();
+        let viewport = graphene::Rect::new(0.0, 0.0, 600.0, 330.0);
+        snapshot.append_color(&gdk::RGBA::BLACK, &viewport);
+        widget.draw(&snapshot);
+        let texture = renderer.render_texture(snapshot.to_node().unwrap(), Some(&viewport));
+        let mut bytes = vec![0; 600 * 330 * 4];
+        texture.download(&mut bytes, 600 * 4);
+        bytes
+    }
+
+    #[test]
+    fn inline_backgrounds_follow_the_font_height_beside_tall_images() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("![[{id}]] ==highlight== and `code`\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(160, 240)));
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        assert_eq!(line.backgrounds.len(), 2);
+        for background in &line.backgrounds {
+            let rects = run_rects(&line.layout, &background.range);
+            assert_ne!(rects, Vec::<graphene::Rect>::new());
+            for rect in rects {
+                assert!(rect.height() < 40.0, "{rect:?}");
+                assert!(rect.y() > 200.0, "{rect:?}");
+                assert!(rect.x() >= 160.0, "{rect:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn selecting_text_beside_an_image_uses_the_full_row_height() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}]] after ==task== **foo** `code`\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(160, 240)));
+        let after = widget.text().unwrap().find("after").unwrap();
+        let end = widget.text().unwrap().find('\n').unwrap();
+        for selection in [0..6, after..end, after..end + 1, 0..end + 1] {
+            widget.edit(|e| e.select(selection.start, selection.end));
+            let lines = widget.imp().lines.borrow();
+            let line = &lines[0];
+            let rects = selection_rects(
+                &line.layout,
+                line.shown(selection.start),
+                line.shown(selection.end.min(end)),
+                selection.end > end,
+            );
+            assert_ne!(rects, Vec::<graphene::Rect>::new());
+            let mut rows = line.layout.iter();
+            let mut bands = Vec::new();
+            loop {
+                let (_, logical) = rows.line_extents();
+                bands.push((pixels(logical.y()), pixels(logical.height())));
+                if !rows.next_line() {
+                    break;
+                }
+            }
+            for rect in &rects {
+                assert!(bands.contains(&(f64::from(rect.y()), f64::from(rect.height()))));
+            }
+            if selection.end > end {
+                assert!(rects.iter().any(|r| (r.x() + r.width() - 552.0).abs() < 0.01));
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_list_selections_fill_adjacent_rows_without_gaps() {
+        let text = (40..60).map(|n| format!("{n}) a")).collect::<Vec<_>>().join("\n");
+        let Some(widget) = widget(&format!("|{text}")) else { return };
+        widget.edit(|e| e.select(0, text.len()));
+        let lines = widget.imp().lines.borrow();
+        let mut bottom = MARGIN_TOP;
+        for line in lines.iter() {
+            let rects =
+                selection_rects(&line.layout, 0, line.layout.text().len(), line.end < text.len());
+            assert_eq!(rects.len(), 1);
+            let rect = &rects[0];
+            assert_eq!(f64::from(rect.y()), 0.0);
+            assert_eq!(f64::from(rect.height()), line.height);
+            assert_eq!(line.y + f64::from(rect.y()), bottom);
+            bottom = line.y + f64::from(rect.y() + rect.height());
+        }
+    }
+
+    #[test]
+    fn wrapped_selection_fills_each_row_including_the_image_row() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("![[{id}]] {}\n|end", "word ".repeat(20));
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(80, 240)));
+        widget.lay_out(240);
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        assert!(line.layout.line_count() > 1);
+        let rects = selection_rects(&line.layout, line.shown(31), line.shown(line.end), true);
+        assert_eq!(rects.len(), usize::try_from(line.layout.line_count()).unwrap());
+        assert!(rects[0].height() >= 240.0);
+        for pair in rects.windows(2) {
+            assert!((pair[0].y() + pair[0].height() - pair[1].y()).abs() < 0.01);
+        }
+        let tails = rects.iter().filter(|r| (r.x() + r.width() - 192.0).abs() < 0.01);
+        assert!(tails.count() >= usize::try_from(line.layout.line_count()).unwrap());
+    }
+
+    #[test]
+    fn selecting_an_embed_tints_its_picture_but_selecting_source_characters_does_not() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}]] after\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(160, 240)));
+        let renderer = gtk::gsk::CairoRenderer::new();
+        renderer.realize(None::<&gdk::Surface>).unwrap();
+        let before = render(&widget, &renderer);
+        widget.edit(|e| e.select(10, 13));
+        let partial = render(&widget, &renderer);
+        let pixel = (100 * 600 + 100) * 4;
+        assert_eq!(&before[pixel..pixel + 4], &partial[pixel..pixel + 4]);
+        widget.edit(|e| e.select(7, 38));
+        let selected = render(&widget, &renderer);
+        assert_ne!(&partial[pixel..pixel + 4], &selected[pixel..pixel + 4]);
+        renderer.unrealize();
+    }
+
+    #[test]
+    fn revealed_images_still_draw_the_same_pixels() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}]] ==highlight== and `code`\n|below");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(160, 240)));
+        let renderer = gtk::gsk::CairoRenderer::new();
+        renderer.realize(None::<&gdk::Surface>).unwrap();
+        let before = render(&widget, &renderer);
+        widget.edit(|e| e.move_to(7, false));
+        let after = render(&widget, &renderer);
+        // A point inside the blue stripe keeps the image's pixels, with source now below it.
+        let pixel = (100 * 600 + 100) * 4;
+        assert_ne!(&before[pixel..pixel + 3], &[0, 0, 0]);
+        assert_eq!(&before[pixel..pixel + 4], &after[pixel..pixel + 4]);
+        renderer.unrealize();
+    }
+
+    #[test]
+    fn invalidating_and_restoring_an_image_keeps_the_caret_still_at_the_note_start() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!(
+            "{}before ![[{id}]] after\n|{}",
+            "earlier line\n".repeat(40),
+            "later line\n".repeat(40)
+        );
+        for scrolled_down in [false, true] {
+            let Some(widget) = widget(&text) else { return };
+            let at = widget.text().unwrap().find('!').unwrap() + 13;
+            let (generation, _) = widget.image_requests(false);
+            widget.set_image(generation, id, Some(texture(160, 400)));
+            widget.edit(|e| e.move_to(at, false));
+            let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
+            scrolled.measure(gtk::Orientation::Horizontal, -1);
+            scrolled.measure(gtk::Orientation::Vertical, 600);
+            scrolled.allocate(600, 500, -1, None);
+            let height = widget.lay_out(600);
+            let caret_y = caret_rect(&widget.imp().lines.borrow(), at).unwrap().1;
+            #[allow(clippy::cast_possible_truncation)]
+            let page = if scrolled_down { 500 } else { (caret_y + 100.0).ceil() as i32 };
+            scrolled.allocate(600, page, -1, None);
+            let scroll = if scrolled_down { (caret_y - 100.0).floor() } else { 0.0 };
+            let adjustment = scrolled.vadjustment();
+            adjustment.configure(
+                scroll,
+                0.0,
+                f64::from(height),
+                10.0,
+                f64::from(page - 20),
+                f64::from(page),
+            );
+            let screen_y =
+                caret_rect(&widget.imp().lines.borrow(), at).unwrap().1 - adjustment.value();
+            assert!(0.0 <= screen_y && screen_y + 20.0 < f64::from(page));
+            for _ in 0..3 {
+                widget.edit(Editor::backspace);
+                widget.scroll_to_cursor();
+                scrolled.measure(gtk::Orientation::Horizontal, -1);
+                scrolled.measure(gtk::Orientation::Vertical, 600);
+                scrolled.allocate(600, page, -1, None);
+                assert!(!has_image_source(&widget));
+                let y = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
+                assert!((y - adjustment.value() - screen_y).abs() < 0.01);
+                if scroll < 1.0 {
+                    assert!(widget.imp().top_space.get() > 300.0);
+                }
+                widget.edit(|e| {
+                    assert!(e.undo());
+                });
+                widget.scroll_to_cursor();
+                let y = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
+                assert!((y - adjustment.value() - screen_y).abs() < 0.01);
+                assert!(has_image_source(&widget));
+                assert_eq!(widget.imp().top_space.get(), 0.0);
+                assert_eq!(widget.imp().bottom_space.get(), 0.0);
+                assert_eq!(adjustment.value(), scroll);
+            }
+            // Ordinary typing still moves to the next line; it must not pin the caret in place.
+            let at = widget.text().unwrap().find("later line").unwrap();
+            widget.edit(|e| e.move_to(at, false));
+            let y = caret_rect(&widget.imp().lines.borrow(), at).unwrap().1;
+            widget.edit(|e| e.insert("\n"));
+            let next = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
+            assert!(next > y);
+            widget.set_editor(Some(Editor::new(Body::detached("another note"))));
+            assert_eq!(widget.imp().top_space.get(), 0.0);
+            assert_eq!(widget.imp().bottom_space.get(), 0.0);
+        }
+    }
+
+    #[test]
+    fn an_image_disappearing_near_the_note_end_keeps_the_caret_still() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}|{}]] after", "word ".repeat(20));
+        let Some(widget) = widget("|") else { return };
+        let mut editor = Editor::new(Body::detached(&text));
+        editor.move_to(20, false);
+        widget.set_editor(Some(editor));
+        widget.lay_out(240);
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(80, 120)));
+        let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
+        scrolled.measure(gtk::Orientation::Horizontal, -1);
+        scrolled.measure(gtk::Orientation::Vertical, 240);
+        scrolled.allocate(240, 200, -1, None);
+        let height = widget.lay_out(240);
+        let adjustment = scrolled.vadjustment();
+        adjustment.configure(130.0, 0.0, f64::from(height), 10.0, 180.0, 200.0);
+        let screen_y = caret_rect(&widget.imp().lines.borrow(), 20).unwrap().1 - adjustment.value();
+        assert!((0.0..120.0).contains(&screen_y));
+        widget.edit(Editor::backspace);
+        widget.scroll_to_cursor();
+        scrolled.measure(gtk::Orientation::Horizontal, -1);
+        scrolled.measure(gtk::Orientation::Vertical, 240);
+        scrolled.allocate(240, 200, -1, None);
+        let y = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
+        assert!((y - adjustment.value() - screen_y).abs() < 0.01);
+        assert!(
+            widget.imp().bottom_space.get() > 0.0,
+            "old height {height}, screen {screen_y}, new caret {y}, scroll {}, top {}, bottom {}",
+            adjustment.value(),
+            widget.imp().top_space.get(),
+            widget.imp().bottom_space.get()
+        );
+        widget.edit(|e| {
+            assert!(e.undo());
+        });
+        widget.scroll_to_cursor();
+        let y = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
+        assert!((y - adjustment.value() - screen_y).abs() < 0.01);
+        assert_eq!(widget.imp().bottom_space.get(), 0.0);
+        assert_eq!(widget.imp().top_space.get(), 0.0);
+    }
+
+    #[test]
+    fn repeatedly_revealing_inline_source_keeps_the_text_baseline_stable() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}]] after\n|{}", "more text\n".repeat(60));
+        let Some(widget) = widget(&text) else { return };
+        let source = 7..38;
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(80, 400)));
+        let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
+        scrolled.measure(gtk::Orientation::Horizontal, -1);
+        scrolled.measure(gtk::Orientation::Vertical, 600);
+        scrolled.allocate(600, 180, -1, None);
+        for width in [600, 240] {
+            let height = widget.lay_out(width);
+            let adjustment = scrolled.vadjustment();
+            adjustment.configure(300.0, 0.0, f64::from(height), 10.0, 150.0, 180.0);
+            // The picture's top is offscreen, but its baseline text and source row both fit.
+            for (at, into, out) in [
+                (source.start - 1, Direction::Forward, Direction::Back),
+                (source.end + 1, Direction::Back, Direction::Forward),
+            ] {
+                widget.imp().editor.borrow_mut().as_mut().unwrap().move_to(at, false);
+                widget.rebuild_layout();
+                adjustment.set_value(300.0);
+                widget.scroll_to_cursor();
+                assert_eq!(adjustment.value(), 300.0, "text beside the image scrolled");
+                let baseline = paragraph_baseline(&widget.imp().lines.borrow(), head(&widget))
+                    .unwrap()
+                    - adjustment.value();
+                for _ in 0..8 {
+                    widget.edit(|e| e.move_by(Unit::Grapheme, into, false));
+                    widget.scroll_to_cursor();
+                    let current = paragraph_baseline(&widget.imp().lines.borrow(), head(&widget))
+                        .unwrap()
+                        - adjustment.value();
+                    assert!((current - baseline).abs() < 0.01, "revealing source moved the text");
+                    assert!(has_image_source(&widget));
+                    widget.edit(|e| e.move_by(Unit::Grapheme, out, false));
+                    widget.scroll_to_cursor();
+                    assert_eq!(adjustment.value(), 300.0, "repeated reveals drifted");
+                    let current = paragraph_baseline(&widget.imp().lines.borrow(), head(&widget))
+                        .unwrap()
+                        - adjustment.value();
+                    assert!((current - baseline).abs() < 0.01, "hiding source moved the text");
+                    assert_eq!(head(&widget), at);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hiding_offscreen_source_keeps_the_clicked_caret_at_its_screen_position() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text =
+            format!("|![[{id}]]\n{}clicked line\n{}", "line\n".repeat(20), "line\n".repeat(40));
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(160, 240)));
+        let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
+        scrolled.measure(gtk::Orientation::Horizontal, -1);
+        scrolled.measure(gtk::Orientation::Vertical, 600);
+        scrolled.allocate(600, 180, -1, None);
+        let height = widget.lay_out(600);
+        let adjustment = scrolled.vadjustment();
+        adjustment.configure(0.0, 0.0, f64::from(height), 10.0, 150.0, 180.0);
+        let at = widget.text().unwrap().find("clicked line").unwrap();
+        let (_, before, _) = caret_rect(&widget.imp().lines.borrow(), at).unwrap();
+        adjustment.set_value(before - 60.0);
+        assert!(adjustment.value() > 240.0);
+        assert!(has_image_source(&widget));
+        *widget.imp().held.borrow_mut() = Some(0..0);
+        widget.edit(|e| e.move_to(at, false));
+        assert!(has_image_source(&widget));
+        widget.imp().held.take();
+        widget.relayout();
+        let (_, after, _) = caret_rect(&widget.imp().lines.borrow(), at).unwrap();
+        assert!((after - adjustment.value() - 60.0).abs() < 0.01);
+        assert!(!has_image_source(&widget));
+        widget.scroll_to_cursor();
+        assert!((after - adjustment.value() - 60.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn wide_images_shrink_in_proportion_and_wrap_without_covering_text() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("before ![[{id}]] after\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(600, 200)));
+        widget.lay_out(240);
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        let rect = image_rect(line, &line.images[0]);
+        assert_eq!(rect.width(), 192.0);
+        assert_eq!(rect.height(), 64.0);
+        assert!(line.layout.line_count() >= 3);
+        assert!(rect.y() >= 0.0);
+        assert!(rect.x() + rect.width() <= 192.01);
+        assert!(f64::from(rect.y() + rect.height()) <= line.height);
+        drop(lines);
+        widget.set_image(generation, id, None);
+        assert_eq!(widget.imp().lines.borrow()[0].images.len(), 0);
+        // An old request cannot put a picture into a newly opened note.
+        widget.set_editor(Some(Editor::new(Body::detached("other note"))));
+        widget.set_image(generation, id, Some(texture(80, 48)));
+        assert_eq!(widget.imp().images.borrow().len(), 0);
+    }
+
+    #[test]
+    fn clipboards_with_text_prefer_it_over_an_image() {
+        if adw::init().is_err() {
+            return;
+        }
+        assert!(image_only(gdk::ContentFormats::for_type(gdk::Texture::static_type())));
+        assert!(!image_only(gdk::ContentFormats::for_type(glib::Type::STRING)));
+        assert!(!image_only(
+            gdk::ContentFormats::builder()
+                .add_type(gdk::Texture::static_type())
+                .add_type(glib::Type::STRING)
+                .build()
+        ));
+    }
+
+    #[test]
+    fn a_paste_finishing_after_a_note_switch_leaves_the_new_note_alone() {
+        let Some(widget) = widget("before |after") else { return };
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let target = PasteTarget {
+            session: widget.imp().session.get(),
+            selection: widget.imp().editor.borrow().as_ref().unwrap().edit_target(),
+        };
+        widget.set_editor(Some(Editor::new(Body::detached("other note"))));
+        widget.insert_image(&target, id);
+        assert_eq!(widget.text().as_deref(), Some("other note"));
+    }
+
     #[test]
     fn maps_drawn_titles_to_source_and_opens_every_glyph() {
         let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
@@ -1277,7 +2497,7 @@ mod tests {
         let lines = widget.imp().lines.borrow();
         let line = &lines[0];
         assert_eq!(line.layout.text(), "café and a longer title after");
-        let label = line.pieces.iter().find(|p| p.label).unwrap();
+        let label = line.pieces.iter().find(|p| p.content == Content::Label).unwrap();
         assert_eq!(line.source(3), 2);
         assert_eq!(line.source_after(label.len), 32);
         assert_eq!(line.shown(32), label.len);

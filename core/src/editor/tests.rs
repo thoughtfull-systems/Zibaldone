@@ -341,3 +341,85 @@ fn link_picker_preserves_an_explicit_label_with_escapes_and_line_breaks() {
     e.insert("\nend");
     assert_eq!(e.display().labels, Vec::<display::Label>::new());
 }
+
+#[test]
+fn image_pastes_replace_the_original_selection_and_undo_in_one_step() {
+    let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+    for text in ["|", "before |after", "- [ ] |task|\n", "é |replace| after"] {
+        let mut e = editor(text);
+        let selection = e.selection();
+        let original = e.text().to_owned();
+        let target = e.edit_target();
+        e.move_to(0, false);
+        assert!(e.insert_image(&target, id), "{text:?}");
+        let range = selection.range();
+        assert_eq!(
+            e.text(),
+            format!("{}![[{id}]]{}", &original[..range.start], &original[range.end..])
+        );
+        assert!(e.undo());
+        assert_eq!(e.text(), original);
+        assert_eq!(e.selection(), selection);
+        assert!(e.redo());
+        assert_eq!(body::wikilinks(e.text())[0].target, id);
+        assert_eq!(body::wikilinks(e.text())[0].label, None);
+    }
+}
+
+#[test]
+fn a_pending_image_paste_follows_edits_around_its_selection() {
+    let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+    let mut e = editor("before |selected| after");
+    let target = e.edit_target();
+    e.body.insert_utf8(0, "é ").unwrap();
+    e.doc.commit_with(CommitOptions::new().origin(ORIGIN));
+    assert!(e.insert_image(&target, id));
+    assert_eq!(e.text(), format!("é before ![[{id}]] after"));
+    assert!(e.undo());
+    assert_eq!(e.text(), "é before selected after");
+    let target = e.edit_target();
+    let selected = e.selection().range();
+    e.body.insert_utf8(selected.start + 1, "changed").unwrap();
+    e.doc.commit_with(CommitOptions::new().origin(ORIGIN));
+    assert!(!e.insert_image(&target, id));
+    assert!(e.text().contains("changed"));
+}
+
+#[test]
+fn moves_onto_images_at_their_source_edges_and_selects_them_whole() {
+    let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+    let text = format!("before ![[{id}]] after");
+    let mut e = Editor::new(Body::detached(&text));
+    e.set_images(HashMap::from([(id, display::ImageSize { width: 80, height: 40 })]));
+    let range = 7..38;
+    for unit in [Unit::Grapheme, Unit::Word] {
+        e.move_to(range.start - 1, false);
+        e.move_by(unit, Direction::Forward, false);
+        assert_eq!(e.selection().head, range.start);
+        assert!(e.display().images[0].revealed);
+        e.move_to(range.end + 1, false);
+        e.move_by(unit, Direction::Back, false);
+        assert_eq!(e.selection().head, range.end);
+    }
+    e.select(0, range.start + 2);
+    e.take_in_syntax(&(0..0));
+    assert_eq!(e.selection().head, range.end);
+    e.select(text.len(), range.end - 2);
+    e.take_in_syntax(&(text.len()..text.len()));
+    assert_eq!(e.selection().head, range.start);
+    assert!(!e.can_undo());
+}
+
+#[test]
+fn moves_onto_an_image_past_surrounding_hidden_formatting() {
+    let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+    let text = format!("a **![[{id}]]** b");
+    let mut e = Editor::new(Body::detached(&text));
+    e.set_images(HashMap::from([(id, display::ImageSize { width: 80, height: 40 })]));
+    e.move_to(1, false);
+    e.move_by(Unit::Grapheme, Direction::Forward, false);
+    assert_eq!(e.selection().head, text.find('!').unwrap());
+    e.move_to(text.len() - 1, false);
+    e.move_by(Unit::Grapheme, Direction::Back, false);
+    assert_eq!(e.selection().head, text.find("]]**").unwrap() + 2);
+}

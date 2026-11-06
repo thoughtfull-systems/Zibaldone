@@ -34,6 +34,13 @@ pub struct Selection {
     pub head: usize,
 }
 
+/// A selection remembered while the app prepares a paste. Its cursors follow edits around it.
+pub struct EditTarget {
+    cursors: Option<(Cursor, Cursor)>,
+    selection: Selection,
+    expected: String,
+}
+
 impl Selection {
     pub fn cursor(at: usize) -> Self {
         Self { anchor: at, head: at }
@@ -91,6 +98,7 @@ pub enum Unit {
 
 /// A note's body open for editing.
 pub struct Editor {
+    images: HashMap<Id, display::ImageSize>,
     titles: HashMap<Id, String>,
     doc: LoroDoc,
     body: LoroText,
@@ -135,6 +143,7 @@ impl Editor {
         }
         let text = body.to_string();
         let mut editor = Self {
+            images: HashMap::new(),
             titles: HashMap::new(),
             doc,
             body,
@@ -166,12 +175,65 @@ impl Editor {
 
     /// What shows while `selection` decides which syntax is visible, such as during a drag.
     pub fn display_for(&self, selection: &Range<usize>) -> display::Display {
-        display::with_titles(&self.text, selection, &mut |id| self.titles.get(&id).cloned())
+        display::with_images(
+            &self.text,
+            selection,
+            &mut |id| self.titles.get(&id).cloned(),
+            &mut |id| self.images.get(&id).copied(),
+        )
     }
 
     /// Updates titles without editing the body or its undo history.
     pub fn set_titles(&mut self, titles: HashMap<Id, String>) {
         self.titles = titles;
+    }
+
+    /// Updates image availability without editing the body or its undo history.
+    pub fn set_images(&mut self, images: HashMap<Id, display::ImageSize>) {
+        self.images = images;
+    }
+
+    /// Targets whose images the app can load, including embeds with explicit captions.
+    pub fn image_targets(&self) -> Vec<Id> {
+        let mut targets: Vec<Id> = body::wikilinks(&self.text)
+            .into_iter()
+            .filter(|link| link.embed)
+            .map(|link| link.target)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    /// Remembers the selection before an asynchronous paste starts.
+    pub fn edit_target(&self) -> EditTarget {
+        EditTarget {
+            cursors: self.cursors.clone(),
+            selection: self.selection,
+            expected: self.selected_text().to_owned(),
+        }
+    }
+
+    /// Inserts an embed where a paste started, as one undo step. Changes within the remembered
+    /// selection cancel the paste rather than replacing text that arrived since it started.
+    pub fn insert_image(&mut self, target: &EditTarget, image: Id) -> bool {
+        self.refresh();
+        let selection = match &target.cursors {
+            Some((anchor, head)) => {
+                let (Some(anchor), Some(head)) = (self.find(anchor), self.find(head)) else {
+                    return false;
+                };
+                Selection { anchor, head }
+            }
+            None => target.selection,
+        };
+        let range = selection.range();
+        if self.text.get(range.clone()) != Some(&target.expected) {
+            return false;
+        }
+        self.place(selection);
+        self.replace(range, &format!("!{}", body::wikilink(image, None)), true);
+        true
     }
 
     pub fn selected_text(&self) -> &str {
@@ -278,7 +340,18 @@ impl Editor {
         }
         let forward = head > anchor;
         let mut to = head;
-        for hidden in self.display_for(showing).hidden {
+        let display = self.display_for(showing);
+        for image in display.images.into_iter().filter(|image| !image.revealed) {
+            let inside = if forward {
+                image.range.start <= to && to < image.range.end
+            } else {
+                image.range.start < to && to <= image.range.end
+            };
+            if inside {
+                to = if forward { image.range.end } else { image.range.start };
+            }
+        }
+        for hidden in display.hidden {
             let at_edge = if forward {
                 hidden.start <= to && to < hidden.end
             } else {
@@ -537,6 +610,17 @@ impl Editor {
         }
         let forward = direction == Direction::Forward;
         let display = self.display();
+        // A move onto an image lands at its source's near edge, revealing the source there.
+        let image_edge = |to| {
+            display
+                .images
+                .iter()
+                .find(|image| !image.revealed && image.range.start <= to && to <= image.range.end)
+                .map(|image| if forward { image.range.start } else { image.range.end })
+        };
+        if let Some(edge) = image_edge(to) {
+            return edge;
+        }
         // Back onto the hidden source of a task box that takes its marker's place, a move lands
         // before the item's text, with the box still drawn, and the next one just after the box's
         // `]`, which shows its source.
@@ -557,7 +641,7 @@ impl Editor {
                 to = if forward { hidden.end } else { hidden.start };
             }
         }
-        to
+        image_edge(to).unwrap_or(to)
     }
 
     /// The place one `unit` from `at` in `direction`.
