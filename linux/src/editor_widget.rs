@@ -11,8 +11,8 @@ use std::ops::Range;
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
-use zib_core::editor::display::{Look, display};
-use zib_core::editor::{Direction, Editor, Unit};
+use zib_core::editor::display::{Look, Shape, display};
+use zib_core::editor::{Direction, Editor, ListKey, Unit};
 
 /// Space around the text, in pixels, as the text view has.
 const MARGIN_SIDES: f64 = 24.0;
@@ -47,6 +47,11 @@ pub struct Line {
     height: f64,
     /// Whether it draws on a shade across the editor's width, as a code block's lines do.
     shaded: bool,
+    /// Where its layout starts, from the widget's left edge: past the margin, and past the room
+    /// that lines up a numbered list's one-digit numbers.
+    left: f64,
+    /// The bullets and task boxes drawn over its text.
+    markers: Vec<(Range<usize>, Shape)>,
 }
 
 /// A run of the text that shows: where it starts in the text and in the layout's text, and its
@@ -62,12 +67,7 @@ impl Line {
     /// Where the text's byte `at`, on this line, falls in the layout's text. Hidden syntax falls
     /// where the text after it shows.
     fn shown(&self, at: usize) -> usize {
-        for piece in &self.pieces {
-            if at <= piece.source + piece.len {
-                return piece.shown + at.saturating_sub(piece.source).min(piece.len);
-            }
-        }
-        self.pieces.last().map_or(0, |piece| piece.shown + piece.len)
+        pieces_shown(&self.pieces, at)
     }
 
     /// The text's byte where the layout's character at `shown` starts, after any hidden syntax
@@ -117,6 +117,10 @@ mod imp {
         /// The selection that decides what shows while a mouse button is down, as it was when the
         /// button went down, so text doesn't move under the pointer and turn a click into a drag.
         pub held: RefCell<Option<Range<usize>>>,
+        /// Whether the mouse button went down on a task box, which a drag then leaves alone.
+        pub on_box: Cell<bool>,
+        /// Whether the next edit leaves the view where it is, rather than scrolling to the cursor.
+        pub keep_view: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -269,6 +273,17 @@ impl EditorWidget {
             glib::Propagation::Proceed
         });
         self.add_controller(buttons);
+        // The pointer shows as an arrow over a task box, as over a button.
+        let motion = gtk::EventControllerMotion::new();
+        let w = self.downgrade();
+        motion.connect_motion(move |_, x, y| {
+            let Some(w) = w.upgrade() else { return };
+            let name = if w.box_at(x, y).is_some() { "default" } else { "text" };
+            if w.cursor().and_then(|cursor| cursor.name()).as_deref() != Some(name) {
+                w.set_cursor_from_name(Some(name));
+            }
+        });
+        self.add_controller(motion);
         let drag = gtk::GestureDrag::new();
         let w = self.downgrade();
         drag.connect_drag_update(move |drag, dx, dy| {
@@ -296,6 +311,7 @@ impl EditorWidget {
             let shown = display(text, &selection);
             let dark = adw::StyleManager::default().is_dark();
             let wrap = (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0);
+            let column = monospace_width(self.upcast_ref());
             let mut lines = Vec::new();
             let mut y = MARGIN_TOP;
             let mut start = 0;
@@ -304,8 +320,11 @@ impl EditorWidget {
                 let pieces = pieces(start, end, &shown.hidden);
                 let shown_text: String =
                     pieces.iter().map(|p| &text[p.source..p.source + p.len]).collect();
+                let columns = shown.pads.iter().filter(|(lines, _)| lines.contains(&start));
+                #[allow(clippy::cast_precision_loss)]
+                let pad = columns.map(|(_, columns)| *columns).max().unwrap_or(0) as f64 * column;
                 let layout = self.create_pango_layout(Some(&shown_text));
-                layout.set_width(units(wrap));
+                layout.set_width(units((wrap - pad).max(1.0)));
                 layout.set_wrap(pango::WrapMode::WordChar);
                 let attributes = pango::AttrList::new();
                 let mut heading = false;
@@ -328,13 +347,31 @@ impl EditorWidget {
                         }
                     }
                 }
+                // The text under a bullet or a box stays, unseen, to keep its room.
+                let markers: Vec<(Range<usize>, Shape)> = shown
+                    .markers
+                    .iter()
+                    .filter(|m| m.range.start >= start && m.range.start < end.max(start + 1))
+                    .map(|m| (m.range.clone(), m.shape))
+                    .collect();
+                for (range, _) in &markers {
+                    let (from, to) =
+                        (pieces_shown(&pieces, range.start), pieces_shown(&pieces, range.end));
+                    // An alpha of 0 counts as no alpha at all, and draws the text.
+                    for mut attribute in foreground((0.5, 0.5, 0.5, 0.004)) {
+                        attribute.set_start_index(u32::try_from(from).unwrap_or(0));
+                        attribute.set_end_index(u32::try_from(to).unwrap_or(u32::MAX));
+                        attributes.insert(attribute);
+                    }
+                }
                 layout.set_attributes(Some(&attributes));
                 if heading {
                     y += HEADING_SPACE;
                 }
                 let shaded = shown.shaded.iter().any(|shaded| shaded.start == start);
                 let height = pixels(layout.size().1);
-                lines.push(Line { start, end, pieces, layout, y, height, shaded });
+                let left = MARGIN_SIDES + pad;
+                lines.push(Line { start, end, pieces, layout, y, height, shaded, left, markers });
                 y += height;
                 start = end + 1;
             }
@@ -378,7 +415,7 @@ impl EditorWidget {
                 snapshot.append_color(&shade, &rect);
             }
             snapshot.save();
-            snapshot.translate(&graphene::Point::new(MARGIN_SIDES as f32, line.y as f32));
+            snapshot.translate(&graphene::Point::new(line.left as f32, line.y as f32));
             let end = line.end;
             // The line break after a line counts as selected with it.
             if selected.start <= end && line.start < selected.end {
@@ -390,6 +427,9 @@ impl EditorWidget {
                 }
             }
             snapshot.append_layout(&line.layout, &color);
+            for (range, shape) in &line.markers {
+                draw_marker(snapshot, line, range, *shape, &color);
+            }
             snapshot.restore();
         }
         if self.has_focus()
@@ -401,6 +441,26 @@ impl EditorWidget {
         }
     }
 
+    /// The start of the source of the drawn task box at a point in the widget, if there's one
+    /// there. A box can reach past its source, over the character before it.
+    fn box_at(&self, x: f64, y: f64) -> Option<usize> {
+        let lines = self.imp().lines.borrow();
+        #[allow(clippy::cast_possible_truncation)]
+        let point = graphene::Point::new(x as f32, y as f32);
+        lines.iter().filter(|line| line.y <= y && y < line.y + line.height).find_map(|line| {
+            line.markers.iter().find_map(|(range, shape)| {
+                if !matches!(shape, Shape::TaskBox(_)) {
+                    return None;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let area = run_rect(line, range)
+                    .union(&marker_rect(line, range))
+                    .offset_r(line.left as f32, line.y as f32);
+                area.contains_point(&point).then_some(range.start)
+            })
+        })
+    }
+
     /// The place in the text nearest a point in the widget.
     fn position_at(&self, x: f64, y: f64) -> usize {
         let lines = self.imp().lines.borrow();
@@ -410,8 +470,7 @@ impl EditorWidget {
             return 0;
         };
         // Pango puts a point past a layout's top or bottom on its first or last row.
-        let (_, index, trailing) =
-            line.layout.xy_to_index(units(x - MARGIN_SIDES), units(y - line.y));
+        let (_, index, trailing) = line.layout.xy_to_index(units(x - line.left), units(y - line.y));
         let index = usize::try_from(index).unwrap_or(0);
         // A click on a character's right half lands after it, before any hidden syntax that
         // follows, and on its left half before it, after any hidden syntax before it.
@@ -492,6 +551,9 @@ impl EditorWidget {
         if let Some(selected) = selected.filter(|s| !s.is_empty()) {
             self.primary_clipboard().set_text(&selected);
         }
+        if self.imp().keep_view.take() {
+            return;
+        }
         let w = self.clone();
         glib::idle_add_local_once(move || w.scroll_to_cursor());
     }
@@ -560,8 +622,24 @@ impl EditorWidget {
             }
             gdk::Key::BackSpace => self.edit(|e| e.delete(word, back)),
             gdk::Key::Delete | gdk::Key::KP_Delete => self.edit(|e| e.delete(word, forward)),
-            gdk::Key::Return | gdk::Key::KP_Enter => self.edit(|e| e.insert("\n")),
-            gdk::Key::Tab => self.edit(|e| e.insert("\t")),
+            gdk::Key::Return | gdk::Key::KP_Enter => {
+                let key = if shift { ListKey::ShiftEnter } else { ListKey::Enter };
+                self.edit(|e| {
+                    if !e.list_key(key) {
+                        e.insert("\n");
+                    }
+                });
+            }
+            gdk::Key::Tab | gdk::Key::ISO_Left_Tab => {
+                let back = shift || key == gdk::Key::ISO_Left_Tab;
+                let key = if back { ListKey::ShiftTab } else { ListKey::Tab };
+                // In a list item, Tab and Shift+Tab move the item, and never type a tab.
+                self.edit(|e| {
+                    if !e.list_key(key) && !back {
+                        e.insert("\t");
+                    }
+                });
+            }
             gdk::Key::a if control => self.edit(Editor::select_all),
             gdk::Key::z if control => self.edit(|e| {
                 e.undo();
@@ -646,6 +724,22 @@ impl EditorWidget {
         if let Some(im) = self.imp().im.borrow().as_ref() {
             im.reset();
         }
+        self.imp().on_box.set(false);
+        // Each click on a drawn task box toggles it, a double click's second too, and leaves the
+        // cursor where it was.
+        let plain = gesture.current_event_state() & gtk::accelerator_get_default_mod_mask();
+        if gesture.current_button() == gdk::BUTTON_PRIMARY
+            && plain.is_empty()
+            && let Some(at) = self.box_at(x, y)
+        {
+            self.imp().on_box.set(true);
+            // The cursor stays where it was, perhaps off screen, and the view stays on the box.
+            self.imp().keep_view.set(true);
+            self.edit(|e| {
+                e.toggle_task(at);
+            });
+            return;
+        }
         let at = self.position_at(x, y);
         let shift = gesture.current_event_state().contains(gdk::ModifierType::SHIFT_MASK);
         match gesture.current_button() {
@@ -677,6 +771,9 @@ impl EditorWidget {
     /// Extends the selection to the point a drag reached: by whole words or lines from the one a
     /// double or triple click selected, or else from where the drag started.
     fn dragged(&self, x: f64, y: f64) {
+        if self.imp().on_box.get() {
+            return;
+        }
         let at = self.position_at(x, y);
         let origin = self.imp().drag_origin.borrow().clone();
         let showing = self.imp().held.borrow().clone();
@@ -761,7 +858,7 @@ fn caret_rect(lines: &[Line], at: usize) -> Option<(f64, f64, f64)> {
     let line = lines.iter().rev().find(|line| line.start <= at)?;
     let local = i32::try_from(line.shown(at)).ok()?;
     let (strong, _) = line.layout.cursor_pos(local);
-    Some((MARGIN_SIDES + pixels(strong.x()), line.y + pixels(strong.y()), pixels(strong.height())))
+    Some((line.left + pixels(strong.x()), line.y + pixels(strong.y()), pixels(strong.height())))
 }
 
 /// The Pango attributes that give text `look`, in the light or `dark` style.
@@ -865,6 +962,138 @@ fn row_extents(lines: &[Line], at: usize) -> Option<(f64, f64)> {
     }
     let (_, logical) = rows.line_extents();
     Some((line.y + pixels(logical.y()), pixels(logical.height())))
+}
+
+/// Where the text's byte `at` falls in the text that `pieces` show. Hidden syntax falls where the
+/// text after it shows.
+fn pieces_shown(pieces: &[Piece], at: usize) -> usize {
+    for piece in pieces {
+        if at <= piece.source + piece.len {
+            return piece.shown + at.saturating_sub(piece.source).min(piece.len);
+        }
+    }
+    pieces.last().map_or(0, |piece| piece.shown + piece.len)
+}
+
+/// The width of a character of the monospace font that list prefixes use, in pixels.
+fn monospace_width(widget: &gtk::Widget) -> f64 {
+    let layout = widget.create_pango_layout(Some("0"));
+    let mut font = widget.pango_context().font_description().unwrap_or_default();
+    font.set_family("monospace");
+    layout.set_font_description(Some(&font));
+    f64::from(layout.pixel_size().0)
+}
+
+/// The cells of the text from `range` on `line`, in the line's coordinates, on its first row.
+fn run_rect(line: &Line, range: &Range<usize>) -> graphene::Rect {
+    let cell = |at: usize| line.layout.index_to_pos(i32::try_from(line.shown(at)).unwrap_or(0));
+    let first = cell(range.start);
+    let last = cell(range.end.max(range.start + 1) - 1);
+    let rect = |x: i32, y: i32, width: i32, height: i32| {
+        #[allow(clippy::cast_possible_truncation)]
+        graphene::Rect::new(
+            pixels(x) as f32,
+            pixels(y) as f32,
+            pixels(width) as f32,
+            pixels(height) as f32,
+        )
+    };
+    rect(first.x(), first.y(), last.x() + last.width() - first.x(), first.height())
+}
+
+/// Where a shape over `range` goes, in the line's coordinates: a square a little smaller than a
+/// row, in the middle of a box's own source, or on a list item's marker, where its siblings'
+/// bullets are.
+fn marker_rect(line: &Line, range: &Range<usize>) -> graphene::Rect {
+    let run = run_rect(line, range);
+    let side = (run.height() * 0.8).round();
+    let own_source = line.layout.text()[line.shown(range.start)..].starts_with('[');
+    let center = if own_source {
+        run.x() + run.width() / 2.0
+    } else {
+        let first = run_rect(line, &(range.start..range.start + 1));
+        first.x() + first.width() / 2.0
+    };
+    graphene::Rect::new(
+        (center - side / 2.0).round(),
+        (run.y() + (run.height() - side) / 2.0).round(),
+        side,
+        side,
+    )
+}
+
+/// The width of the border of a task box whose side is `side`.
+fn box_border(side: f32) -> f32 {
+    (side * 0.1).max(1.5)
+}
+
+/// Draws a bullet or a task box over `range` on `line`, in the line's coordinates.
+fn draw_marker(
+    snapshot: &gtk::Snapshot,
+    line: &Line,
+    range: &Range<usize>,
+    shape: Shape,
+    color: &gdk::RGBA,
+) {
+    let rect = marker_rect(line, range);
+    let side = rect.width();
+    match shape {
+        Shape::TaskBox(checked) => {
+            let rounded = gtk::gsk::RoundedRect::from_rect(rect, side * 0.2);
+            if !checked {
+                let outline = color.with_alpha(0.55);
+                snapshot.append_border(&rounded, &[box_border(side); 4], &[outline; 4]);
+                return;
+            }
+            let accent = adw::StyleManager::default().accent_color_rgba();
+            snapshot.push_rounded_clip(&rounded);
+            snapshot.append_color(&accent, &rect);
+            snapshot.pop();
+            let (x, y) = (rect.x(), rect.y());
+            let check = gtk::gsk::PathBuilder::new();
+            check.move_to(x + side * 0.26, y + side * 0.52);
+            check.line_to(x + side * 0.43, y + side * 0.69);
+            check.line_to(x + side * 0.75, y + side * 0.33);
+            let stroke = gtk::gsk::Stroke::new(side * 0.13);
+            stroke.set_line_cap(gtk::gsk::LineCap::Round);
+            stroke.set_line_join(gtk::gsk::LineJoin::Round);
+            snapshot.append_stroke(&check.to_path(), &stroke, &gdk::RGBA::WHITE);
+        }
+        Shape::Bullet(marker) => {
+            // As wide as the inside of a task box, so bullets and boxes look alike in size.
+            let (glyph, weight) = match marker {
+                '*' => ("•", pango::Weight::Normal),
+                '+' => ("＋", pango::Weight::Bold),
+                _ => ("⁃", pango::Weight::Normal),
+            };
+            let layout = pango::Layout::new(&line.layout.context());
+            layout.set_text(glyph);
+            let attributes = pango::AttrList::new();
+            attributes.insert(pango::AttrInt::new_weight(weight));
+            layout.set_attributes(Some(&attributes));
+            let (ink, _) = layout.extents();
+            if ink.width() <= 0 || ink.height() <= 0 {
+                return;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let (ink_x, ink_y, ink_width, ink_height) = (
+                pixels(ink.x()) as f32,
+                pixels(ink.y()) as f32,
+                pixels(ink.width()) as f32,
+                pixels(ink.height()) as f32,
+            );
+            let scale = (side - 2.0 * box_border(side)) / ink_width;
+            snapshot.save();
+            snapshot.translate(&rect.center());
+            snapshot.scale(scale, scale);
+            snapshot.translate(&graphene::Point::new(
+                -(ink_x + ink_width / 2.0),
+                -(ink_y + ink_height / 2.0),
+            ));
+            snapshot.append_layout(&layout, color);
+            snapshot.restore();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,9 @@ use loro::undo::CursorWithPos;
 use loro::{LoroDoc, LoroText, UndoItemMeta, UndoManager};
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
+use crate::editing::toggle_checkbox;
+pub use crate::lists::ListKey;
+use crate::lists::list_edit;
 use crate::space::ORIGIN;
 use crate::time::{self, Timestamp};
 
@@ -324,6 +327,39 @@ impl Editor {
         }
     }
 
+    /// Makes the edit that Enter, Shift+Enter, Tab, or Shift+Tab makes in a list item, as an undo
+    /// step of its own: a new item, a continuation line, or the item moved in or out a level.
+    /// Returns whether the cursor was in a list item, where the key needs nothing else. With a
+    /// selection, it isn't, and the key does what it does in other text.
+    pub fn list_key(&mut self, key: ListKey) -> bool {
+        if !self.selection.is_empty() {
+            return false;
+        }
+        let Some(edit) = list_edit(&self.text, self.selection.head, key) else { return false };
+        if !edit.range.is_empty() || !edit.text.is_empty() {
+            self.replace(edit.range, &edit.text, true);
+            let at = self.boundary(edit.cursor);
+            self.place(Selection::cursor(at));
+        }
+        true
+    }
+
+    /// Checks or unchecks the task at `at`, or gives the list item there an unchecked box, as an
+    /// undo step of its own, with the selection where it was. Returns whether there was an item.
+    pub fn toggle_task(&mut self, at: usize) -> bool {
+        let Some((range, replacement)) = toggle_checkbox(&self.text, at) else { return false };
+        let before = self.selection;
+        let grown = replacement.len().wrapping_sub(range.len());
+        let keep = |p: usize| if p >= range.end { p.wrapping_add(grown) } else { p };
+        self.replace(range.clone(), replacement, true);
+        let selection = Selection { anchor: keep(before.anchor), head: keep(before.head) };
+        self.place(Selection {
+            anchor: self.boundary(selection.anchor),
+            head: self.boundary(selection.head),
+        });
+        true
+    }
+
     /// Takes the selected text out, and returns it for the clipboard.
     pub fn cut(&mut self) -> String {
         let cut = self.selected_text().to_owned();
@@ -455,7 +491,21 @@ impl Editor {
             return to;
         }
         let forward = direction == Direction::Forward;
-        for hidden in &self.display().hidden {
+        let display = self.display();
+        // Back onto the hidden source of a task box that takes its marker's place, a move lands
+        // before the item's text, with the box still drawn, and the next one just after the box's
+        // `]`, which shows its source.
+        if !forward && unit == Unit::Grapheme {
+            for task_box in &display.task_boxes {
+                if to == task_box.end && at > task_box.end {
+                    return to;
+                }
+                if task_box.start <= to && to < task_box.end && at == task_box.end {
+                    return task_box.start + "[ ]".len();
+                }
+            }
+        }
+        for hidden in &display.hidden {
             let inside = hidden.start < to && to < hidden.end;
             let onto = if forward { to == hidden.start } else { to == hidden.end };
             if inside || (onto && to != at) {

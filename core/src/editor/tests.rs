@@ -245,3 +245,40 @@ fn mouse_selections_take_in_hidden_syntax_at_their_ends() {
     e.take_in_syntax(&(task..task));
     assert_eq!(e.selection().head, task + 4);
 }
+
+#[test]
+fn list_keys_edit_list_items() {
+    let mut e = editor("- one|");
+    assert!(e.list_key(ListKey::Enter));
+    assert_eq!(shown(&e), "- one\n- |");
+    e.insert("two");
+    assert!(e.list_key(ListKey::Tab));
+    assert_eq!(shown(&e), "- one\n  - two|");
+    assert!(e.undo());
+    assert_eq!(shown(&e), "- one\n- two|");
+    // Outside lists, and with a selection, the keys do what they do in other text.
+    let mut e = editor("text|");
+    assert!(!e.list_key(ListKey::Enter));
+    let mut e = editor("- |one|");
+    assert!(!e.list_key(ListKey::Enter));
+}
+
+#[test]
+fn toggles_tasks_with_the_selection_in_place() {
+    let mut e = editor("- [ ] task|");
+    assert!(e.toggle_task(2));
+    assert_eq!(shown(&e), "- [x] task|");
+    let mut e = editor("- item|");
+    assert!(e.toggle_task(0));
+    assert_eq!(shown(&e), "- [ ] item|");
+}
+
+#[test]
+fn moves_back_into_a_task_box_in_two_steps() {
+    let mut e = editor("- [ ] te|xt");
+    e.move_by(Unit::Grapheme, Direction::Back, false);
+    e.move_by(Unit::Grapheme, Direction::Back, false);
+    assert_eq!(shown(&e), "- [ ] |text");
+    e.move_by(Unit::Grapheme, Direction::Back, false);
+    assert_eq!(shown(&e), "- [ ]| text");
+}

@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use crate::editing::{Span, Style, spans};
+use crate::editing::{Span, Style, list_pads, spans};
 
 /// How a range of the text looks. Several looks can cover the same text, as emphasis inside a link
 /// does, and apps apply them in the order they come, so a later one wins where they disagree.
@@ -38,6 +38,24 @@ pub struct Styled {
     pub look: Look,
 }
 
+/// A shape an app draws over text in place of its source, while the selection is away.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Shape {
+    /// A bulleted list item's marker, `*`, `-`, or `+`.
+    Bullet(char),
+    /// A task item's box, and whether it's checked. Over a list item's marker and the space after
+    /// it, the box takes the marker's place, and goes where the marker is. Over the box's own
+    /// source, `[ ]` or `[x]`, it goes in the middle of it.
+    TaskBox(bool),
+}
+
+/// Text that an app draws a shape over. The text stays in the layout, unseen, to keep its room.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Marker {
+    pub range: Range<usize>,
+    pub shape: Shape,
+}
+
 /// How a text looks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Display {
@@ -50,6 +68,14 @@ pub struct Display {
     /// The syntax that hides, because the selection doesn't touch what it belongs to, in order and
     /// without overlaps. None of it holds a line break.
     pub hidden: Vec<Range<usize>>,
+    /// The bullets and task boxes to draw, in order.
+    pub markers: Vec<Marker>,
+    /// The hidden source of each task box that takes its list item's marker's place: `[ ]` or
+    /// `[x]`, and the space after it. Moves treat it apart from other hidden syntax.
+    pub task_boxes: Vec<Range<usize>>,
+    /// Lines of numbered list items, with how many columns of the monospace font that list
+    /// prefixes use to move them right, so a list's one-digit numbers line up on the right.
+    pub pads: Vec<(Range<usize>, usize)>,
 }
 
 /// How `text` looks with `selection`, a byte range, selected. An element's syntax shows while the
@@ -90,7 +116,25 @@ pub fn display(text: &str, selection: &Range<usize>) -> Display {
         if display_math || matches!(style, Style::CodeBlock | Style::Table) {
             display.shaded.extend(lines(text, &range));
         }
-        // A task box and a list marker show until a later step draws over them.
+        // A bullet and a task box draw over their syntax, rather than dim and hide it. In a
+        // bulleted list, a task's box takes its marker's place, and the box's source hides.
+        match style {
+            Style::ListMarker if !shows => {
+                let bullet = text[range.clone()].chars().next().unwrap_or('-');
+                display.markers.push(Marker { range: range.clone(), shape: Shape::Bullet(bullet) });
+            }
+            Style::Checkbox(checked) if !shows => {
+                if let Some(first) = pieces.first() {
+                    let shape = Shape::TaskBox(checked);
+                    display.markers.push(Marker { range: first.clone(), shape });
+                }
+                if let Some(source) = pieces.get(1) {
+                    display.hidden.push(source.clone());
+                    display.task_boxes.push(source.clone());
+                }
+            }
+            _ => {}
+        }
         if !matches!(style, Style::Checkbox(_) | Style::ListMarker) {
             if !shows {
                 display.hidden.extend(pieces.iter().filter(|p| !p.is_empty()).cloned());
@@ -102,6 +146,7 @@ pub fn display(text: &str, selection: &Range<usize>) -> Display {
     display.shaded.sort_by_key(|line| line.start);
     display.shaded.dedup();
     display.hidden = merged(display.hidden);
+    display.pads = list_pads(text);
     display
 }
 
@@ -172,6 +217,29 @@ mod tests {
         // Anywhere in a pipe table shows all of its syntax.
         let table = text.find("| b").unwrap();
         assert_eq!(hidden(table), ["# ", "**", "**", "[", "](http://x)"]);
+    }
+
+    #[test]
+    fn draws_bullets_and_boxes_away_from_the_selection() {
+        let text = "- one\n- [x] done\n1. [ ] first\n\nend";
+        let away = display(text, &(text.len()..text.len()));
+        let markers: Vec<(&str, Shape)> =
+            away.markers.iter().map(|m| (&text[m.range.clone()], m.shape)).collect();
+        assert_eq!(
+            markers,
+            [
+                ("-", Shape::Bullet('-')),
+                ("- ", Shape::TaskBox(true)),
+                ("[ ]", Shape::TaskBox(false))
+            ]
+        );
+        let boxes: Vec<&str> = away.task_boxes.iter().map(|r| &text[r.clone()]).collect();
+        assert_eq!(boxes, ["[x] "]);
+        assert!(away.hidden.contains(&away.task_boxes[0]));
+        // On the item's marker or box, its source shows.
+        let on = display(text, &(6..6));
+        assert_eq!(on.markers.len(), 2);
+        assert_eq!(on.task_boxes, Vec::<Range<usize>>::new());
     }
 
     #[test]
