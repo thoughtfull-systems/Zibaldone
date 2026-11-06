@@ -92,6 +92,9 @@ attribute at the image's size, no wider than the text. Pasting an image works as
 
 Quote bars at each depth, the shade behind code blocks, and the keys that open and close them.
 
+**Try it:** nest quotes and lists, compare Enter with Shift+Enter, and type `>` with whole lines
+selected. Open a code block with a third backtick, add its language, and check blank lines and undo.
+
 ### 8. Math and diagrams
 
 Inline math becomes an atom. Display math and diagrams become drawn blocks while the selection is

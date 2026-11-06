@@ -32,7 +32,11 @@ pub struct Edit {
 /// code blocks are code, except in a `table` block, whose content is a list table's list. In other
 /// code, Enter and Shift+Enter keep the line's indentation, and Tab and Shift+Tab move the list
 /// item that holds the block.
+/// Lists and code inside block quotes keep their quote markers on new and rearranged lines.
 pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
+    if let Some(edit) = quoted_edit(body, cursor, key) {
+        return Some(edit);
+    }
     let tab = matches!(key, ListKey::Tab | ListKey::ShiftTab);
     match code_block(body, cursor) {
         Code::Outside => edit(body, cursor, key, None),
@@ -47,25 +51,39 @@ pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
             let lines = Dedented::new(&body[content.clone()], indent);
             let at = lines.dedented(cursor - content.start);
             let edit = list_edit(&lines.text, at, key)?;
-            let shift = |at: usize| content.start + lines.original(at);
-            let range = shift(edit.range.start)..shift(edit.range.end);
-            let text = edit.text.replace('\n', &format!("\n{}", " ".repeat(indent)));
-            let into = edit.cursor - edit.range.start;
-            let cursor = if into <= edit.text.len() {
-                // In the new text, which its newlines' indentation lengthened.
-                range.start + into + edit.text[..into].matches('\n').count() * indent
-            } else {
-                // After it, where the text was as it is now.
-                let unchanged = edit.cursor - edit.text.len() + edit.range.len();
-                shift(unchanged) + text.len() - range.len()
-            };
-            Some(Edit { cursor, range, text })
+            Some(lines.project(&edit, content.start, &" ".repeat(indent)))
         }
     }
 }
 
-/// Text with up to `indent` spaces taken from the start of each line, and the way back to the
-/// original's offsets.
+/// Edits the list or code inside a quote as text of its own, then restores the quote markers.
+/// Recursion removes one quote level at a time, so nested quotes retain all their markers.
+fn quoted_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
+    let quote =
+        Parser::new_ext(body, Options::empty()).into_offset_iter().find_map(|(event, range)| {
+            (matches!(event, Event::Start(Tag::BlockQuote(_)))
+                && range.start <= cursor
+                && cursor <= range.end)
+                .then_some(range)
+        })?;
+    let end = quote.start + body[quote.clone()].trim_end_matches(['\n', '\r']).len();
+    if cursor > end {
+        return None;
+    }
+    let line_start = body[..quote.start].rfind('\n').map_or(0, |i| i + 1);
+    let indent = quote.start - line_start;
+    let lines = Dedented::quoted(&body[quote.start..end], indent);
+    let at = cursor - quote.start;
+    let &(_, from, removed) = lines.lines.iter().rev().find(|&&(_, from, _)| from <= at)?;
+    if at < from + removed {
+        return None;
+    }
+    let edit = list_edit(&lines.text, lines.dedented(at), key)?;
+    Some(lines.project(&edit, quote.start, &format!("{}> ", " ".repeat(indent))))
+}
+
+/// Text with indentation or quote markers taken from each line, and the way back to the original's
+/// offsets.
 pub(crate) struct Dedented {
     pub(crate) text: String,
     /// For each line, where it starts in the dedented text and in the original, and how many
@@ -88,6 +106,45 @@ impl Dedented {
             start += line.len() + 1;
         }
         Self { text, lines }
+    }
+
+    fn quoted(original: &str, indent: usize) -> Self {
+        let mut text = String::new();
+        let mut lines = Vec::new();
+        let mut from = 0;
+        for (index, line) in original.split('\n').enumerate() {
+            if index > 0 {
+                text.push('\n');
+            }
+            let spaces = line.len() - line.trim_start_matches(' ').len();
+            let mut removed = if index == 0 { 0 } else { spaces.min(indent) };
+            if line[removed..].starts_with('>') {
+                removed += 1;
+                if line[removed..].starts_with([' ', '\t']) {
+                    removed += 1;
+                }
+            }
+            lines.push((text.len(), from, removed));
+            text.push_str(&line[removed..]);
+            from += line.len() + 1;
+        }
+        Self { text, lines }
+    }
+
+    /// Maps an edit back to the original text, restoring its prefix on inserted lines and keeping
+    /// a cursor either within the replacement or after it at the corresponding source position.
+    fn project(&self, edit: &Edit, base: usize, prefix: &str) -> Edit {
+        let shift = |at: usize| base + self.original(at);
+        let range = shift(edit.range.start)..shift(edit.range.end);
+        let text = edit.text.replace('\n', &format!("\n{prefix}"));
+        let into = edit.cursor - edit.range.start;
+        let cursor = if into <= edit.text.len() {
+            range.start + into + edit.text[..into].matches('\n').count() * prefix.len()
+        } else {
+            let unchanged = edit.cursor - edit.text.len() + edit.range.len();
+            shift(unchanged) + text.len() - range.len()
+        };
+        Edit { cursor, range, text }
     }
 
     fn line(&self, at: usize, original: bool) -> (usize, usize, usize) {

@@ -423,3 +423,151 @@ fn moves_onto_an_image_past_surrounding_hidden_formatting() {
     e.move_by(Unit::Grapheme, Direction::Back, false);
     assert_eq!(e.selection().head, text.find("]]**").unwrap() + 2);
 }
+
+#[test]
+fn enter_leaves_quotes_and_shift_enter_continues_them_as_single_undo_steps() {
+    for (before, enter, continued) in [
+        ("> café|", "> café\n\n|", "> café\n> |"),
+        (">> text|", ">> text\n>\n> |", ">> text\n>> |"),
+        ("> > te|xt", "> > te\n>\n> |xt", "> > te\n> > |xt"),
+        ("> text\n> |", "> text\n\n|", "> text\n> \n> |"),
+        ("> > a\n> more|", "> > a\n> more\n>\n> |", "> > a\n> more\n>> |"),
+        ("- > text|", "- > text\n  \n  |", "- > text\n  > |"),
+        ("- item\n  > text|", "- item\n  > text\n  \n  |", "- item\n  > text\n  > |"),
+        ("> |text|", "> \n|", "> \n|"),
+    ] {
+        for (continues, expected) in [(false, enter), (true, continued)] {
+            let mut e = editor(before);
+            let selection = e.selection();
+            e.newline(continues);
+            assert_eq!(shown(&e), expected, "{before:?}, continues {continues}");
+            assert!(e.undo());
+            assert_eq!(shown(&e), before);
+            assert_eq!(e.selection(), selection);
+            assert!(!e.can_undo());
+            assert!(e.redo());
+            assert_eq!(shown(&e), expected);
+        }
+    }
+}
+
+#[test]
+fn typing_quotes_preserves_selected_lines_and_their_list_indentation() {
+    for (before, once, twice) in [
+        ("|café\n\nmore|", "|> café\n> \n> more|", "|> > café\n> > \n> > more|"),
+        ("- |a\n  b|", "- |> a\n  > b|", "- |> > a\n  > > b|"),
+        ("\n|\na\n|\n", "\n\n|> a|\n\n", "\n\n|> > a|\n\n"),
+    ] {
+        let mut e = editor(before);
+        assert_eq!(e.type_text(">"), None);
+        assert_eq!(shown(&e), once);
+        assert_eq!(e.type_text(">"), None);
+        assert_eq!(shown(&e), twice);
+        assert!(e.undo());
+        assert_eq!(shown(&e), once);
+        assert!(e.undo());
+        assert_eq!(shown(&e), before);
+        assert!(e.redo());
+        assert_eq!(shown(&e), once);
+        assert!(e.redo());
+        assert_eq!(shown(&e), twice);
+    }
+    for (before, expected) in [("x |a|", "x >|"), ("|a| x", ">| x")] {
+        let mut e = editor(before);
+        e.type_text(">");
+        assert_eq!(shown(&e), expected);
+    }
+}
+
+#[test]
+fn typed_delimiters_wrap_content_and_keep_boundary_line_breaks_outside() {
+    for delimiter in ["*", "_", "`", "~", "=", "$", "["] {
+        let close = if delimiter == "[" { "]" } else { delimiter };
+        let mut e = editor("\n|\ncafé\n|\n");
+        e.type_text(delimiter);
+        assert_eq!(shown(&e), format!("\n\n{delimiter}|café|{close}\n\n"));
+        assert!(e.undo());
+        assert_eq!(shown(&e), "\n|\ncafé\n|\n");
+    }
+    // Pasting a delimiter replaces the selection without applying typing shortcuts.
+    let mut e = editor("|text|");
+    e.insert("`");
+    assert_eq!(shown(&e), "`|");
+}
+
+#[test]
+fn typing_fences_completes_blocks_and_preserves_the_language_cursor() {
+    for (before, typed, expected) in [
+        ("``|", "`", "```|\n```"),
+        ("- [ ] ``|", "`", "- [ ] ```|\n      ```"),
+        ("- item\n  ``|", "`", "- item\n  ```|\n  ```"),
+        ("$|", "$", "$$\n|\n$$"),
+        ("- item\n  $|", "$", "- item\n  $$\n  |\n  $$"),
+    ] {
+        let mut e = editor(before);
+        e.type_text(typed);
+        assert_eq!(shown(&e), expected);
+        assert!(e.undo());
+        assert_eq!(shown(&e), before);
+        assert!(e.redo());
+        assert_eq!(shown(&e), expected);
+    }
+    let mut e = editor("``|");
+    e.type_text("`");
+    e.type_text("rust");
+    e.newline(false);
+    assert_eq!(shown(&e), "```rust\n|\n```");
+    for before in ["a ``|", "``| a", "```\n``|"] {
+        let mut e = editor(before);
+        e.type_text("`");
+        assert_eq!(shown(&e), before.replace('|', "`|"));
+    }
+}
+
+#[test]
+fn a_third_backtick_and_second_dollar_fence_selected_content() {
+    for (before, typed, expected) in [
+        ("``|café|``", "`", "```\n|café|\n```"),
+        ("- ``|text|``", "`", "- ```\n  |text|\n  ```"),
+        ("$|x|$", "$", "$$\n|x|\n$$"),
+    ] {
+        let mut e = editor(before);
+        e.type_text(typed);
+        assert_eq!(shown(&e), expected);
+        assert!(e.undo());
+        assert_eq!(shown(&e), before);
+        assert!(e.redo());
+        assert_eq!(shown(&e), expected);
+    }
+}
+
+#[test]
+fn lists_and_code_inside_quotes_keep_their_quote_prefixes() {
+    for (before, continues, expected) in [
+        ("> - one|", false, "> - one\n> - |"),
+        ("> - one|", true, "> - one\n>   |"),
+        ("> - one\n>   more|", false, "> - one\n>   more\n> - |"),
+        ("> - one\n>   more|", true, "> - one\n>   more\n>   |"),
+        ("> > - one|", false, "> > - one\n> > - |"),
+        ("> - |", false, "> |"),
+        ("> ```\n>   code|\n> ```", false, "> ```\n>   code\n>   |\n> ```"),
+        ("- > - one|", false, "- > - one\n  > - |"),
+        ("```\n  code|\n```", false, "```\n  code\n  |\n```"),
+    ] {
+        let mut e = editor(before);
+        e.newline(continues);
+        assert_eq!(shown(&e), expected, "{before:?}");
+        assert!(e.undo());
+        assert_eq!(shown(&e), before);
+    }
+    let before = "> - one\n> - two|\n>   more";
+    let nested = "> - one\n>   - two|\n>     more";
+    let mut e = editor(before);
+    assert!(e.list_key(ListKey::Tab));
+    assert_eq!(shown(&e), nested);
+    assert!(e.undo());
+    assert_eq!(shown(&e), before);
+    e.list_key(ListKey::Tab);
+    assert!(e.list_key(ListKey::ShiftTab));
+    assert_eq!(shown(&e), before);
+}

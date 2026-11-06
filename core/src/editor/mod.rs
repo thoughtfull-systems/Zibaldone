@@ -17,8 +17,9 @@ use loro::{LoroDoc, LoroText, UndoItemMeta, UndoManager};
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 use crate::editing::toggle_checkbox;
+use crate::editing::{complete_block_opening, fence_selection, quote_newline, quote_selection};
 pub use crate::lists::ListKey;
-use crate::lists::list_edit;
+use crate::lists::{Edit, list_edit};
 use crate::space::ORIGIN;
 use crate::time::{self, Timestamp};
 use crate::{Id, body};
@@ -397,21 +398,78 @@ impl Editor {
         self.replace(range, typed, separate);
     }
 
-    /// Types text and reports the source to replace when `[[` opens the link picker.
+    /// Types text, applying delimiter and block shortcuts, and reports the source to replace when
+    /// `[[` opens the link picker. Pasted text uses `insert` and bypasses these shortcuts.
     pub fn type_text(&mut self, typed: &str) -> Option<Range<usize>> {
-        let range = self.selection.range();
-        if typed == "[" && !range.is_empty() {
-            let wrapped = range.start > 0
-                && self.text[..range.start].ends_with('[')
-                && self.text[range.end..].starts_with(']');
-            let text = format!("[{}]", self.selected_text());
-            self.replace(range.clone(), &text, true);
-            self.place(Selection { anchor: range.start + 1, head: range.end + 1 });
-            return wrapped.then(|| range.start - 1..range.end + 3);
+        if self.type_delimiter(typed) {
+            let range = self.selection.range();
+            let picker = typed == "["
+                && self.text[..range.start].ends_with("[[")
+                && self.text[range.end..].starts_with("]]");
+            return picker.then(|| range.start - 2..range.end + 2);
         }
         self.insert(typed);
         let end = self.selection.head;
         (typed == "[" && self.text[..end].ends_with("[[")).then(|| end - 2..end)
+    }
+
+    /// Handles a single delimiter: wraps selected text, quotes whole selected lines, or completes
+    /// a block's opening. Line breaks at the selection's edges stay outside the wrapper.
+    fn type_delimiter(&mut self, typed: &str) -> bool {
+        let open = match typed {
+            "*" | "_" | "`" | "~" | "=" | "$" | "[" | ">" => typed.chars().next().unwrap(),
+            _ => return false,
+        };
+        let mut range = self.selection.range();
+        if range.is_empty() {
+            let Some(edit) = complete_block_opening(&self.text, range.start, open) else {
+                return false;
+            };
+            self.apply_edit(edit, None);
+            return true;
+        }
+        while range.start < range.end && self.text.as_bytes()[range.start] == b'\n' {
+            range.start += 1;
+        }
+        while range.start < range.end && self.text.as_bytes()[range.end - 1] == b'\n' {
+            range.end -= 1;
+        }
+        if range.is_empty() {
+            return false;
+        }
+        let block = if open == '>' {
+            quote_selection(&self.text, range.clone())
+        } else {
+            fence_selection(&self.text, range.clone(), open)
+        };
+        if let Some((edit, selected)) = block {
+            self.apply_edit(edit, Some(selected));
+            return true;
+        }
+        if open == '>' {
+            return false;
+        }
+        let close = if open == '[' { ']' } else { open };
+        let replacement = format!("{open}{}{close}", &self.text[range.clone()]);
+        self.replace(range.clone(), &replacement, true);
+        self.place(Selection { anchor: range.start + 1, head: range.end + 1 });
+        true
+    }
+
+    /// Enter leaves the innermost quote, and Shift+Enter continues it. A quote in a list item
+    /// takes precedence over its item; inside code, the list rules preserve indentation instead.
+    /// A selection is replaced with a plain line break.
+    pub fn newline(&mut self, continues: bool) {
+        if self.selection.is_empty()
+            && let Some(edit) = quote_newline(&self.text, self.selection.head, continues)
+        {
+            self.apply_edit(edit, None);
+        } else {
+            let key = if continues { ListKey::ShiftEnter } else { ListKey::Enter };
+            if !self.list_key(key) {
+                self.insert("\n");
+            }
+        }
     }
 
     /// Replaces a picker's unchanged source with a link, as one undo step. A chosen label stays
@@ -492,6 +550,7 @@ impl Editor {
     pub fn undo(&mut self) -> bool {
         self.goal = None;
         self.checkpoint();
+        self.remember_selection();
         let undone = self.undo.undo().unwrap_or(false);
         self.after_history(undone)
     }
@@ -500,6 +559,7 @@ impl Editor {
     pub fn redo(&mut self) -> bool {
         self.goal = None;
         self.checkpoint();
+        self.remember_selection();
         let redone = self.undo.redo().unwrap_or(false);
         self.after_history(redone)
     }
@@ -525,6 +585,16 @@ impl Editor {
         true
     }
 
+    /// Applies one structural edit as an undo step, with its cursor or content selected afterward.
+    fn apply_edit(&mut self, edit: Edit, selected: Option<Range<usize>>) {
+        self.replace(edit.range, &edit.text, true);
+        let selection = selected.map_or_else(
+            || Selection::cursor(self.boundary(edit.cursor)),
+            |range| Selection { anchor: range.start, head: range.end },
+        );
+        self.place(selection);
+    }
+
     /// Replaces `range` with `with`, commits it, and puts the cursor after it. A `separate` edit is
     /// an undo step of its own, and doesn't merge with typing around it.
     fn replace(&mut self, range: Range<usize>, with: &str, separate: bool) {
@@ -534,15 +604,7 @@ impl Editor {
         } else {
             self.typed();
         }
-        let before: Vec<CursorWithPos> = [self.selection.anchor, self.selection.head]
-            .into_iter()
-            .filter_map(|at| {
-                let pos = self.text[..at].chars().count();
-                let cursor = self.body.get_cursor(pos, Side::Middle)?;
-                Some(CursorWithPos { cursor, pos: AbsolutePosition { pos, side: Side::Middle } })
-            })
-            .collect();
-        *self.before.lock().expect("unpoisoned") = before;
+        self.remember_selection();
         // A failed edit leaves the text as it was, which `refresh` then shows.
         if !range.is_empty() {
             let _ = self.body.delete_utf8(range.start, range.len());
@@ -557,6 +619,20 @@ impl Editor {
         self.text = self.body.to_string();
         let at = self.boundary((range.start + with.len()).min(self.text.len()));
         self.place(Selection::cursor(at));
+    }
+
+    /// An undo creates a redo step, and a redo creates an undo step. Each remembers the selection
+    /// before that operation, just as a new edit does, including a block's selected content.
+    fn remember_selection(&self) {
+        let before: Vec<CursorWithPos> = [self.selection.anchor, self.selection.head]
+            .into_iter()
+            .filter_map(|at| {
+                let pos = self.text[..at].chars().count();
+                let cursor = self.body.get_cursor(pos, Side::Middle)?;
+                Some(CursorWithPos { cursor, pos: AbsolutePosition { pos, side: Side::Middle } })
+            })
+            .collect();
+        *self.before.lock().expect("unpoisoned") = before;
     }
 
     /// Ends the undo step in progress, so the next edit starts a new one.

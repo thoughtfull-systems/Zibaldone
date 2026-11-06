@@ -27,6 +27,10 @@ const CARET: f32 = 1.5;
 const HEADING_SPACE: f64 = 6.0;
 /// Room between a revealed image's bottom and its source text.
 const IMAGE_SOURCE_GAP: f64 = 4.0;
+/// Room for each block quote level, and the bar's offset and width inside it.
+const QUOTE_BAR_OFFSET: f64 = 4.0;
+const QUOTE_BAR_WIDTH: f32 = 3.0;
+const QUOTE_INDENT: f64 = 18.0;
 /// The colors of syntax, links, highlights, and the shade behind code, as red, green, blue, and
 /// alpha, as the text view has them.
 const SYNTAX: (f64, f64, f64, f64) = (0.5, 0.5, 0.5, 0.9);
@@ -59,6 +63,16 @@ pub struct Line {
     markers: Vec<(Range<usize>, Shape)>,
     images: Vec<InlineImage>,
     backgrounds: Vec<Background>,
+    quote: Option<QuoteRoom>,
+}
+
+/// Room for quote bars: before the paragraph or inside it, past a list item's prefix.
+struct QuoteRoom {
+    above: f64,
+    continued: usize,
+    depth: usize,
+    inline: bool,
+    left: f64,
 }
 
 /// A background behind glyphs, which doesn't grow to the height of a neighboring image.
@@ -344,6 +358,16 @@ impl EditorWidget {
         gdk::Rectangle::new(x as i32, y as i32, 1, height as i32)
     }
 
+    /// Modifier-assisted input commits literal text, bypassing structural typing shortcuts.
+    fn commit_text(&self, text: &str, state: gdk::ModifierType) {
+        let modifiers = state & gtk::accelerator_get_default_mod_mask();
+        if (modifiers - gdk::ModifierType::SHIFT_MASK).is_empty() {
+            self.type_text(text);
+        } else {
+            self.edit(|e| e.insert(text));
+        }
+    }
+
     fn type_text(&self, text: &str) {
         let mut request = None;
         self.edit(|e| request = e.type_text(text));
@@ -381,14 +405,18 @@ impl EditorWidget {
 
         let im = gtk::IMMulticontext::new();
         im.set_client_widget(Some(self));
-        let w = self.downgrade();
-        im.connect_commit(move |_, text| {
-            if let Some(w) = w.upgrade() {
-                w.type_text(text);
-            }
-        });
         let keys = gtk::EventControllerKey::new();
         keys.set_im_context(Some(&im));
+        let w = self.downgrade();
+        let controller = keys.downgrade();
+        im.connect_commit(move |_, text| {
+            if let Some(w) = w.upgrade() {
+                let state = controller
+                    .upgrade()
+                    .map_or_else(gdk::ModifierType::empty, |keys| keys.current_event_state());
+                w.commit_text(text, state);
+            }
+        });
         let w = self.downgrade();
         keys.connect_key_pressed(move |_, key, _, state| {
             w.upgrade().map_or(glib::Propagation::Proceed, |w| w.key(key, state))
@@ -489,8 +517,13 @@ impl EditorWidget {
                 let columns = shown.pads.iter().filter(|(lines, _)| lines.contains(&start));
                 #[allow(clippy::cast_precision_loss)]
                 let pad = columns.map(|(_, columns)| *columns).max().unwrap_or(0) as f64 * column;
+                let quoted = shown.quotes.iter().find(|q| q.line.start == start);
+                #[allow(clippy::cast_precision_loss)]
+                let inset = quoted
+                    .filter(|q| q.start == start)
+                    .map_or(0.0, |q| q.depth as f64 * QUOTE_INDENT);
                 let layout = self.create_pango_layout(Some(&shown_text));
-                layout.set_width(units((wrap - pad).max(1.0)));
+                layout.set_width(units((wrap - pad - inset).max(1.0)));
                 layout.set_wrap(pango::WrapMode::WordChar);
                 let attributes = pango::AttrList::new();
                 let mut backgrounds = Vec::new();
@@ -504,16 +537,22 @@ impl EditorWidget {
                     .filter(|m| m.range.start >= start && m.range.start < end.max(start + 1))
                     .map(|m| (m.range.clone(), m.shape))
                     .collect();
-                for (range, _) in &markers {
-                    let (from, to) =
-                        (pieces_shown(&pieces, range.start), pieces_shown(&pieces, range.end));
-                    // An alpha of 0 counts as no alpha at all, and draws the text.
-                    for mut attribute in foreground((0.5, 0.5, 0.5, 0.004)) {
-                        attribute.set_start_index(u32::try_from(from).unwrap_or(0));
-                        attribute.set_end_index(u32::try_from(to).unwrap_or(u32::MAX));
-                        attributes.insert(attribute);
+                style_markers(&attributes, &pieces, &markers);
+                let quote = quoted.map(|q| {
+                    let inline = q.start > start;
+                    let offset = if inline {
+                        reserve_quote_room(&layout, &attributes, &pieces, q)
+                    } else {
+                        0.0
+                    };
+                    QuoteRoom {
+                        above: if heading { HEADING_SPACE } else { 0.0 },
+                        continued: quote_continuation(lines.last(), MARGIN_SIDES + pad + offset, y),
+                        depth: q.depth,
+                        inline,
+                        left: MARGIN_SIDES + pad + offset,
                     }
-                }
+                });
                 let images = shape_images(
                     &layout,
                     text,
@@ -521,7 +560,7 @@ impl EditorWidget {
                     &pieces,
                     &shown,
                     &imp.images.borrow(),
-                    wrap - pad,
+                    wrap - pad - inset,
                 );
                 layout.set_attributes(Some(&attributes));
                 if heading {
@@ -529,7 +568,7 @@ impl EditorWidget {
                 }
                 let shaded = shown.shaded.iter().any(|shaded| shaded.start == start);
                 let height = pixels(layout.size().1);
-                let left = MARGIN_SIDES + pad;
+                let left = MARGIN_SIDES + pad + inset;
                 lines.push(Line {
                     start,
                     end,
@@ -542,6 +581,7 @@ impl EditorWidget {
                     markers,
                     images,
                     backgrounds,
+                    quote,
                 });
                 y += height;
                 start = end + 1;
@@ -641,6 +681,9 @@ impl EditorWidget {
             if line.shaded {
                 let rect = graphene::Rect::new(0.0, line.y as f32, width, line.height as f32);
                 snapshot.append_color(&shade, &rect);
+            }
+            for rect in quote_rects(line) {
+                snapshot.append_color(&color.with_alpha(0.3), &rect);
             }
             snapshot.save();
             snapshot.translate(&graphene::Point::new(line.left as f32, line.y as f32));
@@ -970,12 +1013,7 @@ impl EditorWidget {
             gdk::Key::BackSpace => self.edit(|e| e.delete(word, back)),
             gdk::Key::Delete | gdk::Key::KP_Delete => self.edit(|e| e.delete(word, forward)),
             gdk::Key::Return | gdk::Key::KP_Enter => {
-                let key = if shift { ListKey::ShiftEnter } else { ListKey::Enter };
-                self.edit(|e| {
-                    if !e.list_key(key) {
-                        e.insert("\n");
-                    }
-                });
+                self.edit(|e| e.newline(shift));
             }
             gdk::Key::Tab | gdk::Key::ISO_Left_Tab => {
                 let back = shift || key == gdk::Key::ISO_Left_Tab;
@@ -1212,6 +1250,97 @@ fn selection_rects(
         }
     }
     rects
+}
+
+/// Reserves quote indentation after a list prefix, without moving that prefix. The preceding
+/// space keeps its font height, so the room doesn't change baselines or collide with images.
+fn reserve_quote_room(
+    layout: &pango::Layout,
+    attributes: &pango::AttrList,
+    pieces: &[Piece],
+    quote: &zib_core::editing::QuotedLine,
+) -> f64 {
+    let from = pieces_shown(pieces, quote.start.saturating_sub(1));
+    let to = pieces_shown(pieces, quote.start);
+    layout.set_attributes(attributes.copy().as_ref());
+    let cell = layout.index_to_pos(i32::try_from(from).unwrap_or(0));
+    #[allow(clippy::cast_precision_loss)]
+    let room = units(quote.depth as f64 * QUOTE_INDENT);
+    let rect = pango::Rectangle::new(
+        0,
+        cell.y() - baseline_at(layout, from),
+        cell.width() + room,
+        cell.height(),
+    );
+    let mut shape = pango::AttrShape::new(&rect, &rect);
+    shape.set_start_index(u32::try_from(from).unwrap_or(0));
+    shape.set_end_index(u32::try_from(to).unwrap_or(u32::MAX));
+    attributes.change(shape);
+    pixels(cell.x() + cell.width())
+}
+
+/// The depth that continues directly from the previous line at the same horizontal position.
+/// A bar inside a wrapped list paragraph stops at its first row, so the next line starts anew.
+fn quote_continuation(previous: Option<&Line>, left: f64, top: f64) -> usize {
+    let Some(previous) = previous else { return 0 };
+    let Some(quote) = &previous.quote else { return 0 };
+    let height = if quote.inline {
+        pixels(previous.layout.iter().line_extents().1.height())
+    } else {
+        previous.height
+    };
+    if (quote.left - left).abs() < 0.01 && (previous.y + height - top).abs() < 0.01 {
+        quote.depth
+    } else {
+        0
+    }
+}
+
+/// Quote bars join through blank lines and heading spacing. Each new bar starts slightly below
+/// the row's top, clear of the previous line's descenders. Continuing bars keep their full height.
+/// Room inside a paragraph belongs to its first row; quote margins follow every wrapped row.
+fn quote_rects(line: &Line) -> Vec<graphene::Rect> {
+    let Some(quote) = &line.quote else { return Vec::new() };
+    let height = if quote.inline {
+        pixels(line.layout.iter().line_extents().1.height())
+    } else {
+        line.height
+    };
+    let metrics = line.layout.iter().run_readonly().map_or_else(
+        || line.layout.context().metrics(None, None),
+        |run| run.item().analysis().font().metrics(None),
+    );
+    // Font metrics keep this gap proportional to text even when a tall image enlarges the row.
+    let inset = (pixels(metrics.ascent() + metrics.descent()) / 5.0).ceil().min(height);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    (0..quote.depth)
+        .map(|level| {
+            let inset = if level < quote.continued { 0.0 } else { inset };
+            graphene::Rect::new(
+                (quote.left + level as f64 * QUOTE_INDENT + QUOTE_BAR_OFFSET) as f32,
+                (line.y - quote.above + inset) as f32,
+                QUOTE_BAR_WIDTH,
+                (height + quote.above - inset) as f32,
+            )
+        })
+        .collect()
+}
+
+/// The text under a bullet or task box keeps its room but stays unseen. An alpha of zero would
+/// make Pango draw it at full opacity, so use the smallest visible alpha instead.
+fn style_markers(
+    attributes: &pango::AttrList,
+    pieces: &[Piece],
+    markers: &[(Range<usize>, Shape)],
+) {
+    for (range, _) in markers {
+        let (from, to) = (pieces_shown(pieces, range.start), pieces_shown(pieces, range.end));
+        for mut attribute in foreground((0.5, 0.5, 0.5, 0.004)) {
+            attribute.set_start_index(u32::try_from(from).unwrap_or(0));
+            attribute.set_end_index(u32::try_from(to).unwrap_or(u32::MAX));
+            attributes.insert(attribute);
+        }
+    }
 }
 
 fn units(pixels: f64) -> i32 {
@@ -2096,6 +2225,165 @@ mod tests {
         let mut bytes = vec![0; 600 * 330 * 4];
         texture.download(&mut bytes, 600 * 4);
         bytes
+    }
+
+    #[test]
+    fn quote_bars_join_across_blank_lines_headings_and_wrapped_text() {
+        let text = concat!(
+            "> # Quote heading\n>\n> Outer **bold**\n",
+            "> > Inner words that wrap onto more rows\n> > more\n\n|end"
+        );
+        let Some(widget) = widget(text) else { return };
+        widget.lay_out(240);
+        let lines = widget.imp().lines.borrow();
+        let mut bottom = MARGIN_TOP;
+        for (index, line) in lines.iter().take(5).enumerate() {
+            let bars = quote_rects(line);
+            let depth = line.quote.as_ref().unwrap().depth;
+            assert_eq!(bars.len(), depth);
+            if index == 0 {
+                assert!(f64::from(bars[0].y()) > bottom);
+            } else {
+                assert_eq!(f64::from(bars[0].y()), bottom);
+            }
+            assert_eq!(f64::from(bars[0].x()), MARGIN_SIDES + QUOTE_BAR_OFFSET);
+            assert_eq!(line.left, MARGIN_SIDES + f64::from(u32::try_from(depth).unwrap()) * 18.0);
+            bottom = f64::from(bars[0].y() + bars[0].height());
+            assert_eq!(bottom, line.y + line.height);
+            if depth == 2 {
+                assert_eq!(bars[1].x() - bars[0].x(), 18.0);
+                if index == 3 {
+                    assert!(bars[1].y() > bars[0].y());
+                } else {
+                    assert_eq!(bars[1].y(), bars[0].y());
+                }
+                assert_eq!(bars[1].y() + bars[1].height(), bars[0].y() + bars[0].height());
+            }
+        }
+        assert_eq!(lines[1].layout.text(), "");
+        assert!(lines[3].layout.line_count() > 1);
+        assert_eq!(quote_rects(lines.last().unwrap()), Vec::<graphene::Rect>::new());
+    }
+
+    #[test]
+    fn quotes_inside_list_items_reserve_room_after_the_marker() {
+        let text = "- > quoted words that wrap over several rows\n  > > nested\n\n|end";
+        let Some(widget) = widget(text) else { return };
+        widget.lay_out(240);
+        let lines = widget.imp().lines.borrow();
+        let first = &lines[0];
+        let next = &lines[1];
+        assert!(first.layout.line_count() > 1);
+        assert_eq!(first.left, MARGIN_SIDES);
+        let bars = quote_rects(first);
+        assert_eq!(bars.len(), 1);
+        let first_row = pixels(first.layout.iter().line_extents().1.height());
+        assert!(f64::from(bars[0].y()) > first.y);
+        assert_eq!(f64::from(bars[0].y() + bars[0].height()), first.y + first_row);
+        let x = pixels(first.layout.index_to_pos(2).x());
+        assert!(MARGIN_SIDES + x > f64::from(bars[0].x() + bars[0].width()));
+        assert_eq!(quote_rects(next).len(), 2);
+        assert_eq!(quote_rects(next)[0].x(), bars[0].x());
+        let at = text.find("quoted").unwrap();
+        let cell = first.layout.index_to_pos(i32::try_from(first.shown(at)).unwrap());
+        assert_eq!(widget.position_at(first.left + pixels(cell.x()) + 1.0, first.y + 4.0), at);
+    }
+
+    #[test]
+    fn quoted_images_fit_the_inset_width_and_keep_their_source_mapping() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("> ![[{id}]]\n\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let (generation, _) = widget.image_requests(false);
+        widget.set_image(generation, id, Some(texture(800, 400)));
+        widget.lay_out(240);
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        let picture = image_rect(line, &line.images[0]);
+        assert_eq!(picture.width(), 174.0);
+        assert_eq!(picture.height(), 87.0);
+        assert_eq!(line.left, MARGIN_SIDES + QUOTE_INDENT);
+        assert_eq!(f64::from(picture.width()) + line.left, 216.0);
+        let (x, y) = (line.left + 10.0, line.y + 10.0);
+        drop(lines);
+        assert_eq!(widget.position_at(x, y), 2);
+        widget.edit(|e| e.move_to(2, false));
+        assert!(has_image_source(&widget));
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        let image = &line.images[0];
+        let source = source_rect(line, image).unwrap();
+        assert!(source.x() >= 0.0);
+        let bar = quote_rects(line)[0];
+        assert!((f64::from(bar.y()) - line.y) < 10.0);
+        assert_eq!(f64::from(bar.y() + bar.height()), line.y + line.height);
+    }
+
+    #[test]
+    fn code_blocks_shade_empty_lines_and_quote_bars_render_at_each_depth() {
+        let text = "> # Heading\n>\n> Outer\n> > Inner\n> > more\n\n```rust\ncode\n\n```\n\n|end";
+        let Some(widget) = widget(text) else { return };
+        let _window = gtk::Window::builder().child(&widget).build();
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string("* { color: #222; }");
+        gtk::style_context_add_provider_for_display(
+            &widget.display(),
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        widget.measure(gtk::Orientation::Horizontal, -1);
+        widget.measure(gtk::Orientation::Vertical, 600);
+        widget.allocate(600, 330, -1, None);
+        let renderer = gtk::gsk::CairoRenderer::new();
+        renderer.realize(None::<&gdk::Surface>).unwrap();
+        let snapshot = gtk::Snapshot::new();
+        let viewport = graphene::Rect::new(0.0, 0.0, 600.0, 330.0);
+        snapshot.append_color(&gdk::RGBA::WHITE, &viewport);
+        widget.draw(&snapshot);
+        let texture = renderer.render_texture(snapshot.to_node().unwrap(), Some(&viewport));
+        let mut bytes = vec![0; 600 * 330 * 4];
+        texture.download(&mut bytes, 600 * 4);
+        renderer.unrealize();
+        let pixel = |x: f64, y: f64| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let at = ((y as usize) * 600 + x as usize) * 4;
+            &bytes[at..at + 4]
+        };
+        let lines = widget.imp().lines.borrow();
+        for line in lines.iter().take(5) {
+            for bar in quote_rects(line) {
+                assert_ne!(
+                    pixel(f64::from(bar.x()) + 1.0, f64::from(bar.y()) + 2.0),
+                    &[255, 255, 255, 255]
+                );
+            }
+        }
+        for line in lines.iter().skip(6).take(4) {
+            assert!(line.shaded);
+            assert_ne!(pixel(400.0, line.y + 2.0), &[255, 255, 255, 255]);
+        }
+        assert!(!lines[10].shaded);
+        assert_eq!(pixel(400.0, lines[10].y + 2.0), &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn quote_and_code_keys_use_core_rules_and_modified_input_stays_literal() {
+        let Some(widget) = widget("> text|") else { return };
+        widget.key(gdk::Key::Return, gdk::ModifierType::SHIFT_MASK);
+        assert_eq!(widget.text().as_deref(), Some("> text\n> "));
+        widget.key(gdk::Key::Return, gdk::ModifierType::empty());
+        assert_eq!(widget.text().as_deref(), Some("> text\n\n"));
+        widget.set_editor(Some(Editor::new(Body::detached("``"))));
+        widget.edit(|e| e.move_to(2, false));
+        widget.commit_text("`", gdk::ModifierType::empty());
+        assert_eq!(widget.text().as_deref(), Some("```\n```"));
+        assert_eq!(head(&widget), 3);
+        for state in [gdk::ModifierType::ALT_MASK, gdk::ModifierType::CONTROL_MASK] {
+            widget.set_editor(Some(Editor::new(Body::detached("selected"))));
+            widget.edit(Editor::select_all);
+            widget.commit_text("`", state);
+            assert_eq!(widget.text().as_deref(), Some("`"));
+        }
     }
 
     #[test]

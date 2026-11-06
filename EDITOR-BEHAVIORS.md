@@ -24,11 +24,13 @@ Like `PLAN.md`, this list goes away once the work ends.
 - [ ] Syntax that shows, such as `**`, `[[`, or a heading's `#` markers, shows dimmed. This changes
   the current editor, which leaves a heading's `#` markers in the text color.
 - [ ] Code blocks show in a monospace font on a shade that spans the editor's width, empty lines
-  included, and starts at the line's start for a block nested in a list item.
+  included, and starts at the line's start for a block nested in a list item. (core:
+  `editor::display::tests`, widget: `editor_widget::tests`)
 - [ ] Block quotes show in italics and dimmed, moved right by one step for each level of nesting,
   with a bar beside their lines for each level. Bars of lines in a row join up. A quote in a list
   item starts past the item's marker or indentation, with its bars there, and moves only its own
-  lines.
+  lines. Bars also join through heading spacing and blank quote lines. (core:
+  `editor::display::tests`, widget: `editor_widget::tests`)
 - [ ] A pipe table's source shows like a code block, in a monospace font on a shade across the
   editor's width, so its columns line up. This changes the current editor, which shows it in a
   monospace font with no shade.
@@ -77,7 +79,8 @@ The core's `lists::list_edit` holds these, with tests.
 
 ## Block quotes
 
-In the core's `editing::quote_newline` and `editing::quote_selection`, with tests.
+The core's `Editor::newline` and delimiter commands use `editing::quote_newline` and
+`editing::quote_selection`. The rules and undo have tests in `editor::tests`.
 
 - [ ] Enter in a quote leaves the innermost quote: a line with one `>` fewer separates the quote
   from the next line, which starts with one `>` fewer. On a quote line with nothing before the
@@ -102,8 +105,9 @@ In the core's `pipe_tables::table_edit`, with tests.
 
 ## Typing delimiters
 
-In `attach_wrap_keys`, with the core's `editing::complete_block_opening` and
-`editing::fence_selection`.
+The core's `Editor::type_text` uses `editing::complete_block_opening` and
+`editing::fence_selection`, with tests in `editor::tests`. Pasting uses `Editor::insert` and skips
+these shortcuts.
 
 - [ ] Typing `*`, `_`, `` ` ``, `~`, `=`, or `$` with a selection wraps it in the delimiter on both
   sides, and keeps the text inside selected, so typing it again doubles it. `[` wraps it in `[` and

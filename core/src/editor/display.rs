@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use crate::editing::{Span, Style, list_pads, spans};
+use crate::editing::{QuotedLine, Span, Style, list_pads, quoted_lines, spans};
 use crate::markup::{self, Inline};
 use crate::{Id, body};
 
@@ -86,6 +86,8 @@ pub struct Image {
 /// How a text looks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Display {
+    /// The quoted lines, including blank lines and lazy paragraph continuations, in source order.
+    pub quotes: Vec<QuotedLine>,
     /// Available embedded images, in source order. Revealing the source keeps the image in place.
     pub images: Vec<Image>,
     /// Titles for wikilinks without labels, in source order. These never enter the body.
@@ -198,6 +200,7 @@ pub fn with_images(
     display.shaded.dedup();
     display.hidden = merged(display.hidden);
     display.pads = list_pads(text);
+    display.quotes = quoted_lines(text);
     for link in body::wikilinks(text) {
         let touches =
             |range: &Range<usize>| range.start <= selection.end && selection.start <= range.end;
@@ -466,5 +469,38 @@ mod tests {
             shaded,
             ["  ```rust", "  fn main() {}", "  ```", "| a | b |", "|---|---|", "| c | d |"]
         );
+    }
+
+    #[test]
+    fn quote_decorations_keep_depth_and_start_through_blank_and_lazy_lines() {
+        let text = "> outer\n>\n> > inner\nlazy\n\n- > listed\n  > more\n\nend";
+        let shown = display(text, &(text.len()..text.len()));
+        let quotes: Vec<_> = shown
+            .quotes
+            .iter()
+            .map(|q| (&text[q.line.clone()], q.depth, q.start - q.line.start))
+            .collect();
+        assert_eq!(
+            quotes,
+            [
+                ("> outer", 1, 0),
+                (">", 1, 0),
+                ("> > inner", 2, 0),
+                ("lazy", 2, 0),
+                ("- > listed", 1, 2),
+                ("  > more", 1, 2),
+            ]
+        );
+        assert_eq!(display(text, &(2..2)).quotes, shown.quotes);
+        let code = "```\n> literal\n```\n\n    > indented code\n\nend";
+        assert_eq!(display(code, &(0..0)).quotes, Vec::<QuotedLine>::new());
+    }
+
+    #[test]
+    fn code_shading_includes_empty_lines_and_stops_at_the_closing_fence() {
+        let text = "```rust\nlet x = 1;\n\n```\nafter\n\n> ```\n> code\n>\n> ```\n\nend";
+        let shown = display(text, &(text.len()..text.len()));
+        let shaded: Vec<_> = shown.shaded.iter().map(|r| &text[r.clone()]).collect();
+        assert_eq!(shaded, ["```rust", "let x = 1;", "", "```", "> ```", "> code", ">", "> ```"]);
     }
 }
