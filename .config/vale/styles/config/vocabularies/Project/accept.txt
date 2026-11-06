@@ -13,12 +13,14 @@ CommonMark
 Crockford('s)?
 devenv
 Djot
+egui
 Fontconfig
 FTS5
 GFM('s)?
 gitlint
 GLib('s)?
 GTK('s)?
+iced
 iroh('s)?
 Jetpack
 Kotlin
@@ -32,6 +34,7 @@ Nygard
 Pandoc('s)?
 Pango
 PDFs
+Qt
 responder('s)?
 Rust
 sccache
@@ -40,6 +43,7 @@ SQLite
 Syncthing
 Tantivy
 Tauri
+Tiptap
 Tokio('s)?
 Typst
 UniFFI
