@@ -117,6 +117,10 @@ Shift+Tab. Nest a table inside a cell, resize the window, and check undo and lin
 Edits from other machines arrive in the Loro text while the note is open, and the selection keeps
 its place. Other machines' cursors and selections show in their colors.
 
+**Try it:** open the same note on two machines. Type before and inside a selection, undo local
+edits, and check that the other machine's edits stay. Move both cursors through styles, images, and
+tables. Leave a cursor still, disconnect, and switch notes to check that stale cursors disappear.
+
 ### 11. The switch
 
 The new editor becomes the default once it does everything the old one does. Then the GTK text view,

@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 mod drawings;
+mod presence;
 mod tables;
 
 use adw::prelude::*;
@@ -206,6 +207,7 @@ mod imp {
         pub im: RefCell<Option<gtk::IMMulticontext>>,
         /// Called after each edit the owner makes.
         pub edited: RefCell<Option<Box<dyn Fn()>>>,
+        pub selection_changed: RefCell<Option<Box<dyn Fn()>>>,
         pub open_link: Callback<LinkTarget>,
         pub pick_link: Callback<Range<usize>>,
         /// The word or line a double or triple click selected, which a drag with the button still
@@ -301,6 +303,10 @@ impl EditorWidget {
     /// Calls `f` after each edit the owner makes.
     pub fn connect_edited(&self, f: impl Fn() + 'static) {
         *self.imp().edited.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn connect_selection_changed(&self, f: impl Fn() + 'static) {
+        *self.imp().selection_changed.borrow_mut() = Some(Box::new(f));
     }
 
     pub fn connect_open_link(&self, f: impl Fn(LinkTarget) + 'static) {
@@ -504,10 +510,28 @@ impl EditorWidget {
 
     /// Shows edits that arrived from elsewhere.
     pub fn refresh(&self) {
+        let scrolled = self
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_then(|s| s.downcast::<gtk::ScrolledWindow>().ok());
+        let anchor = self.head().and_then(|head| {
+            let (_, y, height) = caret_rect(&self.imp().lines.borrow(), head)?;
+            let adjustment = scrolled.as_ref()?.vadjustment();
+            (y >= adjustment.value() && y + height <= adjustment.value() + adjustment.page_size())
+                .then_some(y - adjustment.value())
+        });
         let changed = self.imp().editor.borrow_mut().as_mut().is_some_and(Editor::refresh);
         if changed {
-            self.relayout();
+            self.imp().held.borrow_mut().take();
+            self.imp().drag_origin.borrow_mut().take();
+            self.rebuild_layout();
+            let caret = self.head().and_then(|head| caret_rect(&self.imp().lines.borrow(), head));
+            if let (Some(scrolled), Some(screen_y), Some((_, y, _))) = (scrolled, anchor, caret) {
+                self.restore_view(&scrolled, y - screen_y);
+            }
+            self.offer_selection();
         }
+        // An earlier cursor message may refer to operations this refresh has just imported.
+        self.queue_draw();
     }
 
     fn setup(&self) {
@@ -901,6 +925,7 @@ impl EditorWidget {
             snapshot.restore();
             tables::snapshot(self, snapshot, line);
         }
+        presence::draw(self, snapshot, &lines, &editor.remote_selections());
         if self.has_focus()
             && let Some((x, y, height)) = caret_rect(&lines, editor.selection().head)
         {
@@ -1083,6 +1108,8 @@ impl EditorWidget {
 
     /// Runs `f` on the editor, and lays out, redraws, and reports the edit after.
     fn edit(&self, f: impl FnOnce(&mut Editor)) {
+        // An import can reach the shared document before its UI notification is delivered.
+        self.refresh();
         let Some(mut editor) = self.imp().editor.borrow_mut().take() else { return };
         let before = editor.text().to_owned();
         let head = editor.selection().head;
@@ -1124,15 +1151,26 @@ impl EditorWidget {
 
     /// Offers the selection as the primary selection, and scrolls the cursor into view.
     fn after_selection(&self) {
-        let selected = self.imp().editor.borrow().as_ref().map(|e| e.selected_text().to_owned());
-        if let Some(selected) = selected.filter(|s| !s.is_empty()) {
-            self.primary_clipboard().set_text(&selected);
-        }
+        self.offer_selection();
         if self.imp().keep_view.take() {
             return;
         }
         let w = self.clone();
         glib::idle_add_local_once(move || w.scroll_to_cursor());
+    }
+
+    fn offer_selection(&self) {
+        self.selection_changed();
+        let selected = self.imp().editor.borrow().as_ref().map(|e| e.selected_text().to_owned());
+        if let Some(selected) = selected.filter(|s| !s.is_empty()) {
+            self.primary_clipboard().set_text(&selected);
+        }
+    }
+
+    fn selection_changed(&self) {
+        if let Some(changed) = self.imp().selection_changed.borrow().as_ref() {
+            changed();
+        }
     }
 
     fn scroll_to_cursor(&self) {

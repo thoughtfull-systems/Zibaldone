@@ -269,6 +269,8 @@ impl Window {
             let w = this.clone();
             widget.connect_edited(move || w.new_editor_edited());
             let w = this.clone();
+            widget.connect_selection_changed(move || w.cursor_moved());
+            let w = this.clone();
             widget.connect_open_link(move |target| w.open_link(target));
             let w = this.clone();
             widget.connect_pick_link(move |range| w.open_widget_link_picker(range));
@@ -737,18 +739,28 @@ impl Window {
                     None => w.inner().view.grab_focus(),
                 };
             }
+            let session = w.inner().new_editor.as_ref().map(EditorWidget::session);
             let opened = core({
                 let state = state.clone();
                 async move { state.open_note(space, note).await }
             })
             .await;
+            if w.inner().new_editor.as_ref().map(EditorWidget::session) != session {
+                return;
+            }
             if let Ok(mut opened) = opened {
                 if let Some(editor) = w.inner().editor.borrow_mut().as_mut() {
                     editor.cursors = Some(opened.cursors.clone());
                 }
+                w.cursor_moved();
                 let listening = w.clone();
                 glib::spawn_future_local(async move {
                     while let Some(event) = core_recv(&mut opened.events).await {
+                        if listening.inner().new_editor.as_ref().map(EditorWidget::session)
+                            != session
+                        {
+                            break;
+                        }
                         listening.live_event(space, note, event);
                     }
                 });
@@ -1104,11 +1116,17 @@ impl Window {
         match event {
             LiveEvent::Started { machine } => {
                 remote.started(machine);
+                if let Some(widget) = &self.inner().new_editor {
+                    widget.remote_started(machine);
+                }
                 // The other machine sees this one's cursor at once, not at the next move.
                 self.cursor_moved();
             }
             LiveEvent::Changed { machine } => {
                 remote.started(machine);
+                if let Some(widget) = &self.inner().new_editor {
+                    widget.remote_started(machine);
+                }
                 self.refresh_open(space, note);
                 let state = self.inner().state.clone();
                 glib::spawn_future_local(async move {
@@ -1116,6 +1134,21 @@ impl Window {
                 });
             }
             LiveEvent::Cursor { machine, selections } => {
+                if let Some(widget) = &self.inner().new_editor {
+                    // Record the cursor before looking up its name. A slower lookup mustn't
+                    // replace a newer selection or bring back an ended session.
+                    widget.remote_received(machine, selections);
+                    let (state, widget, session) =
+                        (self.inner().state.clone(), widget.clone(), widget.session());
+                    glib::spawn_future_local(async move {
+                        if let Some(name) =
+                            core(async move { state.machine_name(space, machine).await }).await
+                        {
+                            widget.remote_name(session, machine, name);
+                        }
+                    });
+                    return;
+                }
                 let name = self.inner().state.clone();
                 let w = self.clone();
                 glib::spawn_future_local(async move {
@@ -1126,7 +1159,12 @@ impl Window {
                     w.place_remote(space);
                 });
             }
-            LiveEvent::Ended { machine } => remote.ended(machine),
+            LiveEvent::Ended { machine } => {
+                remote.ended(machine);
+                if let Some(widget) = &self.inner().new_editor {
+                    widget.remote_ended(machine);
+                }
+            }
         }
         if let Some(editor) = self.inner().editor.borrow().as_ref() {
             editor.live.set(remote.live());
@@ -1198,6 +1236,12 @@ impl Window {
             let Some(sender) = editor.cursors.clone() else { return };
             (editor.space, editor.note, sender, editor.insertions.clone())
         };
+        if let Some(widget) = &self.inner().new_editor {
+            if let Some(selection) = widget.encoded_selection() {
+                let _ = sender.send((note, vec![selection]));
+            }
+            return;
+        }
         let buffer = &self.inner().buffer;
         let (anchor, head) = buffer.selection_bounds().map_or_else(
             || {
@@ -1273,6 +1317,9 @@ impl Window {
             let Some(w) = w.upgrade().map(Self) else { return glib::ControlFlow::Break };
             w.cursor_moved();
             w.inner().remote.expire();
+            if let Some(widget) = &w.inner().new_editor {
+                widget.expire_remote();
+            }
             glib::ControlFlow::Continue
         });
     }

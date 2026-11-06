@@ -787,3 +787,132 @@ fn table_availability_collapses_source_and_survives_pending_cell_edits() {
     assert!(e.display().drawings[0].collapsed());
     assert_eq!(e.display().paragraphs(e.text()).len(), 2);
 }
+
+#[test]
+fn encoded_live_selections_keep_direction_and_use_the_body_not_display_text() {
+    let mut e = editor("é **bold**\nend");
+    e.select(11, 3);
+    let encoded = e.encoded_selection().unwrap();
+    let position =
+        |bytes: &[u8]| e.doc.get_cursor_pos(&Cursor::decode(bytes).unwrap()).unwrap().current.pos;
+    assert_eq!(position(&encoded.anchor), 10);
+    assert_eq!(position(&encoded.head), 2);
+    let mut empty = editor("");
+    let empty_selection = empty.encoded_selection().unwrap();
+    let machine = Id::generate();
+    empty.presence().started(machine);
+    empty.presence().received(machine, vec![empty_selection]);
+    assert_eq!(empty.remote_selections()[0].selection, Selection::cursor(0));
+}
+
+#[test]
+fn remote_selections_follow_local_and_imported_edits_without_affecting_undo_or_syntax() {
+    let mut e = editor("é **bold**\n|end");
+    let other = LoroDoc::new();
+    other.import(&e.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other });
+    peer.select(9, 5);
+    let machine = Id::generate();
+    e.presence().started(machine);
+    e.presence().received(machine, vec![peer.encoded_selection().unwrap()]);
+    e.presence().set_name(machine, "Peer <&>".to_owned());
+    let hidden = e.display().hidden.clone();
+    let remote = &e.remote_selections()[0];
+    assert_eq!(remote.name, "Peer <&>");
+    assert_eq!(&e.text()[remote.selection.range()], "bold");
+    assert_eq!(remote.selection, Selection { anchor: 9, head: 5 });
+    assert_eq!(e.display().hidden, hidden);
+    assert!(!e.can_undo());
+    e.move_to(0, false);
+    e.insert("local ");
+    assert_eq!(e.remote_selections()[0].selection, Selection { anchor: 15, head: 11 });
+    peer.move_to(0, false);
+    peer.insert("remote ");
+    e.doc.import(&peer.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    assert!(e.refresh());
+    let selected = e.remote_selections()[0].selection.range();
+    assert_eq!(&e.text()[selected], "bold");
+    assert!(e.undo());
+    assert_eq!(e.text(), "remote é **bold**\nend");
+    assert_eq!(e.remote_selections()[0].selection, Selection { anchor: 16, head: 12 });
+    assert!(!e.can_undo());
+    assert!(e.redo());
+    assert!(e.text().contains("local "));
+    assert!(e.text().contains("remote "));
+}
+
+#[test]
+fn live_cursors_wait_for_their_operations_and_ignore_other_bodies_and_invalid_bytes() {
+    let mut e = editor("one\n|end");
+    let other = LoroDoc::new();
+    other.import(&e.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other });
+    peer.move_to(0, false);
+    peer.insert("café ");
+    peer.select(0, 5);
+    let remote = peer.encoded_selection().unwrap();
+    let machine = Id::generate();
+    let foreign = e.doc.get_text("another-body");
+    foreign.insert(0, "another note").unwrap();
+    e.doc.commit_with(CommitOptions::new().origin(ORIGIN));
+    let cursor = foreign.get_cursor(2, Side::Middle).unwrap().encode();
+    let wrong_body = crate::sync::Selection { anchor: cursor.clone(), head: cursor };
+    let invalid = crate::sync::Selection { anchor: vec![255], head: vec![] };
+    e.presence().started(machine);
+    e.presence().received(machine, vec![remote, wrong_body, invalid]);
+    assert_eq!(e.remote_selections(), vec![]);
+    e.doc.import(&peer.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    e.refresh();
+    assert_eq!(e.remote_selections().len(), 1);
+    assert_eq!(e.remote_selections()[0].selection, Selection { anchor: 0, head: 5 });
+    e.presence().received(machine, vec![]);
+    assert_eq!(e.remote_selections(), vec![]);
+}
+
+#[test]
+fn concurrent_edits_keep_a_backward_selection_and_undo_only_local_typing() {
+    let mut e = editor("start café fin");
+    e.select(11, 6);
+    let other = LoroDoc::new();
+    other.import(&e.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other });
+    peer.move_to(0, false);
+    peer.insert("before ");
+    e.doc.import(&peer.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    e.refresh();
+    assert_eq!(e.selection(), Selection { anchor: 18, head: 13 });
+    assert_eq!(e.selected_text(), "café");
+    e.insert("tea");
+    peer.move_to(peer.text().len(), false);
+    peer.insert(" after");
+    e.doc.import(&peer.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    e.refresh();
+    assert_eq!(e.text(), "before start tea fin after");
+    assert!(e.undo());
+    assert_eq!(e.text(), "before start café fin after");
+    assert_eq!(e.selected_text(), "café");
+    assert!(!e.can_undo());
+    assert!(e.redo());
+    assert_eq!(e.text(), "before start tea fin after");
+}
+
+#[test]
+fn an_import_that_replaces_the_same_text_still_resolves_the_owners_cursors() {
+    let mut e = editor("a|bc|d");
+    let before = e.selection();
+    let cursors = e.cursors.clone().unwrap();
+    let other = LoroDoc::new();
+    other.import(&e.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
+    let body = other.get_text("body");
+    body.delete(1, 2).unwrap();
+    body.insert(1, "bc").unwrap();
+    other.commit();
+    e.doc.import(&other.export(ExportMode::Snapshot).unwrap()).unwrap();
+    let expected =
+        Selection { anchor: e.find(&cursors.0).unwrap(), head: e.find(&cursors.1).unwrap() };
+    assert_ne!(expected, before);
+    assert!(e.refresh());
+    assert_eq!(e.selection(), expected);
+    assert_eq!(e.text(), "abcd");
+    assert!(!e.refresh());
+}

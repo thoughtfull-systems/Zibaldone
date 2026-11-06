@@ -6,6 +6,7 @@
 //! stays in place as edits from other machines arrive. Offsets are bytes of UTF-8 text.
 
 pub mod display;
+pub mod presence;
 mod tables;
 
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use loro::cursor::{AbsolutePosition, Cursor, Side};
 use loro::undo::CursorWithPos;
-use loro::{LoroDoc, LoroText, UndoItemMeta, UndoManager};
+use loro::{ContainerTrait, LoroDoc, LoroText, UndoItemMeta, UndoManager};
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 use crate::editing::{Drawing, toggle_checkbox};
@@ -109,6 +110,7 @@ pub enum Unit {
 
 /// A note's body open for editing.
 pub struct Editor {
+    presence: presence::Presence,
     drawings: HashMap<Drawing, display::Rendered>,
     previews: Vec<DrawingPreview>,
     images: HashMap<Id, display::ImageSize>,
@@ -156,6 +158,7 @@ impl Editor {
         }
         let text = body.to_string();
         let mut editor = Self {
+            presence: presence::Presence::default(),
             drawings: HashMap::new(),
             previews: Vec::new(),
             images: HashMap::new(),
@@ -182,6 +185,23 @@ impl Editor {
 
     pub fn selection(&self) -> Selection {
         self.selection
+    }
+
+    /// The owner's actual Loro cursors, ready for the existing live editing protocol.
+    pub fn encoded_selection(&self) -> Option<crate::sync::Selection> {
+        let (anchor, head) = self.cursors.as_ref()?;
+        Some(crate::sync::Selection { anchor: anchor.encode(), head: head.encode() })
+    }
+
+    /// Live sessions and their ephemeral cursors. None of this enters the note or undo history.
+    pub fn presence(&mut self) -> &mut presence::Presence {
+        &mut self.presence
+    }
+
+    /// Resolves remote cursors against the current body, in the same byte offsets as the display.
+    /// A cursor from another note or an update that hasn't arrived can't point into this one.
+    pub fn remote_selections(&self) -> Vec<presence::RemoteSelection> {
+        self.presence.resolve(|encoded| self.find(&Cursor::decode(encoded).ok()?))
     }
 
     /// How the text looks with the selection as it is.
@@ -300,14 +320,14 @@ impl Editor {
     }
 
     /// Reads the body again after edits from elsewhere, and keeps the selection with the text
-    /// around it. Returns whether the text changed.
+    /// around it. Returns whether the text or selection changed.
     pub fn refresh(&mut self) -> bool {
         let text = self.body.to_string();
-        if text == self.text {
-            return false;
+        let changed = text != self.text;
+        if changed {
+            self.text = text;
+            self.refresh_previews();
         }
-        self.text = text;
-        self.refresh_previews();
         let found =
             self.cursors.as_ref().map(|(anchor, head)| (self.find(anchor), self.find(head)));
         let selection = if let Some((Some(anchor), Some(head))) = found {
@@ -316,8 +336,11 @@ impl Editor {
             let at = |at: usize| self.boundary(at.min(self.text.len()));
             Selection { anchor: at(self.selection.anchor), head: at(self.selection.head) }
         };
-        self.place(selection);
-        true
+        let changed = changed || selection != self.selection;
+        if changed {
+            self.place(selection);
+        }
+        changed
     }
 
     /// Selects from `anchor` to `head`, which snap to the characters they fall in.
@@ -805,6 +828,9 @@ impl Editor {
 
     /// Where a cursor is now, in bytes.
     fn find(&self, cursor: &Cursor) -> Option<usize> {
+        if cursor.container != self.body.id() {
+            return None;
+        }
         let chars = self.doc.get_cursor_pos(cursor).ok()?.current.pos;
         Some(self.byte(chars))
     }

@@ -267,11 +267,18 @@ these shortcuts.
 - [ ] The window's title is the note's title, from its first line with text, or "Untitled".
 - [ ] While another machine edits the note, the title bar says "Editing live".
 - [ ] Edits from other machines arrive without moving the owner's cursor or selection off the text
-  around them.
+  around them. Undo reverses local edits while leaving imported edits in place. A visible caret
+  keeps its screen position, and an offscreen caret doesn't pull the view away from what the owner
+  reads. (core: `editor::tests`, widget: `editor_widget::presence::tests`)
 - [ ] Other machines' cursors show as carets with their machine's name, and their selections in the
-  machine's color, from six colors that each machine keeps on every run.
+  machine's color, from six colors that each machine keeps on every run. Remote selections follow
+  edits without revealing syntax. Highlights cover images and collapsed blocks too. (core:
+  `editor::tests`, widget: `editor_widget::presence::tests`)
 - [ ] The owner's cursor goes to the other machines at once when a live session starts, and again
-  while it stays still. Other machines' cursors that go quiet disappear.
+  while it stays still. Other machines' cursors that go quiet disappear. The new editor sends its
+  actual anchor and head as Loro cursors, preserving selection direction. An ended session or note
+  switch clears its cursors, and late name lookups can't bring them back. (core:
+  `editor::presence::tests`, widget: `editor_widget::presence::tests`)
 
 ## Around the editor
 

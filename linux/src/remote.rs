@@ -60,6 +60,12 @@ fn color_of(machine: Id) -> usize {
     sum % COLORS.len()
 }
 
+/// Both editors use the same stable machine colors.
+pub fn color(machine: Id, alpha: f32) -> gdk::RGBA {
+    let (r, g, b) = COLORS[color_of(machine)];
+    gdk::RGBA::new(f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, alpha)
+}
+
 struct Peer {
     name: String,
     /// The selections as they arrived, to place again after the text is replaced.

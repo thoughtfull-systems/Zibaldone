@@ -33,6 +33,7 @@ pub(super) enum Content {
 }
 
 pub(super) struct Block {
+    pub collapsed: bool,
     pub content: Content,
     pub cursor: usize,
     pub range: Range<usize>,
@@ -130,6 +131,12 @@ pub(super) fn append(
     let x = origin - line.left + (available - w) / 2.0;
     #[allow(clippy::cast_possible_truncation)]
     let rect = graphene::Rect::new(x as f32, (line.height + PAD) as f32, w as f32, h as f32);
-    line.blocks.push(Block { content, cursor: drawing.cursor, range: drawing.range.clone(), rect });
+    line.blocks.push(Block {
+        collapsed: drawing.collapsed(),
+        content,
+        cursor: drawing.cursor,
+        range: drawing.range.clone(),
+        rect,
+    });
     line.height += h + 2.0 * PAD;
 }
