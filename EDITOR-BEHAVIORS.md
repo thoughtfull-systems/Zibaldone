@@ -165,10 +165,18 @@ these shortcuts.
 ## Drawings
 
 - [ ] Inline math draws in the line in place of its source, at 1.21 times the text size. Math that
-  fails to draw keeps its source.
+  fails to draw keeps its source. A first render keeps its source until ready. (core:
+  `editor::display::drawings::tests`, widget: `editor_widget::drawings::tests`)
 - [ ] Display math and diagrams draw in place of their lines, centered, with 8 pixels of space
-  around them. A failed one shows its source and the error in red, in a monospace font.
-- [ ] While the cursor is in a block, its source shows and the drawing stays below it.
+  around them. A failed one shows its source and the error in red, in a monospace font. (widget:
+  `editor_widget::drawings::tests`)
+- [ ] While the cursor is in a block, its source shows and the drawing stays below it. Clicking the
+  drawing enters its second source line, past structural prefixes. (core:
+  `editor::display::drawings::tests`, widget: `editor_widget::drawings::tests`)
+- [ ] Editing a diagram or formula retains its previous result and reserved space until the new
+  result finishes. Intermediate results can't replace the retained preview. Each drawing keeps its
+  own preview as other edits move it through the note. (core: `editor::tests`, widget:
+  `editor_widget::drawings::tests`)
 - [ ] A block in a list item draws where its source starts, past the item's indentation or marker,
   and fits the width left. Its first line's indentation hides with the source, unless the line holds
   the item's marker, which keeps its bullet.
@@ -176,6 +184,9 @@ these shortcuts.
   Embeds of other notes stay links.
 - [ ] A code block's shade doesn't show behind a drawing over it.
 - [ ] No drawing is wider than the text, past a list item's indentation.
+- [ ] Render results belong to their complete source and note session. Results that finish after an
+  edit or note switch can't overwrite the current drawing or edit the body. (widget:
+  `editor_widget::drawings::tests`)
 
 ## Tables
 

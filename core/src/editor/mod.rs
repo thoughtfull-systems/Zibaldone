@@ -16,7 +16,7 @@ use loro::undo::CursorWithPos;
 use loro::{LoroDoc, LoroText, UndoItemMeta, UndoManager};
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
-use crate::editing::toggle_checkbox;
+use crate::editing::{Drawing, toggle_checkbox};
 use crate::editing::{complete_block_opening, fence_selection, quote_newline, quote_selection};
 pub use crate::lists::ListKey;
 use crate::lists::{Edit, list_edit};
@@ -40,6 +40,15 @@ pub struct EditTarget {
     cursors: Option<(Cursor, Cursor)>,
     selection: Selection,
     expected: String,
+}
+
+/// A drawing occurrence keeps its last completed result while its current source renders. Cursors
+/// keep the occurrence with its source when edits elsewhere move it through the document.
+struct DrawingPreview {
+    cursors: Option<(Cursor, Cursor)>,
+    range: Range<usize>,
+    settled: Option<Drawing>,
+    source: Drawing,
 }
 
 impl Selection {
@@ -99,6 +108,8 @@ pub enum Unit {
 
 /// A note's body open for editing.
 pub struct Editor {
+    drawings: HashMap<Drawing, display::Rendered>,
+    previews: Vec<DrawingPreview>,
     images: HashMap<Id, display::ImageSize>,
     titles: HashMap<Id, String>,
     doc: LoroDoc,
@@ -144,6 +155,8 @@ impl Editor {
         }
         let text = body.to_string();
         let mut editor = Self {
+            drawings: HashMap::new(),
+            previews: Vec::new(),
             images: HashMap::new(),
             titles: HashMap::new(),
             doc,
@@ -158,6 +171,7 @@ impl Editor {
             typing: None,
         };
         editor.place(Selection::default());
+        editor.refresh_previews();
         editor
     }
 
@@ -176,11 +190,18 @@ impl Editor {
 
     /// What shows while `selection` decides which syntax is visible, such as during a drag.
     pub fn display_for(&self, selection: &Range<usize>) -> display::Display {
-        display::with_images(
+        display::with_previews(
             &self.text,
             selection,
             &mut |id| self.titles.get(&id).cloned(),
             &mut |id| self.images.get(&id).copied(),
+            &mut |drawing| self.drawings.get(drawing).cloned(),
+            &mut |range, source| {
+                self.previews
+                    .iter()
+                    .find(|p| p.range == *range && p.source == *source)
+                    .and_then(|p| p.settled.clone())
+            },
         )
     }
 
@@ -192,6 +213,34 @@ impl Editor {
     /// Updates image availability without editing the body or its undo history.
     pub fn set_images(&mut self, images: HashMap<Id, display::ImageSize>) {
         self.images = images;
+    }
+
+    /// Updates render availability without changing the text or undo history.
+    pub fn set_drawings(&mut self, drawings: HashMap<Drawing, display::Rendered>) {
+        self.refresh();
+        self.drawings = drawings;
+        self.refresh_previews();
+    }
+
+    pub fn set_drawing(&mut self, drawing: Drawing, rendered: display::Rendered) {
+        self.refresh();
+        self.drawings.insert(drawing, rendered);
+        self.refresh_previews();
+    }
+
+    /// Render requests keep source order, so visible formulas start before later diagrams.
+    pub fn drawing_targets(&self) -> Vec<Drawing> {
+        let mut seen = std::collections::HashSet::new();
+        crate::editing::drawings(&self.text)
+            .into_iter()
+            .map(|drawn| drawn.drawing)
+            .filter(|drawing| {
+                matches!(
+                    drawing,
+                    Drawing::InlineMath(_) | Drawing::DisplayMath(_) | Drawing::Diagram(_)
+                ) && seen.insert(drawing.clone())
+            })
+            .collect()
     }
 
     /// Targets whose images the app can load, including embeds with explicit captions.
@@ -254,6 +303,7 @@ impl Editor {
             return false;
         }
         self.text = text;
+        self.refresh_previews();
         let found =
             self.cursors.as_ref().map(|(anchor, head)| (self.find(anchor), self.find(head)));
         let selection = if let Some((Some(anchor), Some(head))) = found {
@@ -342,14 +392,18 @@ impl Editor {
         let forward = head > anchor;
         let mut to = head;
         let display = self.display_for(showing);
-        for image in display.images.into_iter().filter(|image| !image.revealed) {
+        let atoms =
+            display.images.iter().filter(|i| !i.revealed).map(|i| &i.range).chain(
+                display.drawings.iter().filter(|d| !d.block && d.collapsed()).map(|d| &d.range),
+            );
+        for range in atoms {
             let inside = if forward {
-                image.range.start <= to && to < image.range.end
+                range.start <= to && to < range.end
             } else {
-                image.range.start < to && to <= image.range.end
+                range.start < to && to <= range.end
             };
             if inside {
-                to = if forward { image.range.end } else { image.range.start };
+                to = if forward { range.end } else { range.start };
             }
         }
         for hidden in display.hidden {
@@ -617,8 +671,50 @@ impl Editor {
             self.checkpoint();
         }
         self.text = self.body.to_string();
+        self.refresh_previews();
         let at = self.boundary((range.start + with.len()).min(self.text.len()));
         self.place(Selection::cursor(at));
+    }
+
+    /// Reconcile occurrences by their live cursor ranges, never by a nearby drawing's kind alone.
+    /// Only a result for the occurrence's current source can replace its settled preview.
+    fn refresh_previews(&mut self) {
+        let mut previous: Vec<_> = std::mem::take(&mut self.previews)
+            .into_iter()
+            .filter_map(|mut preview| {
+                let (start, end) = preview.cursors.as_ref()?;
+                preview.range = self.find(start)?..self.find(end)?;
+                (preview.range.start < preview.range.end).then_some(preview)
+            })
+            .collect();
+        for drawn in crate::editing::drawings(&self.text).into_iter().filter(|d| {
+            matches!(
+                d.drawing,
+                Drawing::InlineMath(_) | Drawing::DisplayMath(_) | Drawing::Diagram(_)
+            )
+        }) {
+            let prior = previous
+                .iter()
+                .position(|p| {
+                    std::mem::discriminant(&p.source) == std::mem::discriminant(&drawn.drawing)
+                        && drawn.range.start <= p.range.start
+                        && p.range.start < drawn.range.end
+                })
+                .map(|i| previous.swap_remove(i));
+            let settled = if self.drawings.contains_key(&drawn.drawing) {
+                Some(drawn.drawing.clone())
+            } else {
+                prior.and_then(|p| p.settled).filter(|source| self.drawings.contains_key(source))
+            };
+            let cursor =
+                |at: usize| self.body.get_cursor(self.text[..at].chars().count(), Side::Middle);
+            self.previews.push(DrawingPreview {
+                cursors: cursor(drawn.range.start).zip(cursor(drawn.range.end)),
+                range: drawn.range,
+                settled,
+                source: drawn.drawing,
+            });
+        }
     }
 
     /// An undo creates a redo step, and a redo creates an undo step. Each remembers the selection
@@ -686,13 +782,16 @@ impl Editor {
         }
         let forward = direction == Direction::Forward;
         let display = self.display();
-        // A move onto an image lands at its source's near edge, revealing the source there.
+        // A move onto a drawing lands at its source's near edge, revealing the source there.
         let image_edge = |to| {
             display
                 .images
                 .iter()
-                .find(|image| !image.revealed && image.range.start <= to && to <= image.range.end)
-                .map(|image| if forward { image.range.start } else { image.range.end })
+                .filter(|image| !image.revealed)
+                .map(|image| &image.range)
+                .chain(display.drawings.iter().filter(|d| d.collapsed()).map(|d| &d.range))
+                .find(|range| range.start <= to && to <= range.end)
+                .map(|range| if forward { range.start } else { range.end })
         };
         if let Some(edge) = image_edge(to) {
             return edge;

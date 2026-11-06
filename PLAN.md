@@ -100,6 +100,9 @@ selected. Open a code block with a third backtick, add its language, and check b
 Inline math becomes an atom. Display math and diagrams become drawn blocks while the selection is
 outside them, from the images that `render` draws now.
 
+**Try it:** write inline math and a display formula, then add a `mermaid` fence. Click each drawing
+to edit its source. Repeat inside lists and quotes. Check invalid input and undo.
+
 ### 9. Tables
 
 Pipe tables and list tables become drawn blocks, with the current table widget's layout, and the

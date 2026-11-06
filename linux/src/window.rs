@@ -50,6 +50,8 @@ pub struct Inner {
     generation: Cell<u64>,
     /// Counts title lookups, so an older result cannot overwrite a newer title.
     label_generation: Cell<u64>,
+    /// Counts drawing refreshes so typing waits for a short pause before rendering.
+    drawing_generation: Cell<u64>,
     title: adw::WindowTitle,
     stack: gtk::Stack,
     view: sourceview5::View,
@@ -242,6 +244,7 @@ impl Window {
             rows: RefCell::default(),
             generation: Cell::new(0),
             label_generation: Cell::new(0),
+            drawing_generation: Cell::new(0),
             title,
             stack,
             view: view.clone(),
@@ -970,6 +973,7 @@ impl Window {
 
     /// Shows a local preview first, then replaces it with the original once it arrives.
     fn refresh_images(&self, reload: bool) {
+        self.refresh_drawings();
         let Some(widget) = self.inner().new_editor.clone() else { return };
         let (generation, targets) = widget.image_requests(reload);
         for target in targets {
@@ -988,6 +992,43 @@ impl Window {
                 widget.set_image(generation, target, original.or(preview));
             });
         }
+    }
+
+    /// Render after a short pause, then let the widget reject results from an older note session.
+    /// Results use the complete source as their key, so an older formula can't replace an edit.
+    fn refresh_drawings(&self) {
+        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let generation = self.inner().drawing_generation.get().wrapping_add(1);
+        self.inner().drawing_generation.set(generation);
+        let w = self.clone();
+        glib::timeout_add_local_once(Duration::from_millis(120), move || {
+            if w.inner().drawing_generation.get() != generation {
+                return;
+            }
+            let (session, targets) = widget.drawing_requests();
+            for drawing in targets {
+                let (kind, source) = match &drawing {
+                    Drawing::InlineMath(s) => (Kind::InlineMath, s.clone()),
+                    Drawing::DisplayMath(s) => (Kind::DisplayMath, s.clone()),
+                    Drawing::Diagram(s) => (Kind::Mermaid, s.clone()),
+                    _ => continue,
+                };
+                let (state, widget) = (w.inner().state.clone(), widget.clone());
+                glib::spawn_future_local(async move {
+                    let result = core(async move { state.render(kind, source).await }).await;
+                    let result = result.map_err(|error| error.to_string()).and_then(|image| {
+                        let size = zib_core::editor::display::ImageSize {
+                            width: image.width,
+                            height: image.height,
+                        };
+                        gdk::Texture::from_bytes(&glib::Bytes::from(&image.png))
+                            .map(|texture| (texture, size))
+                            .map_err(|error| error.to_string())
+                    });
+                    widget.set_drawing(session, drawing, result);
+                });
+            }
+        });
     }
 
     /// Reports the new editor's edits now if a report waits.

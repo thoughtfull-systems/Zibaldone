@@ -4,6 +4,11 @@
 
 use std::ops::Range;
 
+mod drawings;
+
+pub use drawings::{Drawing, Paragraph, Rendered};
+
+use crate::editing::Drawing as SourceDrawing;
 use crate::editing::{QuotedLine, Span, Style, list_pads, quoted_lines, spans};
 use crate::markup::{self, Inline};
 use crate::{Id, body};
@@ -31,6 +36,8 @@ pub enum Look {
     Completed,
     /// Markdown syntax, such as `**`, `[[`, or a heading's `#`, which apps dim.
     Syntax,
+    /// The literal source of a block that failed to render.
+    Error,
 }
 
 /// A range of the text, in bytes, and how it looks.
@@ -86,14 +93,15 @@ pub struct Image {
 /// How a text looks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Display {
+    /// Math and diagrams in source order, including pending and failed renders.
+    pub drawings: Vec<Drawing>,
     /// The quoted lines, including blank lines and lazy paragraph continuations, in source order.
     pub quotes: Vec<QuotedLine>,
     /// Available embedded images, in source order. Revealing the source keeps the image in place.
     pub images: Vec<Image>,
     /// Titles for wikilinks without labels, in source order. These never enter the body.
     pub labels: Vec<Label>,
-    /// The looks, with every piece of syntax last, so its dimming wins over the color of what
-    /// holds it.
+    /// The looks: ordinary styles first, syntax dimming next, and render errors last.
     pub styles: Vec<Styled>,
     /// The lines that draw on a shade across the editor's width, as code blocks, display math,
     /// and pipe tables do, each without its line break.
@@ -134,6 +142,29 @@ pub fn with_images(
     selection: &Range<usize>,
     title: &mut dyn FnMut(Id) -> Option<String>,
     image: &mut dyn FnMut(Id) -> Option<ImageSize>,
+) -> Display {
+    with_resources(text, selection, title, image, &mut |_| None)
+}
+
+/// How the source looks with the platform's titles, image sizes, and math and diagram renders.
+pub fn with_resources(
+    text: &str,
+    selection: &Range<usize>,
+    title: &mut dyn FnMut(Id) -> Option<String>,
+    image: &mut dyn FnMut(Id) -> Option<ImageSize>,
+    render: &mut dyn FnMut(&SourceDrawing) -> Option<Rendered>,
+) -> Display {
+    with_previews(text, selection, title, image, render, &mut |_, _| None)
+}
+
+/// Reuses each occurrence's settled preview only while its current source has no render result.
+pub(super) fn with_previews(
+    text: &str,
+    selection: &Range<usize>,
+    title: &mut dyn FnMut(Id) -> Option<String>,
+    image: &mut dyn FnMut(Id) -> Option<ImageSize>,
+    render: &mut dyn FnMut(&SourceDrawing) -> Option<Rendered>,
+    preview: &mut dyn FnMut(&Range<usize>, &SourceDrawing) -> Option<SourceDrawing>,
 ) -> Display {
     let mut display = Display::default();
     let mut syntax = Vec::new();
@@ -230,6 +261,7 @@ pub fn with_images(
         }
         display.labels.push(label);
     }
+    drawings::collect(&mut display, text, selection, render, preview);
     display
 }
 

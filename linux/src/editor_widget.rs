@@ -9,12 +9,14 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+mod drawings;
+
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
 use zib_core::Id;
-use zib_core::editing::{LinkTarget, link_at};
-use zib_core::editor::display::{Display, ImageSize, Look, Shape};
+use zib_core::editing::{Drawing, LinkTarget, link_at};
+use zib_core::editor::display::{Display, ImageSize, Look, Rendered, Shape};
 use zib_core::editor::{Direction, EditTarget, Editor, ListKey, Unit};
 
 /// Space around the text, in pixels, as the text view has.
@@ -45,6 +47,7 @@ pub fn enabled() -> bool {
 
 /// A line of the text, with hidden syntax left out and link titles drawn in its place.
 pub struct Line {
+    blocks: Vec<drawings::Block>,
     /// Where the line starts and ends in the text, without its line break.
     start: usize,
     end: usize,
@@ -83,6 +86,7 @@ struct Background {
 
 /// An image's source, layout index, texture, and displayed size.
 struct InlineImage {
+    descent: f64,
     source: usize,
     index: usize,
     texture: gdk::Texture,
@@ -98,6 +102,15 @@ enum Content {
     Source,
     Label,
     Image(Id),
+    Drawing(usize),
+}
+
+/// Context shared by the source paragraphs in a single layout pass.
+struct Layout<'a> {
+    column: f64,
+    display: &'a Display,
+    text: &'a str,
+    wrap: f64,
 }
 
 /// Where an image paste started, including which open editor it belongs to.
@@ -165,12 +178,14 @@ mod imp {
     use gtk::subclass::prelude::*;
     use zib_core::editor::{Editor, Unit};
 
-    use super::{HashMap, HashSet, Line, LinkTarget, PasteTarget};
+    use super::{Drawing, HashMap, HashSet, Line, LinkTarget, PasteTarget, drawings};
 
     type Callback<T> = RefCell<Option<Box<dyn Fn(T)>>>;
 
     #[derive(Default)]
     pub struct EditorWidget {
+        pub asked_drawings: RefCell<HashSet<Drawing>>,
+        pub drawings: RefCell<drawings::Resources>,
         pub editor: RefCell<Option<Editor>>,
         pub images: RefCell<HashMap<zib_core::Id, gtk::gdk::Texture>>,
         pub asked_images: RefCell<HashSet<zib_core::Id>>,
@@ -260,6 +275,8 @@ impl EditorWidget {
         imp.image_generation.set(imp.image_generation.get().wrapping_add(1));
         imp.asked_images.borrow_mut().clear();
         imp.images.borrow_mut().clear();
+        imp.asked_drawings.borrow_mut().clear();
+        imp.drawings.borrow_mut().clear();
         imp.bottom_space.set(0.0);
         imp.top_space.set(0.0);
         *imp.editor.borrow_mut() = editor;
@@ -308,6 +325,37 @@ impl EditorWidget {
         let targets = imp.editor.borrow().as_ref().map(Editor::image_targets).unwrap_or_default();
         let mut asked = imp.asked_images.borrow_mut();
         (imp.image_generation.get(), targets.into_iter().filter(|id| asked.insert(*id)).collect())
+    }
+
+    pub fn drawing_requests(&self) -> (u64, Vec<Drawing>) {
+        let imp = self.imp();
+        let targets = imp.editor.borrow().as_ref().map(Editor::drawing_targets).unwrap_or_default();
+        let mut asked = imp.asked_drawings.borrow_mut();
+        (imp.session.get(), targets.into_iter().filter(|d| asked.insert(d.clone())).collect())
+    }
+
+    /// Render results are keyed by source, and a result from another note session is ignored.
+    pub fn set_drawing(&self, session: u64, drawing: Drawing, result: drawings::Resource) {
+        let imp = self.imp();
+        if session != imp.session.get() {
+            return;
+        }
+        let result = result.and_then(|(texture, size)| {
+            if size.width == 0 || size.height == 0 {
+                Err("The drawing has no size".to_owned())
+            } else {
+                Ok((texture, size))
+            }
+        });
+        let rendered = result.as_ref().map_or_else(
+            |error| Rendered::Error(error.clone()),
+            |(_, size)| Rendered::Image(*size),
+        );
+        imp.drawings.borrow_mut().insert(drawing.clone(), result);
+        if let Some(editor) = imp.editor.borrow_mut().as_mut() {
+            editor.set_drawing(drawing, rendered);
+        }
+        self.relayout();
     }
 
     /// Shows an asynchronously loaded image only in the editor that requested it.
@@ -497,7 +545,7 @@ impl EditorWidget {
             imp.laid_width.set(width);
             let editor = imp.editor.borrow();
             let text = editor.as_ref().map_or("", |e| e.text());
-            // While a mouse button is down, what shows stays as it was when it went down.
+            // A drag keeps what showed at its press, so changing syntax doesn't move its target.
             let selection = imp
                 .held
                 .borrow()
@@ -505,86 +553,48 @@ impl EditorWidget {
                 .or_else(|| editor.as_ref().map(|e| e.selection().range()))
                 .unwrap_or_default();
             let shown = editor.as_ref().map(|e| e.display_for(&selection)).unwrap_or_default();
-            let dark = adw::StyleManager::default().is_dark();
-            let wrap = (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0);
-            let column = monospace_width(self.upcast_ref());
+            let context = Layout {
+                column: monospace_width(self.upcast_ref()),
+                display: &shown,
+                text,
+                wrap: (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0),
+            };
             let mut lines = Vec::new();
             let mut y = MARGIN_TOP + imp.top_space.get();
-            let mut start = 0;
-            for line in text.split('\n') {
-                let end = start + line.len();
-                let (pieces, shown_text) = pieces(text, start, end, &shown);
-                let columns = shown.pads.iter().filter(|(lines, _)| lines.contains(&start));
-                #[allow(clippy::cast_precision_loss)]
-                let pad = columns.map(|(_, columns)| *columns).max().unwrap_or(0) as f64 * column;
-                let quoted = shown.quotes.iter().find(|q| q.line.start == start);
-                #[allow(clippy::cast_precision_loss)]
-                let inset = quoted
-                    .filter(|q| q.start == start)
-                    .map_or(0.0, |q| q.depth as f64 * QUOTE_INDENT);
-                let layout = self.create_pango_layout(Some(&shown_text));
-                layout.set_width(units((wrap - pad - inset).max(1.0)));
-                layout.set_wrap(pango::WrapMode::WordChar);
-                let attributes = pango::AttrList::new();
-                let mut backgrounds = Vec::new();
-                let heading =
-                    style_source(&attributes, &pieces, &shown, start..end, dark, &mut backgrounds);
-                style_labels(&attributes, &pieces, &shown, dark, &mut backgrounds);
-                // The text under a bullet or a box stays, unseen, to keep its room.
-                let markers: Vec<(Range<usize>, Shape)> = shown
-                    .markers
-                    .iter()
-                    .filter(|m| m.range.start >= start && m.range.start < end.max(start + 1))
-                    .map(|m| (m.range.clone(), m.shape))
-                    .collect();
-                style_markers(&attributes, &pieces, &markers);
-                let quote = quoted.map(|q| {
-                    let inline = q.start > start;
-                    let offset = if inline {
-                        reserve_quote_room(&layout, &attributes, &pieces, q)
-                    } else {
-                        0.0
-                    };
-                    QuoteRoom {
-                        above: if heading { HEADING_SPACE } else { 0.0 },
-                        continued: quote_continuation(lines.last(), MARGIN_SIDES + pad + offset, y),
-                        depth: q.depth,
-                        inline,
-                        left: MARGIN_SIDES + pad + offset,
+            for paragraph in shown.paragraphs(text) {
+                let mut line = self.layout_line(&context, paragraph.range, y, lines.last());
+                if let Some(index) = paragraph.drawing {
+                    let drawing = &shown.drawings[index];
+                    let origin = drawing_origin(&line, drawing.indent);
+                    drawings::collapse(&mut line, drawing);
+                    if let Some(resource) = imp
+                        .drawings
+                        .borrow()
+                        .get(drawing.preview.as_ref().unwrap_or(&drawing.source))
+                    {
+                        drawings::append(self, &mut line, drawing, resource, origin, width);
                     }
-                });
-                let images = shape_images(
-                    &layout,
-                    text,
-                    &attributes,
-                    &pieces,
-                    &shown,
-                    &imp.images.borrow(),
-                    wrap - pad - inset,
-                );
-                layout.set_attributes(Some(&attributes));
-                if heading {
-                    y += HEADING_SPACE;
+                } else {
+                    for drawing in shown.drawings.iter().filter(|d| d.block && !d.collapsed()) {
+                        if line.start <= drawing.range.end && drawing.range.end <= line.end {
+                            let first = if line.start <= drawing.indent {
+                                &line
+                            } else {
+                                line_at(&lines, drawing.indent).unwrap_or(&line)
+                            };
+                            let origin = drawing_origin(first, drawing.indent);
+                            if let Some(resource) = imp
+                                .drawings
+                                .borrow()
+                                .get(drawing.preview.as_ref().unwrap_or(&drawing.source))
+                            {
+                                drawings::append(self, &mut line, drawing, resource, origin, width);
+                            }
+                        }
+                    }
                 }
-                let shaded = shown.shaded.iter().any(|shaded| shaded.start == start);
-                let height = pixels(layout.size().1);
-                let left = MARGIN_SIDES + pad + inset;
-                lines.push(Line {
-                    start,
-                    end,
-                    pieces,
-                    layout,
-                    y,
-                    height,
-                    shaded,
-                    left,
-                    markers,
-                    images,
-                    backgrounds,
-                    quote,
-                });
-                y += height;
-                start = end + 1;
+                y = line.y + line.height;
+                lines.push(line);
             }
             *imp.lines.borrow_mut() = lines;
         }
@@ -593,6 +603,95 @@ impl EditorWidget {
         #[allow(clippy::cast_possible_truncation)]
         let height = (bottom + MARGIN_BOTTOM + imp.bottom_space.get()).ceil() as i32;
         height
+    }
+
+    fn layout_line(
+        &self,
+        context: &Layout<'_>,
+        range: Range<usize>,
+        mut y: f64,
+        previous: Option<&Line>,
+    ) -> Line {
+        let (start, end) = (range.start, range.end);
+        let Layout { column, display: shown, text, wrap } = *context;
+        let imp = self.imp();
+        let dark = adw::StyleManager::default().is_dark();
+        let (pieces, shown_text) = pieces(text, start, end, shown);
+        let columns = shown.pads.iter().filter(|(lines, _)| lines.contains(&start));
+        #[allow(clippy::cast_precision_loss)]
+        let pad = columns.map(|(_, columns)| *columns).max().unwrap_or(0) as f64 * column;
+        let quoted = shown.quotes.iter().find(|q| q.line.start <= start && start <= q.line.end);
+        #[allow(clippy::cast_precision_loss)]
+        let carried = quoted
+            .filter(|q| q.start < start)
+            .map_or(0.0, |q| text[q.line.start..q.start].chars().count() as f64 * column);
+        #[allow(clippy::cast_precision_loss)]
+        let inset = carried
+            + quoted
+                .filter(|q| q.start == q.line.start || q.start < start)
+                .map_or(0.0, |q| q.depth as f64 * QUOTE_INDENT);
+        let layout = self.create_pango_layout(Some(&shown_text));
+        layout.set_width(units((wrap - pad - inset).max(1.0)));
+        layout.set_wrap(pango::WrapMode::WordChar);
+        let attributes = pango::AttrList::new();
+        let mut backgrounds = Vec::new();
+        let heading = style_source(&attributes, &pieces, shown, start..end, dark, &mut backgrounds);
+        style_labels(&attributes, &pieces, shown, dark, &mut backgrounds);
+        // The text under a bullet or a box stays, unseen, to keep its room.
+        let markers: Vec<(Range<usize>, Shape)> = shown
+            .markers
+            .iter()
+            .filter(|m| m.range.start >= start && m.range.start < end.max(start + 1))
+            .map(|m| (m.range.clone(), m.shape))
+            .collect();
+        style_markers(&attributes, &pieces, &markers);
+        let quote = quoted.map(|q| {
+            let inline = q.start > start;
+            let offset =
+                if inline { reserve_quote_room(&layout, &attributes, &pieces, q) } else { carried };
+            QuoteRoom {
+                above: if heading { HEADING_SPACE } else { 0.0 },
+                continued: quote_continuation(previous, MARGIN_SIDES + pad + offset, y),
+                depth: q.depth,
+                inline,
+                left: MARGIN_SIDES + pad + offset,
+            }
+        });
+        let images = shape_images(
+            &layout,
+            &attributes,
+            &pieces,
+            &ImageContext {
+                available: wrap - pad - inset,
+                display: shown,
+                math_scale: crate::drawings::math_scale(self),
+                renders: &imp.drawings.borrow(),
+                text,
+                textures: &imp.images.borrow(),
+            },
+        );
+        layout.set_attributes(Some(&attributes));
+        if heading {
+            y += HEADING_SPACE;
+        }
+        let shaded = shown.shaded.iter().any(|shaded| shaded.start == start);
+        let height = pixels(layout.size().1);
+        let left = MARGIN_SIDES + pad + inset;
+        Line {
+            blocks: Vec::new(),
+            start,
+            end,
+            pieces,
+            layout,
+            y,
+            height,
+            shaded,
+            left,
+            markers,
+            images,
+            backgrounds,
+            quote,
+        }
     }
 
     /// Keeps the text's baseline at the selection in place while an image rises above its source.
@@ -679,7 +778,8 @@ impl EditorWidget {
         #[allow(clippy::cast_possible_truncation)]
         for line in lines.iter() {
             if line.shaded {
-                let rect = graphene::Rect::new(0.0, line.y as f32, width, line.height as f32);
+                let height = pixels(line.layout.size().1);
+                let rect = graphene::Rect::new(0.0, line.y as f32, width, height as f32);
                 snapshot.append_color(&shade, &rect);
             }
             for rect in quote_rects(line) {
@@ -717,6 +817,9 @@ impl EditorWidget {
                     snapshot.append_color(&highlight, &rect);
                 }
                 draw_image_source(snapshot, line, image, &selected, &highlight, &color);
+            }
+            for block in &line.blocks {
+                block.paint(snapshot, &selected, &highlight);
             }
             for (range, shape) in &line.markers {
                 draw_marker(snapshot, line, range, *shape, &color);
@@ -810,6 +913,15 @@ impl EditorWidget {
 
     /// The place in the text nearest a point in the widget.
     fn position_at(&self, x: f64, y: f64) -> usize {
+        for line in self.imp().lines.borrow().iter() {
+            if let Some(block) = line.blocks.iter().find(|block| {
+                let top = line.y + f64::from(block.rect.y()) - 8.0;
+                let bottom = top + f64::from(block.rect.height()) + 16.0;
+                line.left <= x && top <= y && y < bottom
+            }) {
+                return block.cursor;
+            }
+        }
         if let Some((at, _)) = self.source_position(x, y) {
             return at;
         }
@@ -1284,7 +1396,7 @@ fn reserve_quote_room(
 fn quote_continuation(previous: Option<&Line>, left: f64, top: f64) -> usize {
     let Some(previous) = previous else { return 0 };
     let Some(quote) = &previous.quote else { return 0 };
-    let height = if quote.inline {
+    let height = if quote.inline && previous.layout.line_count() > 1 {
         pixels(previous.layout.iter().line_extents().1.height())
     } else {
         previous.height
@@ -1301,7 +1413,7 @@ fn quote_continuation(previous: Option<&Line>, left: f64, top: f64) -> usize {
 /// Room inside a paragraph belongs to its first row; quote margins follow every wrapped row.
 fn quote_rects(line: &Line) -> Vec<graphene::Rect> {
     let Some(quote) = &line.quote else { return Vec::new() };
-    let height = if quote.inline {
+    let height = if quote.inline && line.layout.line_count() > 1 {
         pixels(line.layout.iter().line_extents().1.height())
     } else {
         line.height
@@ -1364,8 +1476,18 @@ fn images_through(lines: &[Line], at: usize) -> Vec<gdk::Texture> {
     lines
         .iter()
         .take_while(|line| line.start <= at)
-        .flat_map(|line| line.images.iter().map(|image| image.texture.clone()))
+        .flat_map(|line| {
+            line.images
+                .iter()
+                .map(|image| image.texture.clone())
+                .chain(line.blocks.iter().filter_map(drawings::Block::texture))
+        })
         .collect()
+}
+
+fn drawing_origin(line: &Line, at: usize) -> f64 {
+    let (_, x) = line.layout.index_to_line_x(i32::try_from(line.shown(at)).unwrap_or(0), false);
+    line.left + pixels(x)
 }
 
 fn source_image(line: &Line, at: usize) -> Option<&InlineImage> {
@@ -1522,6 +1644,11 @@ fn attributes_of(look: Look, dark: bool) -> Vec<pango::Attribute> {
             attributes
         }
         Look::Completed | Look::Syntax => foreground(SYNTAX),
+        Look::Error => {
+            let mut attributes = foreground((0.8, 0.15, 0.15, 1.0));
+            attributes.push(pango::AttrString::new_family("monospace").upcast());
+            attributes
+        }
     }
 }
 
@@ -1550,26 +1677,54 @@ pub fn image_only(formats: gdk::ContentFormats) -> bool {
 }
 
 /// Reserves each image's size, scaled down to the text width, above the text's baseline.
+struct ImageContext<'a> {
+    available: f64,
+    display: &'a Display,
+    math_scale: f64,
+    renders: &'a drawings::Resources,
+    text: &'a str,
+    textures: &'a HashMap<Id, gdk::Texture>,
+}
+
 fn shape_images(
     layout: &pango::Layout,
-    text: &str,
     attributes: &pango::AttrList,
     pieces: &[Piece],
-    display: &Display,
-    textures: &HashMap<Id, gdk::Texture>,
-    available: f64,
+    context: &ImageContext<'_>,
 ) -> Vec<InlineImage> {
+    let ImageContext { available, display, math_scale, renders, text, textures } = *context;
     let mut images: Vec<InlineImage> = pieces
         .iter()
         .filter_map(|piece| {
-            let Content::Image(target) = piece.content else { return None };
-            let texture = textures.get(&target)?.clone();
-            let scale = (available.max(1.0) / f64::from(texture.width())).min(1.0);
+            let (texture, width, height, descent) = match piece.content {
+                Content::Image(target) => {
+                    let texture = textures.get(&target)?.clone();
+                    let (width, height) = (f64::from(texture.width()), f64::from(texture.height()));
+                    (texture, width, height, 0.0)
+                }
+                Content::Drawing(index) => {
+                    let drawing = &display.drawings[index];
+                    let (texture, size) = renders
+                        .get(drawing.preview.as_ref().unwrap_or(&drawing.source))?
+                        .as_ref()
+                        .ok()?;
+                    let descent = pixels(layout.context().metrics(None, None).descent());
+                    (
+                        texture.clone(),
+                        f64::from(size.width) * math_scale,
+                        f64::from(size.height) * math_scale,
+                        descent,
+                    )
+                }
+                _ => return None,
+            };
+            let scale = (available.max(1.0) / width.max(1.0)).min(1.0);
             Some(InlineImage {
+                descent: descent * scale,
                 source: piece.source,
                 index: piece.shown,
-                width: f64::from(texture.width()) * scale,
-                height: f64::from(texture.height()) * scale,
+                width: width * scale,
+                height: height * scale,
                 end: piece.source + piece.source_len,
                 texture,
                 source_layout: None,
@@ -1617,7 +1772,7 @@ fn apply_image_shape(attributes: &pango::AttrList, image: &InlineImage) {
         });
     let rect = pango::Rectangle::new(
         0,
-        -units(image.height + raised),
+        -units(image.height + raised - image.descent),
         units(reserved),
         units(image.height + raised + below),
     );
@@ -1637,7 +1792,8 @@ fn image_rect(line: &Line, image: &InlineImage) -> graphene::Rect {
     #[allow(clippy::cast_possible_truncation)]
     graphene::Rect::new(
         pixels(x) as f32,
-        (pixels(baseline_at(&line.layout, image.index)) - image.height - raised) as f32,
+        (pixels(baseline_at(&line.layout, image.index)) - image.height - raised + image.descent)
+            as f32,
         image.width as f32,
         image.height as f32,
     )
@@ -1696,7 +1852,7 @@ fn style_source(
         }
         heading |= matches!(styled.look, Look::Heading(_));
         for piece in pieces {
-            if matches!(piece.content, Content::Image(_))
+            if matches!(piece.content, Content::Image(_) | Content::Drawing(_))
                 || (piece.content != Content::Source && styled.look == Look::Syntax)
             {
                 continue;
@@ -1761,22 +1917,35 @@ fn style_labels(
 
 /// The parts of a line that show, with link titles in place of their source.
 fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece>, String) {
+    let atoms: Vec<_> = display
+        .images
+        .iter()
+        .map(|i| (i.range.clone(), Content::Image(i.target)))
+        .chain(
+            display
+                .drawings
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| !d.block && d.collapsed())
+                .map(|(index, d)| (d.range.clone(), Content::Drawing(index))),
+        )
+        .collect();
     let mut pieces = Vec::new();
     let mut shown_text = String::new();
     let mut at = start;
     while at < end {
         let shown = shown_text.len();
-        if let Some(image) = display.images.iter().find(|i| i.range.start == at) {
+        if let Some((range, content)) = atoms.iter().find(|(range, _)| range.start == at) {
             let atom = "\u{fffc}";
             pieces.push(Piece {
                 source: at,
                 shown,
                 len: atom.len(),
-                source_len: image.range.len(),
-                content: Content::Image(image.target),
+                source_len: range.len(),
+                content: *content,
             });
             shown_text.push_str(atom);
-            at = image.range.end;
+            at = range.end;
         } else if let Some(label) = display.labels.iter().find(|l| l.range.start == at) {
             pieces.push(Piece {
                 source: at,
@@ -1792,7 +1961,7 @@ fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece
                 .labels
                 .iter()
                 .map(|l| l.range.start)
-                .chain(display.images.iter().map(|i| i.range.start))
+                .chain(atoms.iter().map(|(range, _)| range.start))
                 .filter(|&p| p > at)
                 .min()
                 .unwrap_or(end)
@@ -1804,7 +1973,7 @@ fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece
                 .iter()
                 .map(|r| r.start)
                 .chain(display.labels.iter().map(|l| l.range.start))
-                .chain(display.images.iter().map(|i| i.range.start))
+                .chain(atoms.iter().map(|(range, _)| range.start))
                 .filter(|&p| p > at)
                 .min()
                 .unwrap_or(end)
@@ -2003,7 +2172,7 @@ mod tests {
 
     /// A widget showing `text`, laid out 600 pixels wide, with the cursor at `|`. `None` without a
     /// display to lay out on, such as in the Nix build, where these tests have nothing to check.
-    fn widget(text: &str) -> Option<EditorWidget> {
+    pub(super) fn widget(text: &str) -> Option<EditorWidget> {
         adw::init().ok()?;
         let at = text.find('|')?;
         let mut editor = Editor::new(Body::detached(&text.replace('|', "")));
@@ -2014,7 +2183,7 @@ mod tests {
         Some(widget)
     }
 
-    fn head(widget: &EditorWidget) -> usize {
+    pub(super) fn head(widget: &EditorWidget) -> usize {
         widget.head().unwrap_or_default()
     }
 
@@ -2028,7 +2197,7 @@ mod tests {
     }
 
     /// A colored image with a stripe, so rendering checks show its aspect ratio and placement.
-    fn texture(width: i32, height: i32) -> gdk::Texture {
+    pub(super) fn texture(width: i32, height: i32) -> gdk::Texture {
         let mut bytes = Vec::new();
         for y in 0..height {
             for x in 0..width {
@@ -2216,7 +2385,7 @@ mod tests {
         }
     }
 
-    fn render(widget: &EditorWidget, renderer: &gtk::gsk::CairoRenderer) -> Vec<u8> {
+    pub(super) fn render(widget: &EditorWidget, renderer: &gtk::gsk::CairoRenderer) -> Vec<u8> {
         let snapshot = gtk::Snapshot::new();
         let viewport = graphene::Rect::new(0.0, 0.0, 600.0, 330.0);
         snapshot.append_color(&gdk::RGBA::BLACK, &viewport);

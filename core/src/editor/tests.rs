@@ -571,3 +571,133 @@ fn lists_and_code_inside_quotes_keep_their_quote_prefixes() {
     assert!(e.list_key(ListKey::ShiftTab));
     assert_eq!(shown(&e), before);
 }
+
+#[test]
+fn rendered_math_moves_through_source_edges_and_render_updates_never_edit_the_body() {
+    let mut e = editor("before $x^2$ after\n|end");
+    let source = Drawing::InlineMath("x^2".into());
+    assert_eq!(e.drawing_targets().as_slice(), std::slice::from_ref(&source));
+    e.set_drawing(
+        source.clone(),
+        display::Rendered::Image(display::ImageSize { width: 80, height: 40 }),
+    );
+    for (from, direction, expected) in [(6, Direction::Forward, 7), (13, Direction::Back, 12)] {
+        e.move_to(from, false);
+        e.move_by(Unit::Grapheme, direction, false);
+        assert_eq!(e.selection().head, expected);
+        assert!(e.display().drawings[0].revealed);
+    }
+    e.select(0, 9);
+    e.take_in_syntax(&(0..0));
+    assert_eq!(e.selection().head, 12);
+    e.set_drawing(source, display::Rendered::Error("bad formula".into()));
+    assert_eq!(e.text(), "before $x^2$ after\nend");
+    assert!(!e.can_undo());
+    let e = editor("$x$ and $x$\n\n```mermaid\nflowchart LR\na-->b\n```\n|end");
+    assert_eq!(e.drawing_targets().len(), 2);
+}
+
+#[test]
+fn diagram_and_math_edits_keep_the_previous_result_until_the_current_source_finishes() {
+    for text in [
+        "```mermaid\na-->b|\n```\nend",
+        "$$\nx+y|\n$$\nend",
+        "$x+y|$\nend",
+        "```mermaid\na-->b|\n```",
+        "$$\nx+y|\n$$",
+        "$x+y|$",
+    ] {
+        let mut e = editor(text);
+        let original = e.drawing_targets()[0].clone();
+        let size = display::ImageSize { width: 120, height: 80 };
+        e.set_drawing(original.clone(), display::Rendered::Image(size));
+        e.insert("z");
+        let intermediate = e.drawing_targets()[0].clone();
+        e.insert("w");
+        let latest = e.drawing_targets()[0].clone();
+        let shown = &e.display().drawings[0];
+        assert_eq!(shown.source, latest);
+        assert_eq!(shown.preview.as_ref(), Some(&original));
+        assert_eq!(shown.rendered, Some(display::Rendered::Image(size)));
+        // An older request finishing during this edit cannot replace the preview with a stale edit.
+        e.set_drawing(
+            intermediate,
+            display::Rendered::Image(display::ImageSize { width: 20, height: 20 }),
+        );
+        assert_eq!(e.display().drawings[0].preview.as_ref(), Some(&original));
+        let replacement = display::ImageSize { width: 140, height: 90 };
+        e.set_drawing(latest.clone(), display::Rendered::Image(replacement));
+        assert_eq!(e.display().drawings[0].preview.as_ref(), Some(&latest));
+        assert_eq!(e.display().drawings[0].rendered, Some(display::Rendered::Image(replacement)));
+        assert_eq!(e.text(), text.replace('|', "zw"));
+    }
+}
+
+#[test]
+fn previews_follow_each_occurrence_across_other_edits_and_do_not_transfer_to_new_blocks() {
+    let mut e = editor("```mermaid\na-->b|\n```\n\n```mermaid\nx-->y\n```\nend");
+    let original = e.drawing_targets();
+    for (index, source) in original.iter().enumerate() {
+        let size = display::ImageSize { width: 100 + u32::try_from(index).unwrap(), height: 50 };
+        e.set_drawing(source.clone(), display::Rendered::Image(size));
+    }
+    e.insert("c");
+    e.move_to(0, false);
+    e.insert("heading\n\n");
+    let source = e.text().find("x-->y").unwrap() + 5;
+    e.move_to(source, false);
+    e.insert("z");
+    let shown = e.display();
+    assert_eq!(shown.drawings[0].preview.as_ref(), Some(&original[0]));
+    assert_eq!(shown.drawings[1].preview.as_ref(), Some(&original[1]));
+    let first = shown.drawings[0].range.clone();
+    e.select(first.start, first.end);
+    e.insert("plain text");
+    e.move_to(0, false);
+    e.insert("```mermaid\nnew-->block\n```\n\n");
+    let shown = e.display();
+    assert_eq!(shown.drawings[0].preview, None);
+    assert_eq!(shown.drawings[1].preview.as_ref(), Some(&original[1]));
+}
+
+#[test]
+fn a_removed_formula_cannot_lend_its_preview_to_a_formula_appended_at_the_note_end() {
+    let mut e = editor("$x|$");
+    let original = e.drawing_targets()[0].clone();
+    e.set_drawing(
+        original,
+        display::Rendered::Image(display::ImageSize { width: 120, height: 80 }),
+    );
+    e.move_to(e.text().len(), false);
+    e.insert("\n\n$y$");
+    e.select(0, 1);
+    e.insert("");
+    let shown = e.display();
+    assert_eq!(shown.drawings.len(), 1);
+    assert_eq!(shown.drawings[0].source, Drawing::InlineMath("y".into()));
+    assert_eq!(shown.drawings[0].preview, None);
+}
+
+#[test]
+fn render_errors_replace_previews_when_ready_and_remain_until_the_next_result() {
+    let mut e = editor("```mermaid\na-->b|\n```\nend");
+    let original = e.drawing_targets()[0].clone();
+    e.set_drawing(
+        original,
+        display::Rendered::Image(display::ImageSize { width: 120, height: 80 }),
+    );
+    e.insert("bad");
+    let invalid = e.drawing_targets()[0].clone();
+    let error = display::Rendered::Error("cannot render".into());
+    e.set_drawing(invalid.clone(), error.clone());
+    assert_eq!(e.display().drawings[0].rendered, Some(error.clone()));
+    e.insert("fixed");
+    assert_eq!(e.display().drawings[0].preview.as_ref(), Some(&invalid));
+    assert_eq!(e.display().drawings[0].rendered, Some(error));
+    let latest = e.drawing_targets()[0].clone();
+    e.set_drawing(
+        latest.clone(),
+        display::Rendered::Image(display::ImageSize { width: 140, height: 90 }),
+    );
+    assert_eq!(e.display().drawings[0].preview.as_ref(), Some(&latest));
+}
