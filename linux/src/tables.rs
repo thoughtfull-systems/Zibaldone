@@ -144,7 +144,7 @@ pub fn cell_at(
         let (column, row, _, _) = grid.query_child(&cell);
         let (row, column) = (usize::try_from(row).ok()?, usize::try_from(column).ok()?);
         let mut nested = Vec::new();
-        let mut tables = (0..).zip(children(&cell).filter(|w| w.has_css_class("zib-table")));
+        let mut tables = (0..).zip(nested_tables(&cell));
         if let Some((index, inner)) = tables.find(|(_, inner)| contains(inner))
             && let Some((inner_row, inner_column, deeper)) = cell_at(&inner, relative_to, point)
         {
@@ -158,6 +158,19 @@ pub fn cell_at(
 
 fn children(widget: &gtk::Widget) -> impl Iterator<Item = gtk::Widget> {
     std::iter::successors(widget.first_child(), gtk::Widget::next_sibling)
+}
+
+/// Collect direct table descendants through quote and list containers, stopping at each grid.
+fn nested_tables(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+    let mut tables = Vec::new();
+    for child in children(widget) {
+        if child.has_css_class("zib-table") {
+            tables.push(child);
+        } else {
+            tables.extend(nested_tables(&child));
+        }
+    }
+    tables
 }
 
 fn grid(

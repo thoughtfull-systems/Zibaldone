@@ -173,9 +173,9 @@ these shortcuts.
 - [ ] While the cursor is in a block, its source shows and the drawing stays below it. Clicking the
   drawing enters its second source line, past structural prefixes. (core:
   `editor::display::drawings::tests`, widget: `editor_widget::drawings::tests`)
-- [ ] Editing a diagram or formula retains its previous result and reserved space until the new
-  result finishes. Intermediate results can't replace the retained preview. Each drawing keeps its
-  own preview as other edits move it through the note. (core: `editor::tests`, widget:
+- [ ] Editing a diagram, formula, or table retains its previous result and reserved space until the
+  new result finishes. Intermediate results can't replace the retained preview. Each drawing keeps
+  its preview as other edits move it through the note. (core: `editor::tests`, widget:
   `editor_widget::drawings::tests`)
 - [ ] A block in a list item draws where its source starts, past the item's indentation or marker,
   and fits the width left. Its first line's indentation hides with the source, unless the line holds
@@ -191,13 +191,20 @@ these shortcuts.
 ## Tables
 
 - [ ] Pipe tables and list tables draw as grids with borders while the selection is outside them,
-  and show their source while it's inside.
+  and show their source while it's inside. A cell click selects that cell's current source, nested
+  cells included. (core: `editor::tests`, widget: `editor_widget::tables::tests`)
 - [ ] Header rows and columns show in bold on a light shade.
 - [ ] A column's text wraps at 40 characters. Columns follow their alignment: left, center, or
   right.
 - [ ] Cells show inline styles, code, block quotes, the titles of linked notes, math, diagrams no
   wider than 480 pixels, and tables nested in cells.
 - [ ] A cell whose math or diagram fails to draw shows its source.
+- [ ] Tab and Shift+Tab select cells in the innermost list table. The first and last cells stay
+  selected at its boundaries. Navigation doesn't change the table's markdown. Pipe tables keep their
+  column alignment and row creation rules. (core: `editor::tests`)
+- [ ] Tables fit the available width and keep cell clicks accurate when scaled. Identical tables
+  have separate grids. A note switch removes their children, and outdated table reference reloads
+  can't replace a newer grid. (widget: `editor_widget::tables::tests`)
 
 ## Links and their labels
 

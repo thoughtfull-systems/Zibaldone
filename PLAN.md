@@ -109,6 +109,9 @@ Pipe tables and list tables become drawn blocks, with the current table widget's
 source shows when the selection enters. Tab and Shift+Tab move between cells, and a click in a cell
 selects its source, as now.
 
+**Try it:** create pipe and list tables, click cells to replace their source, and use Tab and
+Shift+Tab. Nest a table inside a cell, resize the window, and check undo and linked titles.
+
 ### 10. Live editing
 
 Edits from other machines arrive in the Loro text while the note is open, and the selection keeps

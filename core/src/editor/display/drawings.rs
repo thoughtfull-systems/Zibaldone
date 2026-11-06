@@ -11,6 +11,7 @@ use super::{Display, ImageSize};
 pub enum Rendered {
     Image(ImageSize),
     Error(String),
+    Table,
 }
 
 /// Math or a diagram, with the source and the platform's most recent render result.
@@ -31,7 +32,7 @@ pub struct Drawing {
 
 impl Drawing {
     pub fn collapsed(&self) -> bool {
-        !self.revealed && matches!(self.rendered, Some(Rendered::Image(_)))
+        !self.revealed && matches!(self.rendered, Some(Rendered::Image(_) | Rendered::Table))
     }
 }
 
@@ -96,7 +97,7 @@ pub(super) fn collect(
     for drawn in editing::drawings(text) {
         if !matches!(
             drawn.drawing,
-            Source::InlineMath(_) | Source::DisplayMath(_) | Source::Diagram(_)
+            Source::InlineMath(_) | Source::DisplayMath(_) | Source::Diagram(_) | Source::Table(_)
         ) {
             continue;
         }
@@ -129,7 +130,7 @@ pub(super) fn collect(
             drawn.range.start
         };
         let usable = |result: &Rendered| match result {
-            Rendered::Error(_) => true,
+            Rendered::Error(_) | Rendered::Table => true,
             Rendered::Image(size) => size.width > 0 && size.height > 0,
         };
         let (key, rendered) = if let Some(result) = render(&drawn.drawing).filter(usable) {
@@ -146,7 +147,7 @@ pub(super) fn collect(
         }
         let revealed = drawn.touches(selection);
         // Pending and failed math retain all their source, including the dollar delimiters.
-        if !matches!(rendered, Some(Rendered::Image(_))) {
+        if !matches!(rendered, Some(Rendered::Image(_) | Rendered::Table)) {
             display.hidden.retain(|hidden| {
                 hidden.end <= drawn.range.start || hidden.start >= drawn.range.end
             });
@@ -183,7 +184,16 @@ mod tests {
             "| a | b |\n|---|---|\n| $cell$ | x |\n\nend"
         );
         let display = shown(text, text.len()..text.len());
-        let sources: Vec<_> = display.drawings.iter().map(|d| (&d.source, d.block)).collect();
+        let sources: Vec<_> = display
+            .drawings
+            .iter()
+            .filter(|d| !matches!(d.source, Source::Table(_)))
+            .map(|d| (&d.source, d.block))
+            .collect();
+        assert_eq!(
+            display.drawings.iter().filter(|d| matches!(d.source, Source::Table(_))).count(),
+            1
+        );
         assert_eq!(
             sources,
             [

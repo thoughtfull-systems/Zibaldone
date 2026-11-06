@@ -973,7 +973,7 @@ impl Window {
 
     /// Shows a local preview first, then replaces it with the original once it arrives.
     fn refresh_images(&self, reload: bool) {
-        self.refresh_drawings();
+        self.refresh_drawings(reload);
         let Some(widget) = self.inner().new_editor.clone() else { return };
         let (generation, targets) = widget.image_requests(reload);
         for target in targets {
@@ -996,8 +996,11 @@ impl Window {
 
     /// Render after a short pause, then let the widget reject results from an older note session.
     /// Results use the complete source as their key, so an older formula can't replace an edit.
-    fn refresh_drawings(&self) {
+    fn refresh_drawings(&self, reload: bool) {
         let Some(widget) = self.inner().new_editor.clone() else { return };
+        if reload {
+            widget.reload_tables();
+        }
         let generation = self.inner().drawing_generation.get().wrapping_add(1);
         self.inner().drawing_generation.set(generation);
         let w = self.clone();
@@ -1007,6 +1010,16 @@ impl Window {
             }
             let (session, targets) = widget.drawing_requests();
             for drawing in targets {
+                if let Drawing::Table(table) = &drawing {
+                    let (state, widget, table) =
+                        (w.inner().state.clone(), widget.clone(), table.clone());
+                    let revision = widget.table_revision();
+                    glib::spawn_future_local(async move {
+                        let refs = table_refs(state, &table).await;
+                        widget.set_table(session, revision, drawing, refs);
+                    });
+                    continue;
+                }
                 let (kind, source) = match &drawing {
                     Drawing::InlineMath(s) => (Kind::InlineMath, s.clone()),
                     Drawing::DisplayMath(s) => (Kind::DisplayMath, s.clone()),
@@ -2045,6 +2058,23 @@ fn arrow_keys(list: &gtk::ListBox) -> gtk::EventControllerKey {
     keys
 }
 
+/// The same table references serve both editors, including drawings and links in nested cells.
+async fn table_refs(state: Arc<State>, table: &zib_core::body::ListTable) -> tables::Refs {
+    let targets = tables::link_targets(table);
+    let drawings = tables::drawings(table);
+    core(async move {
+        let mut refs = tables::Refs { titles: state.titles(&targets).await, ..Default::default() };
+        for (kind, source) in drawings {
+            let key = tables::drawing_key(kind, &source);
+            if let Ok(image) = state.render(kind, source).await {
+                refs.images.insert(key, image);
+            }
+        }
+        refs
+    })
+    .await
+}
+
 /// Draws math, a diagram, or an embedded image for the editor, at its natural size. Math that
 /// can't be drawn keeps its source in the line; a block that can't shows its source and the error.
 async fn draw(state: Arc<State>, drawing: Drawing) -> Option<gtk::Widget> {
@@ -2054,21 +2084,7 @@ async fn draw(state: Arc<State>, drawing: Drawing) -> Option<gtk::Widget> {
         Drawing::Diagram(source) => (Kind::Mermaid, source),
         Drawing::Embed(target) => return embedded_image(state, target).await,
         Drawing::Table(table) => {
-            let targets = tables::link_targets(&table);
-            let drawings = tables::drawings(&table);
-            let refs = core(async move {
-                let mut refs =
-                    tables::Refs { titles: state.titles(&targets).await, ..Default::default() };
-                for (kind, source) in drawings {
-                    let key = tables::drawing_key(kind, &source);
-                    // A drawing that fails shows its source in the cell.
-                    if let Ok(image) = state.render(kind, source).await {
-                        refs.images.insert(key, image);
-                    }
-                }
-                refs
-            })
-            .await;
+            let refs = table_refs(state, &table).await;
             return Some(tables::widget(&table, &refs));
         }
     };

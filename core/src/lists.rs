@@ -92,6 +92,28 @@ pub(crate) struct Dedented {
 }
 
 impl Dedented {
+    /// Drops the indentation and quote markers of a containing block, retaining the source map.
+    pub(crate) fn container(original: &str, columns: usize) -> Self {
+        let mut text = String::new();
+        let mut lines = Vec::new();
+        let mut from = 0;
+        for line in original.split('\n') {
+            if from > 0 {
+                text.push('\n');
+            }
+            let removed = line
+                .chars()
+                .take(columns)
+                .take_while(|c| matches!(c, ' ' | '\t' | '>'))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            lines.push((text.len(), from, removed));
+            text.push_str(&line[removed..]);
+            from += line.len() + 1;
+        }
+        Self { text, lines }
+    }
+
     pub(crate) fn new(original: &str, indent: usize) -> Self {
         let mut text = String::with_capacity(original.len());
         let mut lines = Vec::new();

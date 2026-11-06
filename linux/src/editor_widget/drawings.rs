@@ -2,19 +2,26 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gdk, graphene, pango};
 use zib_core::editing::Drawing;
 use zib_core::editor::display::{self, ImageSize};
 
-use super::{Line, MARGIN_SIDES, pixels};
+use super::{Line, MARGIN_SIDES, pixels, tables};
 
 #[cfg(test)]
 mod tests;
 
-pub(super) type Resource = Result<(gdk::Texture, ImageSize), String>;
+pub(super) type ImageResult = Result<(gdk::Texture, ImageSize), String>;
 pub(super) type Resources = HashMap<Drawing, Resource>;
+
+pub(super) enum Resource {
+    Error(String),
+    Image(gdk::Texture, ImageSize),
+    Table(Rc<tables::Data>),
+}
 
 const PAD: f64 = 8.0;
 const RED: (f32, f32, f32, f32) = (0.8, 0.15, 0.15, 1.0);
@@ -22,6 +29,7 @@ const RED: (f32, f32, f32, f32) = (0.8, 0.15, 0.15, 1.0);
 pub(super) enum Content {
     Error(pango::Layout),
     Image(gdk::Texture),
+    Table(tables::Layout),
 }
 
 pub(super) struct Block {
@@ -34,6 +42,7 @@ pub(super) struct Block {
 impl Block {
     pub fn paint(&self, snapshot: &gtk::Snapshot, selected: &Range<usize>, color: &gdk::RGBA) {
         match &self.content {
+            Content::Table(_) => {}
             Content::Error(layout) => {
                 snapshot.save();
                 snapshot.translate(&graphene::Point::new(self.rect.x(), self.rect.y()));
@@ -50,10 +59,19 @@ impl Block {
         }
     }
 
+    #[cfg(test)]
     pub fn texture(&self) -> Option<gdk::Texture> {
         match &self.content {
-            Content::Error(_) => None,
+            Content::Error(_) | Content::Table(_) => None,
             Content::Image(texture) => Some(texture.clone()),
+        }
+    }
+
+    pub fn visual(&self) -> Option<gtk::glib::Object> {
+        match &self.content {
+            Content::Error(_) => None,
+            Content::Image(texture) => Some(texture.clone().upcast()),
+            Content::Table(layout) => Some(layout.widget.clone().upcast()),
         }
     }
 }
@@ -82,7 +100,7 @@ pub(super) fn append(
 ) {
     let available = (f64::from(width) - MARGIN_SIDES - origin).max(1.0);
     let (content, w, h) = match resource {
-        Ok((texture, size)) => {
+        Resource::Image(texture, size) => {
             let math = matches!(drawing.source, Drawing::InlineMath(_) | Drawing::DisplayMath(_));
             let scale = if math { crate::drawings::math_scale(widget) } else { 1.0 };
             let w = f64::from(size.width) * scale;
@@ -90,7 +108,7 @@ pub(super) fn append(
             let fit = (available / w.max(1.0)).min(1.0);
             (Content::Image(texture.clone()), w * fit, h * fit)
         }
-        Err(message) => {
+        Resource::Error(message) => {
             let layout = widget.create_pango_layout(Some(message));
             let style = pango::AttrList::new();
             style.insert(pango::AttrString::new_family("monospace"));
@@ -99,6 +117,14 @@ pub(super) fn append(
             layout.set_wrap(pango::WrapMode::WordChar);
             let (w, h) = layout.size();
             (Content::Error(layout), pixels(w), pixels(h))
+        }
+        Resource::Table(data) => {
+            let layout = tables::layout(widget, data, available);
+            let (w, h) = (
+                f64::from(layout.width) * f64::from(layout.scale),
+                f64::from(layout.height) * f64::from(layout.scale),
+            );
+            (Content::Table(layout), w, h)
         }
     };
     let x = origin - line.left + (available - w) / 2.0;

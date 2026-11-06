@@ -441,7 +441,13 @@ mod tests {
     fn hides_syntax_away_from_the_selection() {
         let text = "# Title\n\nSome **bold** and [a](http://x).\n\n| *a* | b |\n|---|---|\n\nend";
         let hidden = |at: usize| -> Vec<&str> {
-            display(text, &(at..at)).hidden.iter().map(|r| &text[r.clone()]).collect()
+            with_resources(text, &(at..at), &mut |_| None, &mut |_| None, &mut |d| {
+                matches!(d, SourceDrawing::Table(_)).then_some(Rendered::Table)
+            })
+            .hidden
+            .iter()
+            .map(|r| &text[r.clone()])
+            .collect()
         };
         let all = ["# ", "**", "**", "[", "](http://x)", "*", "*"];
         assert_eq!(hidden(text.len()), all);

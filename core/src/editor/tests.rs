@@ -701,3 +701,89 @@ fn render_errors_replace_previews_when_ready_and_remain_until_the_next_result() 
     );
     assert_eq!(e.display().drawings[0].preview.as_ref(), Some(&latest));
 }
+
+#[test]
+fn table_tabs_align_pipe_cells_and_undo_restores_the_original_source() {
+    let before = "| h | other |\n|---|---|\n| a | b |\n\nend";
+    let mut e = Editor::new(Body::detached(before));
+    e.move_to(before.find(" a ").unwrap() + 1, false);
+    let selected = e.selection();
+    assert!(e.table_key(false));
+    assert_eq!(e.selected_text(), "b");
+    let aligned = e.text().to_owned();
+    assert!(e.table_key(true));
+    assert_eq!(e.selected_text(), "a");
+    assert_eq!(e.text(), aligned);
+    assert!(e.undo());
+    assert_eq!(e.text(), before);
+    assert_eq!(e.selection(), selected);
+    assert!(!e.can_undo());
+    assert!(e.redo());
+    assert_eq!(e.text(), aligned);
+}
+
+#[test]
+fn list_table_tabs_select_cells_without_changing_their_markdown() {
+    let text = "```table\n- - alpha\n  - beta\n- - gamma\n  - delta\n```\nend";
+    let mut e = Editor::new(Body::detached(text));
+    e.move_to(text.find("alpha").unwrap(), false);
+    for next in ["beta", "gamma", "delta", "delta"] {
+        assert!(e.table_key(false));
+        assert_eq!(e.selected_text(), next);
+    }
+    for next in ["gamma", "beta", "alpha", "alpha"] {
+        assert!(e.table_key(true));
+        assert_eq!(e.selected_text(), next);
+    }
+    assert_eq!(e.text(), text);
+    assert!(!e.can_undo());
+}
+
+#[test]
+fn clicking_a_table_cell_selects_its_source_for_replacement_and_undo() {
+    for text in [
+        "| left | **café** |\n|---|---|\n\nend",
+        "```table\n- - left\n  - **café**\n```\nend",
+        "> ```table\n> - - left\n>   - **café**\n> ```\nend",
+        "- ```table\n  - - left\n    - **café**\n  ```\nend",
+    ] {
+        let mut e = Editor::new(Body::detached(text));
+        let range = e.display().drawings[0].range.clone();
+        assert!(e.select_table_cell(range, 0, 1, &[]), "{text:?}");
+        assert_eq!(e.selected_text(), "**café**");
+        e.insert("edited");
+        assert_eq!(e.text(), text.replace("**café**", "edited"));
+        assert!(e.undo());
+        assert_eq!(e.text(), text);
+        assert_eq!(e.selected_text(), "**café**");
+    }
+}
+
+#[test]
+fn nested_table_cells_select_and_navigate_their_innermost_source() {
+    for inner in ["```table\n- - inner\n  - value\n```", "| inner | value |\n|---|---|"] {
+        let content = inner.replace('\n', "\n    ");
+        let text = format!("````table\n- - outer\n  - {content}\n````\nend");
+        let mut e = Editor::new(Body::detached(&text));
+        let range = e.display().drawings[0].range.clone();
+        assert!(e.select_table_cell(range, 0, 1, &[(0, 0, 1)]), "{text:?}");
+        assert_eq!(e.selected_text(), "value");
+        assert!(e.table_key(true));
+        assert_eq!(e.selected_text(), "inner");
+        assert!(e.table_key(false));
+        assert_eq!(e.selected_text(), "value");
+        assert_eq!(e.text(), text);
+    }
+}
+
+#[test]
+fn table_availability_collapses_source_and_survives_pending_cell_edits() {
+    let mut e = editor("```table\n- - a|\n  - b\n```\nend");
+    let table = e.drawing_targets()[0].clone();
+    e.set_drawing(table.clone(), display::Rendered::Table);
+    e.insert("new");
+    assert_eq!(e.display().drawings[0].preview.as_ref(), Some(&table));
+    e.move_to(e.text().len(), false);
+    assert!(e.display().drawings[0].collapsed());
+    assert_eq!(e.display().paragraphs(e.text()).len(), 2);
+}

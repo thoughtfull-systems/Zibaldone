@@ -277,6 +277,9 @@ pub fn table_cell_in_body(
     column: usize,
     nested: &[(usize, usize, usize)],
 ) -> Option<Range<usize>> {
+    let source = &body[block.clone()];
+    let skipped = source.len() - source.trim_start_matches([' ', '\t', '>']).len();
+    let block = block.start + skipped..block.end;
     let fenced = &body[block.clone()];
     if !fenced.starts_with("```") && !fenced.starts_with("~~~") {
         let pipe_table = nested.is_empty().then_some(block)?;
@@ -284,13 +287,13 @@ pub fn table_cell_in_body(
     }
     let start = block.start + fenced.find('\n')? + 1;
     let last_line = block.start + fenced.rfind('\n').map_or(0, |i| i + 1);
-    let closing = body[last_line..block.end].trim_start();
+    let closing = body[last_line..block.end].trim_start_matches([' ', '\t', '>']);
     let closed = last_line > start && (closing.starts_with("```") || closing.starts_with("~~~"));
     let end = if closed { last_line - 1 } else { block.end };
     // A table nested in a list item has the item's indentation, which its content drops.
     let line_start = body[..block.start].rfind('\n').map_or(0, |i| i + 1);
     let indent = body[line_start..block.start].chars().count();
-    let lines = crate::lists::Dedented::new(&body[start..end.max(start)], indent);
+    let lines = crate::lists::Dedented::container(&body[start..end.max(start)], indent);
     let cell = body::table_cell_source(&lines.text, row, column, nested)?;
     Some(start + lines.original(cell.start)..start + lines.original(cell.end))
 }

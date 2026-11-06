@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 mod drawings;
+mod tables;
 
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
@@ -174,18 +175,21 @@ mod imp {
     use std::cell::{Cell, RefCell};
     use std::ops::Range;
 
+    use adw::prelude::*;
     use gtk::glib;
     use gtk::subclass::prelude::*;
     use zib_core::editor::{Editor, Unit};
 
-    use super::{Drawing, HashMap, HashSet, Line, LinkTarget, PasteTarget, drawings};
+    use super::{Drawing, HashMap, HashSet, Line, LinkTarget, PasteTarget, drawings, tables};
 
     type Callback<T> = RefCell<Option<Box<dyn Fn(T)>>>;
 
     #[derive(Default)]
     pub struct EditorWidget {
         pub asked_drawings: RefCell<HashSet<Drawing>>,
-        pub drawings: RefCell<drawings::Resources>,
+        pub(super) drawings: RefCell<drawings::Resources>,
+        pub(super) table_views: RefCell<Vec<tables::View>>,
+        pub table_revision: Cell<u64>,
         pub editor: RefCell<Option<Editor>>,
         pub images: RefCell<HashMap<zib_core::Id, gtk::gdk::Texture>>,
         pub asked_images: RefCell<HashSet<zib_core::Id>>,
@@ -224,6 +228,12 @@ mod imp {
     }
 
     impl ObjectImpl for EditorWidget {
+        fn dispose(&self) {
+            while let Some(child) = self.obj().first_child() {
+                child.unparent();
+            }
+        }
+
         fn constructed(&self) {
             self.parent_constructed();
             self.obj().setup();
@@ -246,6 +256,7 @@ mod imp {
 
         fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
             self.obj().lay_out(width);
+            tables::allocate(&self.lines.borrow());
             self.obj().update_im_cursor();
         }
 
@@ -277,6 +288,10 @@ impl EditorWidget {
         imp.images.borrow_mut().clear();
         imp.asked_drawings.borrow_mut().clear();
         imp.drawings.borrow_mut().clear();
+        while let Some(child) = self.first_child() {
+            child.unparent();
+        }
+        imp.table_views.borrow_mut().clear();
         imp.bottom_space.set(0.0);
         imp.top_space.set(0.0);
         *imp.editor.borrow_mut() = editor;
@@ -334,8 +349,60 @@ impl EditorWidget {
         (imp.session.get(), targets.into_iter().filter(|d| asked.insert(d.clone())).collect())
     }
 
+    pub fn reload_tables(&self) {
+        self.imp().table_revision.set(self.imp().table_revision.get().wrapping_add(1));
+        self.imp().asked_drawings.borrow_mut().retain(|d| !matches!(d, Drawing::Table(_)));
+    }
+
+    pub fn table_revision(&self) -> u64 {
+        self.imp().table_revision.get()
+    }
+
+    pub fn set_table(
+        &self,
+        session: u64,
+        revision: u64,
+        drawing: Drawing,
+        refs: crate::tables::Refs,
+    ) {
+        if session != self.imp().session.get() || revision != self.table_revision() {
+            return;
+        }
+        let Drawing::Table(table) = &drawing else { return };
+        let data = std::rc::Rc::new(tables::Data { table: table.clone(), refs });
+        self.imp().drawings.borrow_mut().insert(drawing.clone(), drawings::Resource::Table(data));
+        if let Some(editor) = self.imp().editor.borrow_mut().as_mut() {
+            editor.set_drawing(drawing, Rendered::Table);
+        }
+        self.relayout();
+    }
+
+    /// GTK answers geometry; the core maps the resulting cell path to the current body.
+    fn table_at(&self, x: f64, y: f64) -> Option<(Range<usize>, crate::tables::CellPath)> {
+        #[allow(clippy::cast_possible_truncation)]
+        let point = graphene::Point::new(x as f32, y as f32);
+        for line in self.imp().lines.borrow().iter() {
+            for block in &line.blocks {
+                if let drawings::Content::Table(layout) = &block.content
+                    && let Some(cell) =
+                        crate::tables::cell_at(&layout.widget, self.upcast_ref(), &point)
+                {
+                    return Some((block.range.clone(), cell));
+                }
+            }
+        }
+        None
+    }
+
+    fn select_cell_at(&self, x: f64, y: f64) -> bool {
+        let Some((block, (row, column, nested))) = self.table_at(x, y) else { return false };
+        let mut selected = false;
+        self.edit(|editor| selected = editor.select_table_cell(block, row, column, &nested));
+        selected
+    }
+
     /// Render results are keyed by source, and a result from another note session is ignored.
-    pub fn set_drawing(&self, session: u64, drawing: Drawing, result: drawings::Resource) {
+    pub fn set_drawing(&self, session: u64, drawing: Drawing, result: drawings::ImageResult) {
         let imp = self.imp();
         if session != imp.session.get() {
             return;
@@ -351,7 +418,11 @@ impl EditorWidget {
             |error| Rendered::Error(error.clone()),
             |(_, size)| Rendered::Image(*size),
         );
-        imp.drawings.borrow_mut().insert(drawing.clone(), result);
+        let resource = match result {
+            Ok((texture, size)) => drawings::Resource::Image(texture, size),
+            Err(error) => drawings::Resource::Error(error),
+        };
+        imp.drawings.borrow_mut().insert(drawing.clone(), resource);
         if let Some(editor) = imp.editor.borrow_mut().as_mut() {
             editor.set_drawing(drawing, rendered);
         }
@@ -559,6 +630,7 @@ impl EditorWidget {
                 text,
                 wrap: (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0),
             };
+            tables::begin(self);
             let mut lines = Vec::new();
             let mut y = MARGIN_TOP + imp.top_space.get();
             for paragraph in shown.paragraphs(text) {
@@ -597,6 +669,8 @@ impl EditorWidget {
                 lines.push(line);
             }
             *imp.lines.borrow_mut() = lines;
+            tables::finish(self);
+            tables::allocate(&imp.lines.borrow());
         }
         let lines = imp.lines.borrow();
         let bottom = lines.last().map_or(MARGIN_TOP, |line| line.y + line.height);
@@ -825,6 +899,7 @@ impl EditorWidget {
                 draw_marker(snapshot, line, range, *shape, &color);
             }
             snapshot.restore();
+            tables::snapshot(self, snapshot, line);
         }
         if self.has_focus()
             && let Some((x, y, height)) = caret_rect(&lines, editor.selection().head)
@@ -1132,7 +1207,7 @@ impl EditorWidget {
                 let key = if back { ListKey::ShiftTab } else { ListKey::Tab };
                 // In a list item, Tab and Shift+Tab move the item, and never type a tab.
                 self.edit(|e| {
-                    if !e.list_key(key) && !back {
+                    if !e.table_key(back) && !e.list_key(key) && !back {
                         e.insert("\t");
                     }
                 });
@@ -1261,6 +1336,14 @@ impl EditorWidget {
             return;
         }
         let at = self.position_at(x, y);
+        if gesture.current_button() == gdk::BUTTON_PRIMARY
+            && plain.is_empty()
+            && self.select_cell_at(x, y)
+        {
+            self.imp().on_box.set(true);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            return;
+        }
         let shift = gesture.current_event_state().contains(gdk::ModifierType::SHIFT_MASK);
         match gesture.current_button() {
             gdk::BUTTON_MIDDLE => {
@@ -1472,15 +1555,15 @@ fn line_at(lines: &[Line], at: usize) -> Option<&Line> {
 
 /// Images determine the height of earlier paragraphs and of the entire paragraph at the caret.
 /// Source offsets can change during ordinary typing without changing which pictures are there.
-fn images_through(lines: &[Line], at: usize) -> Vec<gdk::Texture> {
+fn images_through(lines: &[Line], at: usize) -> Vec<glib::Object> {
     lines
         .iter()
         .take_while(|line| line.start <= at)
         .flat_map(|line| {
             line.images
                 .iter()
-                .map(|image| image.texture.clone())
-                .chain(line.blocks.iter().filter_map(drawings::Block::texture))
+                .map(|image| image.texture.clone().upcast::<glib::Object>())
+                .chain(line.blocks.iter().filter_map(drawings::Block::visual))
         })
         .collect()
 }
@@ -1704,10 +1787,11 @@ fn shape_images(
                 }
                 Content::Drawing(index) => {
                     let drawing = &display.drawings[index];
-                    let (texture, size) = renders
-                        .get(drawing.preview.as_ref().unwrap_or(&drawing.source))?
-                        .as_ref()
-                        .ok()?;
+                    let drawings::Resource::Image(texture, size) =
+                        renders.get(drawing.preview.as_ref().unwrap_or(&drawing.source))?
+                    else {
+                        return None;
+                    };
                     let descent = pixels(layout.context().metrics(None, None).descent());
                     (
                         texture.clone(),

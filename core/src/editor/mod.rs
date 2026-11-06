@@ -6,6 +6,7 @@
 //! stays in place as edits from other machines arrive. Offsets are bytes of UTF-8 text.
 
 pub mod display;
+mod tables;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -237,7 +238,10 @@ impl Editor {
             .filter(|drawing| {
                 matches!(
                     drawing,
-                    Drawing::InlineMath(_) | Drawing::DisplayMath(_) | Drawing::Diagram(_)
+                    Drawing::InlineMath(_)
+                        | Drawing::DisplayMath(_)
+                        | Drawing::Diagram(_)
+                        | Drawing::Table(_)
                 ) && seen.insert(drawing.clone())
             })
             .collect()
@@ -574,6 +578,42 @@ impl Editor {
         true
     }
 
+    /// Table navigation precedes list indentation and accepts the selection left by the last Tab.
+    pub fn table_key(&mut self, back: bool) -> bool {
+        if let Some((edit, selected)) =
+            crate::pipe_tables::table_edit(&self.text, self.selection.head, back)
+        {
+            if edit.range.is_empty() && edit.text.is_empty() {
+                self.select(selected.start, selected.end);
+            } else {
+                self.apply_edit(edit, Some(selected));
+            }
+            return true;
+        }
+        let Some(selected) = tables::next_cell(&self.text, &self.selection.range(), back) else {
+            return false;
+        };
+        self.select(selected.start, selected.end);
+        true
+    }
+
+    /// Selects a drawn cell's current source, including a cell in a table nested inside it.
+    pub fn select_table_cell(
+        &mut self,
+        block: Range<usize>,
+        row: usize,
+        column: usize,
+        nested: &[(usize, usize, usize)],
+    ) -> bool {
+        let Some(range) =
+            crate::editing::table_cell_in_body(&self.text, block, row, column, nested)
+        else {
+            return false;
+        };
+        self.select(range.start, range.end);
+        true
+    }
+
     /// Checks or unchecks the task at `at`, or gives the list item there an unchecked box, as an
     /// undo step of its own, with the selection where it was. Returns whether there was an item.
     pub fn toggle_task(&mut self, at: usize) -> bool {
@@ -690,7 +730,10 @@ impl Editor {
         for drawn in crate::editing::drawings(&self.text).into_iter().filter(|d| {
             matches!(
                 d.drawing,
-                Drawing::InlineMath(_) | Drawing::DisplayMath(_) | Drawing::Diagram(_)
+                Drawing::InlineMath(_)
+                    | Drawing::DisplayMath(_)
+                    | Drawing::Diagram(_)
+                    | Drawing::Table(_)
             )
         }) {
             let prior = previous

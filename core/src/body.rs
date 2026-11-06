@@ -535,16 +535,14 @@ pub fn table_cell_source(
     let Some(&(table, inner_row, inner_column)) = nested.first() else {
         return Some(source(0..cell.len()));
     };
-    let (block, _) = fenced_blocks(&cell)
+    let block = crate::editing::drawings(&cell)
         .into_iter()
-        .filter(|(_, fenced)| matches!(fenced, Fenced::Table(Some(_))))
-        .nth(table)?;
-    let fenced = &cell[block.clone()];
-    let start = block.start + fenced.find('\n')? + 1;
-    let last_line = block.start + fenced.rfind('\n').map_or(0, |i| i + 1);
-    let end = if last_line > start { last_line - 1 } else { block.end };
-    let inner = table_cell_source(&cell[start..end], inner_row, inner_column, &nested[1..])?;
-    Some(source(start + inner.start..start + inner.end))
+        .filter(|drawn| matches!(drawn.drawing, crate::editing::Drawing::Table(_)))
+        .nth(table)?
+        .range;
+    let inner =
+        crate::editing::table_cell_in_body(&cell, block, inner_row, inner_column, &nested[1..])?;
+    Some(source(inner))
 }
 
 /// The offset in `content` of byte `at` of the text that `cell_text` gives for the item at
