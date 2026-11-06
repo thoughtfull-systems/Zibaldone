@@ -183,6 +183,20 @@ When an editor inserts a wikilink, it stores `[[<id>]]` with the target's canoni
 the owner selected text first, it stores the text as the label, with each line break replaced by a
 space and each backslash, `]`, and `|` escaped.
 
+## Labels in display editors
+
+An editor that draws from a display model shows a wikilink without a label by its target's current
+title, with its span formatting. The title stands for the link's source range, and never enters the
+body. When the selection touches the link, including either edge, the source shows as written.
+
+The editor updates the displayed title when the target changes. This changes neither the body nor
+the undo history. It fills in no labels and strips none when it saves. A label the owner writes
+stays explicit, even when it equals the target's current title or a title the editor showed before.
+
+When the owner picks a target, the editor stores a wikilink with its canonical identifier and no
+label. If the owner wraps selected text in `[[` and `]]` first, the editor stores that text as the
+label, with each line break replaced by a space and each backslash, `]`, and `|` escaped.
+
 ## Platforms
 
 No platform differs. Every app renders bodies from the core's parse tree.

@@ -48,6 +48,8 @@ pub struct Inner {
     rows: RefCell<Vec<(Id, Id)>>,
     /// Counts reloads of the list, so only the latest one fills it.
     generation: Cell<u64>,
+    /// Counts title lookups, so an older result cannot overwrite a newer title.
+    label_generation: Cell<u64>,
     title: adw::WindowTitle,
     stack: gtk::Stack,
     view: sourceview5::View,
@@ -239,6 +241,7 @@ impl Window {
             list,
             rows: RefCell::default(),
             generation: Cell::new(0),
+            label_generation: Cell::new(0),
             title,
             stack,
             view: view.clone(),
@@ -262,6 +265,10 @@ impl Window {
         if let Some(widget) = &this.inner().new_editor {
             let w = this.clone();
             widget.connect_edited(move || w.new_editor_edited());
+            let w = this.clone();
+            widget.connect_open_link(move |target| w.open_link(target));
+            let w = this.clone();
+            widget.connect_pick_link(move |range| w.open_widget_link_picker(range));
         }
         this.update_history();
         this.reload_spaces();
@@ -568,6 +575,7 @@ impl Window {
             return;
         }
         self.reload_notes();
+        self.refresh_link_titles();
         let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
         if let Some((open_space, note)) = open.filter(|(s, _)| *s == space) {
             self.refresh_open(open_space, note);
@@ -692,6 +700,7 @@ impl Window {
                 live: Cell::new(false),
                 cursors: None,
             };
+            let titles = editor.titles.clone();
             w.set_text(&text);
             *w.inner().editor.borrow_mut() = Some(editor);
             if let Some(widget) = w.inner().new_editor.clone() {
@@ -701,7 +710,10 @@ impl Window {
                 })
                 .await;
                 match opened {
-                    Ok(body) => widget.set_editor(Some(zib_core::editor::Editor::new(body))),
+                    Ok(body) => {
+                        widget.set_editor(Some(zib_core::editor::Editor::new(body)));
+                        widget.set_titles(titles);
+                    }
                     Err(error) => w.toast(&format!("Couldn't open the note: {error}")),
                 }
             }
@@ -915,6 +927,7 @@ impl Window {
             editor.live.get()
         };
         self.update_title();
+        self.refresh_link_titles();
         if let Some(timer) = self.inner().body_timer.take() {
             timer.remove();
         }
@@ -925,6 +938,27 @@ impl Window {
             w.report_body_edited_now();
         });
         *self.inner().body_timer.borrow_mut() = Some(timer);
+    }
+
+    /// Resolves labels across all spaces, and discards a lookup if the open body changed.
+    fn refresh_link_titles(&self) {
+        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let Some(text) = widget.text() else { return };
+        let generation = self.inner().label_generation.get().wrapping_add(1);
+        self.inner().label_generation.set(generation);
+        let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
+        let state = self.inner().state.clone();
+        let w = self.clone();
+        glib::spawn_future_local(async move {
+            let targets: Vec<Id> = body::link_targets(&text).into_iter().collect();
+            let titles = core(async move { state.titles(&targets).await }).await;
+            if w.inner().label_generation.get() == generation
+                && w.inner().editor.borrow().as_ref().map(|e| (e.space, e.note)) == open
+                && widget.text().as_deref() == Some(&text)
+            {
+                widget.set_titles(titles);
+            }
+        });
     }
 
     /// Reports the new editor's edits now if a report waits.
@@ -951,6 +985,7 @@ impl Window {
 
     /// Commits pending typing, and ends the note's live sessions.
     fn close_editor(&self) {
+        self.inner().label_generation.set(self.inner().label_generation.get().wrapping_add(1));
         self.report_body_edited();
         if let Some(widget) = &self.inner().new_editor {
             widget.set_editor(None);
@@ -1026,6 +1061,7 @@ impl Window {
                 editor.stored = text;
             }
             self.update_title();
+            self.refresh_link_titles();
             return;
         }
         let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
@@ -1481,11 +1517,54 @@ impl Window {
         let place = view.iter_location(&buffer.iter_at_mark(&end));
         let (x, y) =
             view.buffer_to_window_coords(gtk::TextWindowType::Widget, place.x(), place.y());
-        let popover = gtk::Popover::builder()
-            .pointing_to(&gdk::Rectangle::new(x, y, 1, place.height()))
-            .position(gtk::PositionType::Bottom)
-            .build();
-        popover.set_parent(view);
+        let w = self.clone();
+        let (from, to) = (start.clone(), end.clone());
+        let chosen = Rc::new(Cell::new(false));
+        let picked = chosen.clone();
+        let pick = move |target| {
+            picked.set(true);
+            w.insert_link(&from, &to, target, label.clone());
+        };
+        let w = self.clone();
+        let closed = move || {
+            if !chosen.get() {
+                w.inner().buffer.delete_mark(&start);
+                w.inner().buffer.delete_mark(&end);
+            }
+            w.inner().view.grab_focus();
+        };
+        self.show_link_picker(view, &gdk::Rectangle::new(x, y, 1, place.height()), pick, closed);
+    }
+
+    fn open_widget_link_picker(&self, range: std::ops::Range<usize>) {
+        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let Some(text) = widget.text() else { return };
+        let Some(expected) = text.get(range.clone()).map(str::to_owned) else { return };
+        let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
+        let w = self.clone();
+        let editing = widget.clone();
+        let pick = move |target| {
+            if w.inner().editor.borrow().as_ref().map(|e| (e.space, e.note)) == open {
+                editing.insert_link(range.clone(), &expected, target);
+            }
+        };
+        let editing = widget.clone();
+        self.show_link_picker(&widget, &widget.cursor_rectangle(), pick, move || {
+            editing.grab_focus();
+        });
+    }
+
+    /// The search and results shared by both editors' link pickers.
+    fn show_link_picker(
+        &self,
+        parent: &impl IsA<gtk::Widget>,
+        place: &gdk::Rectangle,
+        on_pick: impl Fn(Id) + 'static,
+        on_closed: impl Fn() + 'static,
+    ) {
+        let popover =
+            gtk::Popover::builder().pointing_to(place).position(gtk::PositionType::Bottom).build();
+        popover.set_parent(parent);
         let entry = gtk::SearchEntry::builder().placeholder_text("Link to a note").build();
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
@@ -1532,19 +1611,18 @@ impl Window {
             }
         };
         fill(String::new());
-        // Whether the owner picked a note. The link goes in once its title arrives, so the marks
-        // outlive the popover.
         let chosen = Rc::new(Cell::new(false));
         let pick = {
-            let (w, popover, found) = (self.clone(), popover.clone(), found.clone());
-            let (start, end, chosen) = (start.clone(), end.clone(), chosen.clone());
+            let (popover, found) = (popover.clone(), found.clone());
+            let chosen = chosen.clone();
+            let on_pick = Rc::new(on_pick);
             move |index: i32| {
                 let target =
                     usize::try_from(index).ok().and_then(|i| found.borrow().get(i).copied());
                 if let Some(target) = target
                     && !chosen.replace(true)
                 {
-                    w.insert_link(&start, &end, target, label.clone());
+                    on_pick(target);
                 }
                 popover.popdown();
             }
@@ -1557,14 +1635,8 @@ impl Window {
         entry.add_controller(arrow_keys(&list));
         let closing = popover.clone();
         entry.connect_stop_search(move |_| closing.popdown());
-        let w = self.clone();
         popover.connect_closed(move |popover| {
-            if !chosen.get() {
-                let buffer = &w.inner().buffer;
-                buffer.delete_mark(&start);
-                buffer.delete_mark(&end);
-            }
-            w.inner().view.grab_focus();
+            on_closed();
             let popover = popover.clone();
             glib::idle_add_local_once(move || popover.unparent());
         });
@@ -1733,18 +1805,22 @@ impl Window {
         let Some(iter) = view.iter_at_location(bx, by) else { return false };
         let text = editor::text(&self.inner().buffer);
         let byte = editor::byte_at(&text, iter.offset());
-        match link_at(&text, byte) {
-            Some(LinkTarget::Note(note)) => self.open_uri(&format!("zib:note/{note}")),
-            Some(LinkTarget::Web(url)) => {
+        let Some(target) = link_at(&text, byte) else { return false };
+        self.open_link(target);
+        true
+    }
+
+    fn open_link(&self, target: LinkTarget) {
+        match target {
+            LinkTarget::Note(note) => self.open_uri(&format!("zib:note/{note}")),
+            LinkTarget::Web(url) => {
                 let launched =
                     gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>);
                 if launched.is_err() {
                     self.toast(&format!("No app opens {url}"));
                 }
             }
-            None => return false,
         }
-        true
     }
 
     fn add_machine(&self) {

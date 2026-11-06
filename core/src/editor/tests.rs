@@ -282,3 +282,62 @@ fn moves_back_into_a_task_box_in_two_steps() {
     e.move_by(Unit::Grapheme, Direction::Back, false);
     assert_eq!(shown(&e), "- [ ]| text");
 }
+
+/// Note bodies: Labels in display editors.
+#[test]
+fn link_titles_change_without_edits_or_undo_steps() {
+    let target: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+    let text = format!("[[{target}]]\n\nend");
+    let mut e = Editor::new(Body::detached(&text));
+    e.move_to(text.len(), false);
+    for title in ["**First**", "*Renamed*", ""] {
+        e.set_titles(HashMap::from([(target, title.to_owned())]));
+        let shown = e.display();
+        assert_eq!(shown.labels.len(), 1);
+        assert_eq!(e.text(), text);
+        assert!(!e.can_undo());
+    }
+    e.insert("!");
+    e.set_titles(HashMap::from([(target, "Later".to_owned())]));
+    assert!(e.undo());
+    assert_eq!(e.text(), text);
+    assert_eq!(e.display().labels[0].text, "Later");
+}
+
+/// Note bodies: Labels in display editors.
+#[test]
+fn link_picker_inserts_only_the_identifier_and_undo_restores_the_brackets() {
+    let target: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+    let mut e = editor("See |");
+    assert_eq!(e.type_text("["), None);
+    let range = e.type_text("[").unwrap();
+    assert_eq!(range, 4..6);
+    assert!(e.insert_link(range, "[[", target));
+    assert_eq!(e.text(), format!("See [[{target}]]"));
+    assert_eq!(e.selection().head, e.text().len());
+    assert!(e.undo());
+    assert_eq!(e.text(), "See [[");
+    assert!(e.redo());
+    assert_eq!(e.text(), format!("See [[{target}]]"));
+    // An edit while the picker is open must never replace unrelated source.
+    assert!(!e.insert_link(0..2, "[[", target));
+}
+
+/// Note bodies: Labels in display editors.
+#[test]
+fn link_picker_preserves_an_explicit_label_with_escapes_and_line_breaks() {
+    let target: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+    let label = "**café** | \\ ]\nnext";
+    let mut e = Editor::new(Body::detached(label));
+    e.select_all();
+    assert_eq!(e.type_text("["), None);
+    let range = e.type_text("[").unwrap();
+    let expected = e.text().to_owned();
+    assert!(e.insert_link(range, &expected, target));
+    let links = body::wikilinks(e.text());
+    assert_eq!(links[0].label.as_deref(), Some("**café** | \\ ] next"));
+    e.set_titles(HashMap::from([(target, label.to_owned())]));
+    assert_eq!(e.text(), body::wikilink(target, Some(label)));
+    e.insert("\nend");
+    assert_eq!(e.display().labels, Vec::<display::Label>::new());
+}

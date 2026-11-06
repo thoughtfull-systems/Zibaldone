@@ -7,6 +7,7 @@
 
 pub mod display;
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +21,7 @@ pub use crate::lists::ListKey;
 use crate::lists::list_edit;
 use crate::space::ORIGIN;
 use crate::time::{self, Timestamp};
+use crate::{Id, body};
 
 /// How long a pause in typing ends its undo step, in milliseconds.
 const TYPING_PAUSE: i64 = 1000;
@@ -89,6 +91,7 @@ pub enum Unit {
 
 /// A note's body open for editing.
 pub struct Editor {
+    titles: HashMap<Id, String>,
     doc: LoroDoc,
     body: LoroText,
     undo: UndoManager,
@@ -132,6 +135,7 @@ impl Editor {
         }
         let text = body.to_string();
         let mut editor = Self {
+            titles: HashMap::new(),
             doc,
             body,
             undo,
@@ -157,7 +161,17 @@ impl Editor {
 
     /// How the text looks with the selection as it is.
     pub fn display(&self) -> display::Display {
-        display::display(&self.text, &self.selection.range())
+        self.display_for(&self.selection.range())
+    }
+
+    /// What shows while `selection` decides which syntax is visible, such as during a drag.
+    pub fn display_for(&self, selection: &Range<usize>) -> display::Display {
+        display::with_titles(&self.text, selection, &mut |id| self.titles.get(&id).cloned())
+    }
+
+    /// Updates titles without editing the body or its undo history.
+    pub fn set_titles(&mut self, titles: HashMap<Id, String>) {
+        self.titles = titles;
     }
 
     pub fn selected_text(&self) -> &str {
@@ -264,7 +278,7 @@ impl Editor {
         }
         let forward = head > anchor;
         let mut to = head;
-        for hidden in display::display(&self.text, showing).hidden {
+        for hidden in self.display_for(showing).hidden {
             let at_edge = if forward {
                 hidden.start <= to && to < hidden.end
             } else {
@@ -308,6 +322,37 @@ impl Editor {
         // A line break, or text pasted in one go, is an undo step of its own.
         let separate = typed.contains('\n') || typed.chars().nth(1).is_some();
         self.replace(range, typed, separate);
+    }
+
+    /// Types text and reports the source to replace when `[[` opens the link picker.
+    pub fn type_text(&mut self, typed: &str) -> Option<Range<usize>> {
+        let range = self.selection.range();
+        if typed == "[" && !range.is_empty() {
+            let wrapped = range.start > 0
+                && self.text[..range.start].ends_with('[')
+                && self.text[range.end..].starts_with(']');
+            let text = format!("[{}]", self.selected_text());
+            self.replace(range.clone(), &text, true);
+            self.place(Selection { anchor: range.start + 1, head: range.end + 1 });
+            return wrapped.then(|| range.start - 1..range.end + 3);
+        }
+        self.insert(typed);
+        let end = self.selection.head;
+        (typed == "[" && self.text[..end].ends_with("[[")).then(|| end - 2..end)
+    }
+
+    /// Replaces a picker's unchanged source with a link, as one undo step. A chosen label stays
+    /// explicit even when it happens to match the target's title.
+    pub fn insert_link(&mut self, range: Range<usize>, expected: &str, target: Id) -> bool {
+        if self.text.get(range.clone()) != Some(expected) {
+            return false;
+        }
+        let label = expected
+            .strip_prefix("[[")
+            .and_then(|s| s.strip_suffix("]]"))
+            .filter(|s| !s.is_empty());
+        self.replace(range, &body::wikilink(target, label), true);
+        true
     }
 
     /// Deletes the selection, or the character before the cursor.

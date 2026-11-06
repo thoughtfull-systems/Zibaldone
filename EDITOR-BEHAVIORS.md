@@ -186,11 +186,13 @@ In `attach_wrap_keys`, with the core's `editing::complete_block_opening` and
 
 ## Links and their labels
 
-- [ ] Opening a note shows each wikilink without a label with its target's title. (core:
-  `body::fill_labels_mapped`)
+- [ ] Opening a note shows each wikilink without a label with its target's title and span
+  formatting. The title comes from the display model, and the source shows when the selection
+  touches the link. (core: `editor::display`)
 - [ ] A link the owner types gets its target's title once the cursor leaves it.
-- [ ] A label equal to the target's title, or to any title the editor showed for it, isn't stored.
-  Other labels stay as the owner's. (core: `body::strip_labels`)
+- [ ] The body holds only labels the owner writes, including one that equals the target's title.
+  Displayed titles never enter the body or its undo history. This changes the current editor, which
+  fills in titles and strips matching labels when it saves. (core: `editor::tests`)
 - [ ] When a target's title changes while the note is open, its links show the new title.
 - [ ] A target that's gone shows as a missing note, and one with a tombstone shows its last title,
   styled as deleted.
@@ -201,8 +203,9 @@ In `attach_wrap_keys`, with the core's `editing::complete_block_opening` and
   "Untitled" for a note without a title.
 - [ ] In the picker, Up and Down move the selection, Enter or a click picks a note, and Escape
   closes it and leaves the typed `[[` alone.
-- [ ] A picked note's link replaces the `[[` with the target's identifier and title, and the cursor
-  goes after it.
+- [ ] A picked note's link replaces the `[[` with the target's canonical identifier and any label
+  the owner selected. The cursor goes after it, and undo restores the brackets. (core:
+  `editor::tests`)
 
 ## Files and images
 

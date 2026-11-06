@@ -5,6 +5,8 @@
 use std::ops::Range;
 
 use crate::editing::{Span, Style, list_pads, spans};
+use crate::markup::{self, Inline};
+use crate::{Id, body};
 
 /// How a range of the text looks. Several looks can cover the same text, as emphasis inside a link
 /// does, and apps apply them in the order they come, so a later one wins where they disagree.
@@ -56,9 +58,19 @@ pub struct Marker {
     pub shape: Shape,
 }
 
+/// A title drawn in place of a link's source. Its styles use byte ranges in `text`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Label {
+    pub range: Range<usize>,
+    pub text: String,
+    pub styles: Vec<Styled>,
+}
+
 /// How a text looks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Display {
+    /// Titles for wikilinks without labels, in source order. These never enter the body.
+    pub labels: Vec<Label>,
     /// The looks, with every piece of syntax last, so its dimming wins over the color of what
     /// holds it.
     pub styles: Vec<Styled>,
@@ -82,6 +94,15 @@ pub struct Display {
 /// selection touches it, the cursor at either edge included, and hides otherwise. In a pipe table
 /// that the selection touches, all of it shows, so its columns line up.
 pub fn display(text: &str, selection: &Range<usize>) -> Display {
+    with_titles(text, selection, &mut |_| None)
+}
+
+/// How `text` looks, resolving the markdown title of each wikilink without a label.
+pub fn with_titles(
+    text: &str,
+    selection: &Range<usize>,
+    title: &mut dyn FnMut(Id) -> Option<String>,
+) -> Display {
     let mut display = Display::default();
     let mut syntax = Vec::new();
     let found = spans(text);
@@ -147,7 +168,61 @@ pub fn display(text: &str, selection: &Range<usize>) -> Display {
     display.shaded.dedup();
     display.hidden = merged(display.hidden);
     display.pads = list_pads(text);
+    for link in body::wikilinks(text).into_iter().filter(|link| link.label.is_none()) {
+        let touches =
+            |range: &Range<usize>| range.start <= selection.end && selection.start <= range.end;
+        if touches(&link.range) || tables.iter().any(|t| t.contains(&link.range.start)) {
+            continue;
+        }
+        let markdown = title(link.target).unwrap_or_else(|| link.target.to_string());
+        let mut label = Label { range: link.range, text: String::new(), styles: Vec::new() };
+        label.append(&markup::inline_markdown(&markdown));
+        if label.text.trim().is_empty() {
+            "Untitled".clone_into(&mut label.text);
+            label.styles.clear();
+        }
+        display.labels.push(label);
+    }
     display
+}
+
+impl Label {
+    /// Keeps a title's inline formatting without putting its markdown syntax on screen.
+    fn append(&mut self, inlines: &[Inline]) {
+        for inline in inlines {
+            let start = self.text.len();
+            let (children, look) = match inline {
+                Inline::Emphasis(children) => (children, Look::Emphasis),
+                Inline::Strong(children) => (children, Look::Strong),
+                Inline::Strikethrough(children) => (children, Look::Strikethrough),
+                Inline::Underline(children) => (children, Look::Underline),
+                Inline::Highlight(children) => (children, Look::Highlight),
+                Inline::Link { content, .. } => {
+                    self.append(content);
+                    continue;
+                }
+                Inline::Text(text) => {
+                    self.text.push_str(text);
+                    continue;
+                }
+                Inline::Code(text) | Inline::Math { source: text, .. } => {
+                    self.text.push_str(text);
+                    self.styles.push(Styled { range: start..self.text.len(), look: Look::Code });
+                    continue;
+                }
+                Inline::SoftBreak | Inline::HardBreak => {
+                    self.text.push(' ');
+                    continue;
+                }
+                _ => {
+                    self.text.push_str(&markup::flatten_text(std::slice::from_ref(inline)));
+                    continue;
+                }
+            };
+            self.append(children);
+            self.styles.push(Styled { range: start..self.text.len(), look });
+        }
+    }
 }
 
 /// `ranges` in order, with those that overlap or meet joined.
@@ -181,6 +256,49 @@ fn lines(text: &str, range: &Range<usize>) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Note bodies: Labels in display editors.
+    #[test]
+    fn draws_formatted_titles_only_away_from_unlabeled_links() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let link = format!("[[{id}#part]]");
+        let text = format!("{link} [[{id}|chosen]] `[[{id}]]`\n\nend");
+        let shown = with_titles(&text, &(text.len()..text.len()), &mut |_| {
+            Some("**café** =under= ==bright== ~~gone~~ `code` $x$ &amp;".to_owned())
+        });
+        assert_eq!(shown.labels.len(), 1);
+        let label = &shown.labels[0];
+        assert_eq!(label.range, 0..link.len());
+        assert_eq!(label.text, "café under bright gone code x &");
+        let looks: Vec<_> =
+            label.styles.iter().map(|s| (&label.text[s.range.clone()], s.look)).collect();
+        assert_eq!(
+            looks,
+            [
+                ("café", Look::Strong),
+                ("under", Look::Underline),
+                ("bright", Look::Highlight),
+                ("gone", Look::Strikethrough),
+                ("code", Look::Code),
+                ("x", Look::Code),
+            ]
+        );
+        for at in [0, 2, link.len()] {
+            assert_eq!(
+                with_titles(&text, &(at..at), &mut |_| Some("title".into())).labels,
+                Vec::<Label>::new(),
+            );
+        }
+    }
+
+    #[test]
+    fn missing_and_untitled_links_have_visible_labels() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("[[{id}]]\nend");
+        assert_eq!(display(&text, &(text.len()..text.len())).labels[0].text, id.to_string());
+        let shown = with_titles(&text, &(text.len()..text.len()), &mut |_| Some(String::new()));
+        assert_eq!(shown.labels[0].text, "Untitled");
+    }
 
     /// The looks of `text`, each with the text it covers.
     fn looks(text: &str) -> Vec<(&str, Look)> {

@@ -6,12 +6,15 @@
 //! It shows a note while `ZIB_EDITOR=new` is set in the development build, until it does
 //! everything the text view does.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
-use zib_core::editor::display::{Look, Shape, display};
+use zib_core::Id;
+use zib_core::editing::{LinkTarget, link_at};
+use zib_core::editor::display::{Display, Look, Shape};
 use zib_core::editor::{Direction, Editor, ListKey, Unit};
 
 /// Space around the text, in pixels, as the text view has.
@@ -34,7 +37,7 @@ pub fn enabled() -> bool {
     !cfg!(feature = "production") && std::env::var("ZIB_EDITOR").is_ok_and(|v| v == "new")
 }
 
-/// A line of the text, laid out with its hidden syntax left out.
+/// A line of the text, with hidden syntax left out and link titles drawn in its place.
 pub struct Line {
     /// Where the line starts and ends in the text, without its line break.
     start: usize,
@@ -54,13 +57,15 @@ pub struct Line {
     markers: Vec<(Range<usize>, Shape)>,
 }
 
-/// A run of the text that shows: where it starts in the text and in the layout's text, and its
-/// length in bytes.
+/// A run's source and layout offsets and lengths, in bytes. A title maps every glyph back to
+/// the whole link that it stands for.
 #[derive(Clone, Copy)]
 struct Piece {
     source: usize,
     shown: usize,
     len: usize,
+    source_len: usize,
+    label: bool,
 }
 
 impl Line {
@@ -75,20 +80,27 @@ impl Line {
     fn source(&self, shown: usize) -> usize {
         for piece in &self.pieces {
             if shown < piece.shown + piece.len {
-                return piece.source + shown.saturating_sub(piece.shown);
+                return piece.source
+                    + if piece.label { 0 } else { shown.saturating_sub(piece.shown) };
             }
         }
-        self.pieces.last().map_or(self.start, |piece| piece.source + piece.len)
+        self.pieces.last().map_or(self.start, |piece| piece.source + piece.source_len)
     }
 
     /// The text's byte where the layout's character before `shown` ends, before any hidden syntax
     /// after it.
     fn source_after(&self, shown: usize) -> usize {
-        let text = self.layout.text();
-        match text[..shown.min(text.len())].chars().next_back() {
-            Some(c) => self.source(shown - c.len_utf8()) + c.len_utf8(),
-            None => self.source(0),
+        for piece in self.pieces.iter().rev() {
+            if shown > piece.shown {
+                return piece.source
+                    + if piece.label {
+                        piece.source_len
+                    } else {
+                        shown.saturating_sub(piece.shown).min(piece.len)
+                    };
+            }
         }
+        self.source(0)
     }
 }
 
@@ -100,7 +112,9 @@ mod imp {
     use gtk::subclass::prelude::*;
     use zib_core::editor::{Editor, Unit};
 
-    use super::Line;
+    use super::{Line, LinkTarget};
+
+    type Callback<T> = RefCell<Option<Box<dyn Fn(T)>>>;
 
     #[derive(Default)]
     pub struct EditorWidget {
@@ -111,6 +125,8 @@ mod imp {
         pub im: RefCell<Option<gtk::IMMulticontext>>,
         /// Called after each edit the owner makes.
         pub edited: RefCell<Option<Box<dyn Fn()>>>,
+        pub open_link: Callback<LinkTarget>,
+        pub pick_link: Callback<Range<usize>>,
         /// The word or line a double or triple click selected, which a drag with the button still
         /// down grows from by whole words or lines.
         pub drag_origin: RefCell<Option<(Range<usize>, Unit)>>,
@@ -186,6 +202,45 @@ impl EditorWidget {
         *self.imp().edited.borrow_mut() = Some(Box::new(f));
     }
 
+    pub fn connect_open_link(&self, f: impl Fn(LinkTarget) + 'static) {
+        *self.imp().open_link.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn connect_pick_link(&self, f: impl Fn(Range<usize>) + 'static) {
+        *self.imp().pick_link.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn set_titles(&self, titles: HashMap<Id, String>) {
+        if let Some(editor) = self.imp().editor.borrow_mut().as_mut() {
+            editor.set_titles(titles);
+        }
+        self.relayout();
+    }
+
+    pub fn insert_link(&self, range: Range<usize>, expected: &str, target: Id) {
+        self.edit(|e| {
+            e.insert_link(range, expected, target);
+        });
+    }
+
+    /// The caret rectangle that anchors the link picker.
+    pub fn cursor_rectangle(&self) -> gdk::Rectangle {
+        let rect = self.head().and_then(|at| caret_rect(&self.imp().lines.borrow(), at));
+        let (x, y, height) = rect.unwrap_or((MARGIN_SIDES, MARGIN_TOP, 16.0));
+        #[allow(clippy::cast_possible_truncation)]
+        gdk::Rectangle::new(x as i32, y as i32, 1, height as i32)
+    }
+
+    fn type_text(&self, text: &str) {
+        let mut request = None;
+        self.edit(|e| request = e.type_text(text));
+        if let Some(range) = request
+            && let Some(pick) = self.imp().pick_link.borrow().as_ref()
+        {
+            pick(range);
+        }
+    }
+
     /// The text shown, if a note is open.
     pub fn text(&self) -> Option<String> {
         self.imp().editor.borrow().as_ref().map(|e| e.text().to_owned())
@@ -216,7 +271,7 @@ impl EditorWidget {
         let w = self.downgrade();
         im.connect_commit(move |_, text| {
             if let Some(w) = w.upgrade() {
-                w.edit(|e| e.insert(text));
+                w.type_text(text);
             }
         });
         let keys = gtk::EventControllerKey::new();
@@ -308,7 +363,7 @@ impl EditorWidget {
                 .clone()
                 .or_else(|| editor.as_ref().map(|e| e.selection().range()))
                 .unwrap_or_default();
-            let shown = display(text, &selection);
+            let shown = editor.as_ref().map(|e| e.display_for(&selection)).unwrap_or_default();
             let dark = adw::StyleManager::default().is_dark();
             let wrap = (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0);
             let column = monospace_width(self.upcast_ref());
@@ -317,9 +372,7 @@ impl EditorWidget {
             let mut start = 0;
             for line in text.split('\n') {
                 let end = start + line.len();
-                let pieces = pieces(start, end, &shown.hidden);
-                let shown_text: String =
-                    pieces.iter().map(|p| &text[p.source..p.source + p.len]).collect();
+                let (pieces, shown_text) = pieces(text, start, end, &shown);
                 let columns = shown.pads.iter().filter(|(lines, _)| lines.contains(&start));
                 #[allow(clippy::cast_precision_loss)]
                 let pad = columns.map(|(_, columns)| *columns).max().unwrap_or(0) as f64 * column;
@@ -334,12 +387,22 @@ impl EditorWidget {
                     }
                     heading |= matches!(styled.look, Look::Heading(_));
                     for piece in &pieces {
+                        if piece.label && styled.look == Look::Syntax {
+                            continue;
+                        }
                         let from = styled.range.start.max(piece.source);
-                        let to = styled.range.end.min(piece.source + piece.len);
+                        let to = styled.range.end.min(piece.source + piece.source_len);
                         if from >= to {
                             continue;
                         }
-                        let index = |at: usize| u32::try_from(piece.shown + at - piece.source);
+                        let index = |at: usize| {
+                            let offset = if piece.label {
+                                if at == from { 0 } else { piece.len }
+                            } else {
+                                at - piece.source
+                            };
+                            u32::try_from(piece.shown + offset)
+                        };
                         for mut attribute in attributes_of(styled.look, dark) {
                             attribute.set_start_index(index(from).unwrap_or(0));
                             attribute.set_end_index(index(to).unwrap_or(u32::MAX));
@@ -347,6 +410,7 @@ impl EditorWidget {
                         }
                     }
                 }
+                style_labels(&attributes, &pieces, &shown, dark);
                 // The text under a bullet or a box stays, unseen, to keep its room.
                 let markers: Vec<(Range<usize>, Shape)> = shown
                     .markers
@@ -459,6 +523,19 @@ impl EditorWidget {
                 area.contains_point(&point).then_some(range.start)
             })
         })
+    }
+
+    /// The link under an actual glyph, including any part of a drawn title.
+    fn link_at(&self, x: f64, y: f64) -> Option<LinkTarget> {
+        let lines = self.imp().lines.borrow();
+        let line = lines.iter().find(|l| l.y <= y && y < l.y + l.height)?;
+        let (inside, index, _) = line.layout.xy_to_index(units(x - line.left), units(y - line.y));
+        if !inside {
+            return None;
+        }
+        let at = line.source(usize::try_from(index).ok()?);
+        let editor = self.imp().editor.borrow();
+        link_at(editor.as_ref()?.text(), at)
     }
 
     /// The place in the text nearest a point in the widget.
@@ -725,6 +802,17 @@ impl EditorWidget {
             im.reset();
         }
         self.imp().on_box.set(false);
+        if gesture.current_button() == gdk::BUTTON_PRIMARY
+            && gesture.current_event_state().contains(gdk::ModifierType::CONTROL_MASK)
+            && let Some(target) = self.link_at(x, y)
+        {
+            self.imp().on_box.set(true);
+            if let Some(open) = self.imp().open_link.borrow().as_ref() {
+                open(target);
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            return;
+        }
         // Each click on a drawn task box toggles it, a double click's second too, and leaves the
         // cursor where it was.
         let plain = gesture.current_event_state() & gtk::accelerator_get_default_mod_mask();
@@ -931,21 +1019,77 @@ fn background(rgba: (f64, f64, f64, f64)) -> Vec<pango::Attribute> {
     color(rgba, pango::AttrColor::new_background, pango::AttrInt::new_background_alpha)
 }
 
-/// The parts of the line from `start` to `end` that show, around the `hidden` syntax.
-fn pieces(start: usize, end: usize, hidden: &[Range<usize>]) -> Vec<Piece> {
-    let mut pieces = Vec::new();
-    let (mut at, mut shown) = (start, 0);
-    for gap in hidden.iter().filter(|gap| gap.start < end && gap.end > start) {
-        if gap.start > at {
-            pieces.push(Piece { source: at, shown, len: gap.start - at });
-            shown += gap.start - at;
+/// Applies the styles within each title, after the styles inherited from the surrounding source.
+fn style_labels(attributes: &pango::AttrList, pieces: &[Piece], display: &Display, dark: bool) {
+    for piece in pieces.iter().filter(|p| p.label) {
+        let Some(label) = display.labels.iter().find(|l| l.range.start == piece.source) else {
+            continue;
+        };
+        for styled in &label.styles {
+            for mut attribute in attributes_of(styled.look, dark) {
+                attribute
+                    .set_start_index(u32::try_from(piece.shown + styled.range.start).unwrap_or(0));
+                attribute.set_end_index(
+                    u32::try_from(piece.shown + styled.range.end).unwrap_or(u32::MAX),
+                );
+                attributes.insert(attribute);
+            }
         }
-        at = at.max(gap.end);
     }
-    if at < end || pieces.is_empty() {
-        pieces.push(Piece { source: at.min(end), shown, len: end.saturating_sub(at) });
+}
+
+/// The parts of a line that show, with link titles in place of their source.
+fn pieces(text: &str, start: usize, end: usize, display: &Display) -> (Vec<Piece>, String) {
+    let mut pieces = Vec::new();
+    let mut shown_text = String::new();
+    let mut at = start;
+    while at < end {
+        let shown = shown_text.len();
+        if let Some(label) = display.labels.iter().find(|l| l.range.start == at) {
+            pieces.push(Piece {
+                source: at,
+                shown,
+                len: label.text.len(),
+                source_len: label.range.len(),
+                label: true,
+            });
+            shown_text.push_str(&label.text);
+            at = label.range.end;
+        } else if let Some(gap) = display.hidden.iter().find(|r| r.contains(&at)) {
+            at = display
+                .labels
+                .iter()
+                .map(|l| l.range.start)
+                .filter(|&p| p > at)
+                .min()
+                .unwrap_or(end)
+                .min(gap.end)
+                .min(end);
+        } else {
+            let next = display
+                .hidden
+                .iter()
+                .map(|r| r.start)
+                .chain(display.labels.iter().map(|l| l.range.start))
+                .filter(|&p| p > at)
+                .min()
+                .unwrap_or(end)
+                .min(end);
+            pieces.push(Piece {
+                source: at,
+                shown,
+                len: next - at,
+                source_len: next - at,
+                label: false,
+            });
+            shown_text.push_str(&text[at..next]);
+            at = next;
+        }
     }
-    pieces
+    if pieces.is_empty() {
+        pieces.push(Piece { source: end, shown: 0, len: 0, source_len: 0, label: false });
+    }
+    (pieces, shown_text)
 }
 
 /// The top and height of the row, as the text wraps, that `at` lies on, in the widget's
@@ -968,8 +1112,13 @@ fn row_extents(lines: &[Line], at: usize) -> Option<(f64, f64)> {
 /// text after it shows.
 fn pieces_shown(pieces: &[Piece], at: usize) -> usize {
     for piece in pieces {
-        if at <= piece.source + piece.len {
-            return piece.shown + at.saturating_sub(piece.source).min(piece.len);
+        if at <= piece.source + piece.source_len {
+            let offset = if piece.label {
+                if at <= piece.source { 0 } else { piece.len }
+            } else {
+                at.saturating_sub(piece.source).min(piece.len)
+            };
+            return piece.shown + offset;
         }
     }
     pieces.last().map_or(0, |piece| piece.shown + piece.len)
@@ -1117,6 +1266,67 @@ mod tests {
 
     fn head(widget: &EditorWidget) -> usize {
         widget.head().unwrap_or_default()
+    }
+
+    #[test]
+    fn maps_drawn_titles_to_source_and_opens_every_glyph() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("**[[{id}]]** after\n|end");
+        let Some(widget) = widget(&text) else { return };
+        widget.set_titles(HashMap::from([(id, "**café** and a longer title".to_owned())]));
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        assert_eq!(line.layout.text(), "café and a longer title after");
+        let label = line.pieces.iter().find(|p| p.label).unwrap();
+        assert_eq!(line.source(3), 2);
+        assert_eq!(line.source_after(label.len), 32);
+        assert_eq!(line.shown(32), label.len);
+        let (x, y) = (line.left, line.y);
+        for (index, _) in line.layout.text()[..label.len].char_indices() {
+            let cell = line.layout.index_to_pos(i32::try_from(index).unwrap());
+            assert_eq!(
+                widget.link_at(
+                    x + pixels(cell.x()) + pixels(cell.width()) / 2.0,
+                    y + pixels(cell.y()) + pixels(cell.height()) / 2.0,
+                ),
+                Some(LinkTarget::Note(id))
+            );
+        }
+        assert_eq!(widget.link_at(x, y - 2.0), None);
+        drop(lines);
+        widget.edit(|e| e.move_to(2, false));
+        assert!(widget.imp().lines.borrow()[0].layout.text().contains(&id.to_string()));
+    }
+
+    #[test]
+    fn wrapped_titles_keep_their_source_and_web_links_keep_their_targets() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        let text = format!("[[{id}]] [web](https://example.com)\n|end");
+        let Some(widget) = widget(&text) else { return };
+        let title = "A title long enough to wrap over several visual lines";
+        widget.set_titles(HashMap::from([(id, title.to_owned())]));
+        widget.lay_out(240);
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        assert!(line.layout.line_count() > 1);
+        for (index, _) in title.char_indices().filter(|(_, c)| !c.is_whitespace()) {
+            let cell = line.layout.index_to_pos(i32::try_from(index).unwrap());
+            assert_eq!(
+                widget.link_at(
+                    line.left + pixels(cell.x()) + pixels(cell.width()) / 2.0,
+                    line.y + pixels(cell.y()) + pixels(cell.height()) / 2.0,
+                ),
+                Some(LinkTarget::Note(id)),
+            );
+        }
+        let web = line.layout.index_to_pos(i32::try_from(title.len() + 1).unwrap());
+        assert_eq!(
+            widget.link_at(
+                line.left + pixels(web.x()) + pixels(web.width()) / 2.0,
+                line.y + pixels(web.y()) + pixels(web.height()) / 2.0,
+            ),
+            Some(LinkTarget::Web("https://example.com".to_owned())),
+        );
     }
 
     #[test]
