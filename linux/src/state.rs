@@ -453,6 +453,23 @@ impl State {
         Ok(())
     }
 
+    /// A note's body, for an editor to change directly.
+    pub async fn open_body(&self, space_id: Id, id: Id) -> Result<zib_core::editor::Body> {
+        let space = self.space(space_id).await?;
+        space.lock().await.open_body(id)
+    }
+
+    /// Records that an editor changed a note's body directly: updates its metadata and its place
+    /// in the search index, and has the space saved and synced.
+    pub async fn body_edited(&self, space_id: Id, id: Id) -> Result<()> {
+        let space = self.space(space_id).await?;
+        let mut space = space.lock().await;
+        space.note_edited(id)?;
+        self.reindex_note(space_id, &space, id);
+        self.changed_here(space_id);
+        Ok(())
+    }
+
     pub async fn delete_note(&self, space_id: Id, id: Id) -> Result<()> {
         let space = self.space(space_id).await?;
         let mut space = space.lock().await;

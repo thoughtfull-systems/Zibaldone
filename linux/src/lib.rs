@@ -6,6 +6,7 @@ pub mod app;
 pub mod derive;
 pub mod drawings;
 pub mod editor;
+pub mod editor_widget;
 pub mod icon;
 pub mod instance;
 pub mod remote;

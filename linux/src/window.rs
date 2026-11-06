@@ -19,6 +19,7 @@ use zib_core::{Channel, Id};
 use crate::app::core;
 use crate::drawings::Draw;
 use crate::editor;
+use crate::editor_widget::{self, EditorWidget};
 use crate::state::State;
 use crate::tables;
 
@@ -65,6 +66,11 @@ pub struct Inner {
     focus_body: Cell<bool>,
     /// Other machines' cursors in the open note.
     remote: Rc<crate::remote::Remote>,
+    /// The editor of decision ZIB0017, which shows notes in place of the text view while
+    /// `ZIB_EDITOR=new` is set in a development build.
+    new_editor: Option<EditorWidget>,
+    /// The report of the new editor's edits, which waits for a pause in typing.
+    body_timer: RefCell<Option<glib::SourceId>>,
 }
 
 /// The note open in the editor.
@@ -193,7 +199,15 @@ impl Window {
         };
         let view = editor::new_view(draw);
         let buffer = view.buffer();
-        let editor_scroll = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
+        let new_editor = editor_widget::enabled().then(EditorWidget::default);
+        let editor_scroll = match &new_editor {
+            Some(widget) => gtk::ScrolledWindow::builder()
+                .child(widget)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .build(),
+            None => gtk::ScrolledWindow::builder().child(&view).vexpand(true).build(),
+        };
         let empty = adw::StatusPage::builder()
             .icon_name("accessories-text-editor-symbolic")
             .title(state.channel.display_name())
@@ -240,9 +254,15 @@ impl Window {
             loading: Cell::new(false),
             focus_body: Cell::new(false),
             remote: crate::remote::Remote::new(view.upcast_ref()),
+            new_editor,
+            body_timer: RefCell::default(),
         }));
         this.connect(&new_note, &add_file, &delete, &view);
         this.connect_files(&view);
+        if let Some(widget) = &this.inner().new_editor {
+            let w = this.clone();
+            widget.connect_edited(move || w.new_editor_edited());
+        }
         this.update_history();
         this.reload_spaces();
         this.watch_status();
@@ -674,13 +694,27 @@ impl Window {
             };
             w.set_text(&text);
             *w.inner().editor.borrow_mut() = Some(editor);
+            if let Some(widget) = w.inner().new_editor.clone() {
+                let opened = core({
+                    let state = state.clone();
+                    async move { state.open_body(space, note).await }
+                })
+                .await;
+                match opened {
+                    Ok(body) => widget.set_editor(Some(zib_core::editor::Editor::new(body))),
+                    Err(error) => w.toast(&format!("Couldn't open the note: {error}")),
+                }
+            }
             w.inner()
                 .open_file
                 .set_visible(loaded.type_name == "file" || loaded.type_name == "image");
             w.update_title();
             w.show_mode();
             if w.inner().focus_body.take() {
-                w.inner().view.grab_focus();
+                match &w.inner().new_editor {
+                    Some(widget) => widget.grab_focus(),
+                    None => w.inner().view.grab_focus(),
+                };
             }
             let opened = core({
                 let state = state.clone();
@@ -834,6 +868,10 @@ impl Window {
 
     /// Stores the editor's text without filled-in labels, applying only the differences.
     fn commit(&self) {
+        // The new editor stores each edit as it happens, and the text view holds no edits then.
+        if self.inner().new_editor.is_some() {
+            return;
+        }
         let (space, note, stripped) = {
             let mut editor = self.inner().editor.borrow_mut();
             let Some(editor) = editor.as_mut() else { return };
@@ -863,8 +901,60 @@ impl Window {
         });
     }
 
+    /// The new editor changed the note's body, which it already stored: shows the title it has now,
+    /// and reports the edit once typing pauses, or at once while another machine edits the note
+    /// live.
+    fn new_editor_edited(&self) {
+        let Some(text) = self.inner().new_editor.as_ref().and_then(EditorWidget::text) else {
+            return;
+        };
+        let live = {
+            let mut editor = self.inner().editor.borrow_mut();
+            let Some(editor) = editor.as_mut() else { return };
+            editor.stored = text;
+            editor.live.get()
+        };
+        self.update_title();
+        if let Some(timer) = self.inner().body_timer.take() {
+            timer.remove();
+        }
+        let w = self.clone();
+        let wait = if live { COMMIT_LIVE } else { COMMIT_PAUSE };
+        let timer = glib::timeout_add_local_once(wait, move || {
+            w.inner().body_timer.take();
+            w.report_body_edited_now();
+        });
+        *self.inner().body_timer.borrow_mut() = Some(timer);
+    }
+
+    /// Reports the new editor's edits now if a report waits.
+    fn report_body_edited(&self) {
+        if let Some(timer) = self.inner().body_timer.take() {
+            timer.remove();
+            self.report_body_edited_now();
+        }
+    }
+
+    /// Has the core record the open note's edits: its metadata, search, saving, and sync.
+    fn report_body_edited_now(&self) {
+        let Some((space, note)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
+        else {
+            return;
+        };
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            let _ = core(async move { state.body_edited(space, note).await }).await;
+            w.reload_notes();
+        });
+    }
+
     /// Commits pending typing, and ends the note's live sessions.
     fn close_editor(&self) {
+        self.report_body_edited();
+        if let Some(widget) = &self.inner().new_editor {
+            widget.set_editor(None);
+        }
         let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
         if let Some(timer) = pending {
             timer.remove();
@@ -928,6 +1018,16 @@ impl Window {
 
     /// Reloads the open note after another machine changed it, keeping the owner's typing.
     fn refresh_open(&self, space: Id, note: Id) {
+        if let Some(widget) = &self.inner().new_editor {
+            widget.refresh();
+            if let (Some(text), Some(editor)) =
+                (widget.text(), self.inner().editor.borrow_mut().as_mut())
+            {
+                editor.stored = text;
+            }
+            self.update_title();
+            return;
+        }
         let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
         if let Some(timer) = pending {
             timer.remove();

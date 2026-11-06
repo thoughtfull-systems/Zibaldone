@@ -5,8 +5,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use loro::{
-    ExportMode, LoroDoc, LoroMap, LoroText, LoroValue, UpdateOptions, ValueOrContainer,
-    VersionVector,
+    CommitOptions, ExportMode, LoroDoc, LoroMap, LoroText, LoroValue, UpdateOptions,
+    ValueOrContainer, VersionVector,
 };
 
 use crate::address::MachineKey;
@@ -14,6 +14,10 @@ use crate::body::{self, Title};
 use crate::schema::{self, Value, child_map};
 use crate::time::{self, Timestamp};
 use crate::{Error, Id, Result};
+
+/// The origin of every commit the core makes for itself, which an editor's undo leaves out, so undo
+/// only reverses the owner's edits in the editor.
+pub const ORIGIN: &str = "zib";
 
 const META: &str = "meta";
 const NOTES: &str = "notes";
@@ -164,7 +168,7 @@ impl Space {
         let space = Self::empty(machine);
         space.doc.get_map(META).insert("id", Id::generate().to_string())?;
         schema::write_schemas(&space.doc, &schema::built_in())?;
-        space.doc.commit();
+        commit(&space.doc);
         Ok(space)
     }
 
@@ -174,7 +178,7 @@ impl Space {
         space.doc.import(bytes)?;
         space.id()?;
         if schema::write_schemas(&space.doc, &schema::built_in())? {
-            space.doc.commit();
+            commit(&space.doc);
         }
         Ok(space)
     }
@@ -218,7 +222,7 @@ impl Space {
 
     /// Commits pending edits, such as typing, in one Loro commit.
     pub fn commit(&self) {
-        self.doc.commit();
+        commit(&self.doc);
     }
 
     /// The whole space as a snapshot, for saving.
@@ -243,7 +247,7 @@ impl Space {
     /// Imports updates from another member after checking them in a copy, as the sync
     /// specification requires. It imports nothing if the check fails.
     pub fn import_checked(&mut self, updates: &[u8]) -> Result<()> {
-        self.doc.commit();
+        commit(&self.doc);
         // Updates from another space carry its own `meta.id`, which a merge might hide, so read
         // them alone first.
         let alone = LoroDoc::new();
@@ -297,7 +301,7 @@ impl Space {
         meta.insert("updated", now)?;
         meta.insert("updated-by", machine.as_str())?;
         note.insert_container("settings", LoroMap::new())?;
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -357,6 +361,12 @@ impl Space {
         }
     }
 
+    /// A note's body for an editor to change directly, which records the note as open.
+    pub fn open_body(&mut self, id: Id) -> Result<crate::editor::Body> {
+        self.open_note(id);
+        Ok(crate::editor::Body { doc: self.doc.clone(), text: self.body(id)? })
+    }
+
     /// Inserts `text` at a position in Unicode characters, without committing.
     pub fn insert_text(&mut self, id: Id, at: usize, text: &str) -> Result<()> {
         self.body(id)?.insert(at, text)?;
@@ -388,7 +398,7 @@ impl Space {
         fields.insert(name, value.to_loro())?;
         self.clear_derived(id, name)?;
         self.touch(id)?;
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -398,7 +408,7 @@ impl Space {
         fields.delete(name)?;
         self.clear_derived(id, name)?;
         self.touch(id)?;
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -424,13 +434,20 @@ impl Space {
     pub fn close_note(&mut self, id: Id) -> Result<()> {
         if self.open.remove(&id).is_some_and(|open| open.pending) {
             self.write_updated(id)?;
-            self.doc.commit();
+            commit(&self.doc);
         }
         Ok(())
     }
 
     /// Sets `updated` and `updated-by`, but while an editor has the note open, at most once a
     /// minute.
+    /// Records that an editor changed a note's body, as `insert_text` does, and commits.
+    pub fn note_edited(&mut self, id: Id) -> Result<()> {
+        self.touch(id)?;
+        commit(&self.doc);
+        Ok(())
+    }
+
     fn touch(&mut self, id: Id) -> Result<()> {
         let now = time::now();
         if let Some(open) = self.open.get_mut(&id) {
@@ -475,7 +492,7 @@ impl Space {
         tombstone.insert("deleted-by", self.machine.to_string())?;
         self.notes().delete(&id.to_string())?;
         self.open.remove(&id);
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -511,9 +528,9 @@ impl Space {
         for (name, value) in &note.fields {
             fields.insert(name, value.clone())?;
         }
-        target.doc.commit();
+        commit(&target.doc);
         self.notes().delete(&id.to_string())?;
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -563,7 +580,7 @@ impl Space {
             None => self.doc.get_map(SETTINGS),
         };
         map.insert(key, value.into())?;
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -586,7 +603,7 @@ impl Space {
         } else {
             holders.delete(&self.machine.to_string())?;
         }
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -655,14 +672,14 @@ impl Space {
         entry.insert("key", key.to_hex())?;
         entry.insert("name", name)?;
         entry.insert("policy", policy.name())?;
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
     /// Renames a member, in one commit.
     pub fn rename_machine(&mut self, id: Id, name: &str) -> Result<()> {
         child_map(&self.doc.get_map(MACHINES), &id.to_string())?.insert("name", name)?;
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -681,7 +698,7 @@ impl Space {
                 holders.delete(&key)?;
             }
         }
-        self.doc.commit();
+        commit(&self.doc);
         Ok(())
     }
 
@@ -751,6 +768,11 @@ fn check_import(before: &LoroDoc, after: &LoroDoc) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Commits `doc`'s pending changes as the core's own, with the `ORIGIN` that undo leaves out.
+pub(crate) fn commit(doc: &LoroDoc) {
+    doc.commit_with(CommitOptions::new().origin(ORIGIN));
 }
 
 #[cfg(test)]

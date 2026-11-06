@@ -8,6 +8,7 @@ pub mod base32;
 pub mod body;
 pub mod channel;
 pub mod editing;
+pub mod editor;
 pub mod error;
 pub mod files;
 pub mod frame;
