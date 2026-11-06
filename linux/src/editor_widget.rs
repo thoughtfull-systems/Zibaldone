@@ -6,6 +6,8 @@
 //! It shows a note while `ZIB_EDITOR=new` is set in the development build, until it does
 //! everything the text view does.
 
+use std::ops::Range;
+
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
@@ -32,16 +34,62 @@ pub fn enabled() -> bool {
     !cfg!(feature = "production") && std::env::var("ZIB_EDITOR").is_ok_and(|v| v == "new")
 }
 
-/// A line of the text, laid out.
+/// A line of the text, laid out with its hidden syntax left out.
 pub struct Line {
-    /// Where the line starts in the text.
+    /// Where the line starts and ends in the text, without its line break.
     start: usize,
+    end: usize,
+    /// The parts of the line that show, in order, which make up the layout's text.
+    pieces: Vec<Piece>,
     layout: pango::Layout,
     /// Its top, from the widget's top.
     y: f64,
     height: f64,
     /// Whether it draws on a shade across the editor's width, as a code block's lines do.
     shaded: bool,
+}
+
+/// A run of the text that shows: where it starts in the text and in the layout's text, and its
+/// length in bytes.
+#[derive(Clone, Copy)]
+struct Piece {
+    source: usize,
+    shown: usize,
+    len: usize,
+}
+
+impl Line {
+    /// Where the text's byte `at`, on this line, falls in the layout's text. Hidden syntax falls
+    /// where the text after it shows.
+    fn shown(&self, at: usize) -> usize {
+        for piece in &self.pieces {
+            if at <= piece.source + piece.len {
+                return piece.shown + at.saturating_sub(piece.source).min(piece.len);
+            }
+        }
+        self.pieces.last().map_or(0, |piece| piece.shown + piece.len)
+    }
+
+    /// The text's byte where the layout's character at `shown` starts, after any hidden syntax
+    /// before it.
+    fn source(&self, shown: usize) -> usize {
+        for piece in &self.pieces {
+            if shown < piece.shown + piece.len {
+                return piece.source + shown.saturating_sub(piece.shown);
+            }
+        }
+        self.pieces.last().map_or(self.start, |piece| piece.source + piece.len)
+    }
+
+    /// The text's byte where the layout's character before `shown` ends, before any hidden syntax
+    /// after it.
+    fn source_after(&self, shown: usize) -> usize {
+        let text = self.layout.text();
+        match text[..shown.min(text.len())].chars().next_back() {
+            Some(c) => self.source(shown - c.len_utf8()) + c.len_utf8(),
+            None => self.source(0),
+        }
+    }
 }
 
 mod imp {
@@ -66,6 +114,9 @@ mod imp {
         /// The word or line a double or triple click selected, which a drag with the button still
         /// down grows from by whole words or lines.
         pub drag_origin: RefCell<Option<(Range<usize>, Unit)>>,
+        /// The selection that decides what shows while a mouse button is down, as it was when the
+        /// button went down, so text doesn't move under the pointer and turn a click into a drag.
+        pub held: RefCell<Option<Range<usize>>>,
     }
 
     #[glib::object_subclass]
@@ -199,6 +250,25 @@ impl EditorWidget {
             }
         });
         self.add_controller(click);
+        // A legacy controller sees every press and release, before the gestures and without taking
+        // part in them.
+        let buttons = gtk::EventControllerLegacy::builder()
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let w = self.downgrade();
+        buttons.connect_event(move |_, event| {
+            let Some(w) = w.upgrade() else { return glib::Propagation::Proceed };
+            match event.event_type() {
+                gdk::EventType::ButtonPress => {
+                    let held = w.imp().editor.borrow().as_ref().map(|e| e.selection().range());
+                    w.imp().held.borrow_mut().clone_from(&held);
+                }
+                gdk::EventType::ButtonRelease if w.imp().held.take().is_some() => w.relayout(),
+                _ => {}
+            }
+            glib::Propagation::Proceed
+        });
+        self.add_controller(buttons);
         let drag = gtk::GestureDrag::new();
         let w = self.downgrade();
         drag.connect_drag_update(move |drag, dx, dy| {
@@ -216,7 +286,14 @@ impl EditorWidget {
             imp.laid_width.set(width);
             let editor = imp.editor.borrow();
             let text = editor.as_ref().map_or("", |e| e.text());
-            let shown = display(text);
+            // While a mouse button is down, what shows stays as it was when it went down.
+            let selection = imp
+                .held
+                .borrow()
+                .clone()
+                .or_else(|| editor.as_ref().map(|e| e.selection().range()))
+                .unwrap_or_default();
+            let shown = display(text, &selection);
             let dark = adw::StyleManager::default().is_dark();
             let wrap = (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0);
             let mut lines = Vec::new();
@@ -224,21 +301,31 @@ impl EditorWidget {
             let mut start = 0;
             for line in text.split('\n') {
                 let end = start + line.len();
-                let layout = self.create_pango_layout(Some(line));
+                let pieces = pieces(start, end, &shown.hidden);
+                let shown_text: String =
+                    pieces.iter().map(|p| &text[p.source..p.source + p.len]).collect();
+                let layout = self.create_pango_layout(Some(&shown_text));
                 layout.set_width(units(wrap));
                 layout.set_wrap(pango::WrapMode::WordChar);
                 let attributes = pango::AttrList::new();
                 let mut heading = false;
                 for styled in &shown.styles {
-                    let (from, to) = (styled.range.start.max(start), styled.range.end.min(end));
-                    if from >= to {
+                    if styled.range.start >= end.max(start + 1) || styled.range.end <= start {
                         continue;
                     }
                     heading |= matches!(styled.look, Look::Heading(_));
-                    for mut attribute in attributes_of(styled.look, dark) {
-                        attribute.set_start_index(u32::try_from(from - start).unwrap_or(0));
-                        attribute.set_end_index(u32::try_from(to - start).unwrap_or(u32::MAX));
-                        attributes.insert(attribute);
+                    for piece in &pieces {
+                        let from = styled.range.start.max(piece.source);
+                        let to = styled.range.end.min(piece.source + piece.len);
+                        if from >= to {
+                            continue;
+                        }
+                        let index = |at: usize| u32::try_from(piece.shown + at - piece.source);
+                        for mut attribute in attributes_of(styled.look, dark) {
+                            attribute.set_start_index(index(from).unwrap_or(0));
+                            attribute.set_end_index(index(to).unwrap_or(u32::MAX));
+                            attributes.insert(attribute);
+                        }
                     }
                 }
                 layout.set_attributes(Some(&attributes));
@@ -247,7 +334,7 @@ impl EditorWidget {
                 }
                 let shaded = shown.shaded.iter().any(|shaded| shaded.start == start);
                 let height = pixels(layout.size().1);
-                lines.push(Line { start, layout, y, height, shaded });
+                lines.push(Line { start, end, pieces, layout, y, height, shaded });
                 y += height;
                 start = end + 1;
             }
@@ -263,6 +350,9 @@ impl EditorWidget {
     /// Lays the lines out again after the text changed, and redraws.
     fn relayout(&self) {
         self.imp().lines.borrow_mut().clear();
+        // At once, not at GTK's next layout, so a key that comes before then, such as a held
+        // arrow key, finds the lines where they are.
+        self.lay_out(self.imp().laid_width.get());
         self.queue_resize();
         self.queue_draw();
         self.update_im_cursor();
@@ -289,11 +379,11 @@ impl EditorWidget {
             }
             snapshot.save();
             snapshot.translate(&graphene::Point::new(MARGIN_SIDES as f32, line.y as f32));
-            let end = line.start + line.layout.text().len();
+            let end = line.end;
             // The line break after a line counts as selected with it.
             if selected.start <= end && line.start < selected.end {
-                let from = selected.start.saturating_sub(line.start);
-                let to = (selected.end - line.start).min(end - line.start);
+                let from = line.shown(selected.start.max(line.start));
+                let to = line.shown(selected.end.min(end));
                 let reaches_break = selected.end > end;
                 for rect in selection_rects(&line.layout, from, to, reaches_break) {
                     snapshot.append_color(&highlight, &rect);
@@ -314,31 +404,51 @@ impl EditorWidget {
     /// The place in the text nearest a point in the widget.
     fn position_at(&self, x: f64, y: f64) -> usize {
         let lines = self.imp().lines.borrow();
-        let Some(line) = lines.iter().find(|line| y < line.y + line.height).or(lines.last()) else {
+        // A point in the space above a heading belongs to the line before it, so a move up from
+        // the heading's first row reaches that line. Above the first line, it's the first line.
+        let Some(line) = lines.iter().rev().find(|line| line.y <= y).or(lines.first()) else {
             return 0;
         };
-        if y < line.y {
-            return line.start;
-        }
+        // Pango puts a point past a layout's top or bottom on its first or last row.
         let (_, index, trailing) =
             line.layout.xy_to_index(units(x - MARGIN_SIDES), units(y - line.y));
-        let text = line.layout.text();
-        let mut at = usize::try_from(index).unwrap_or(0);
-        for _ in 0..trailing {
-            at += text[at..].chars().next().map_or(0, char::len_utf8);
+        let index = usize::try_from(index).unwrap_or(0);
+        // A click on a character's right half lands after it, before any hidden syntax that
+        // follows, and on its left half before it, after any hidden syntax before it.
+        if trailing > 0 {
+            let text = line.layout.text();
+            let after = index + text[index..].chars().next().map_or(0, char::len_utf8);
+            line.source_after(after)
+        } else {
+            line.source(index)
         }
-        line.start + at
     }
 
     /// The place one visual line up or down from `at`, at the left edge `goal`, or `None` past
     /// the first or last line.
     fn vertical(&self, at: usize, goal: f64, down: bool) -> Option<usize> {
         let lines = self.imp().lines.borrow();
-        let (_, y, height) = caret_rect(&lines, at)?;
-        let target = if down { y + height + 1.0 } else { y - 1.0 };
+        // Past the edge of the row the cursor is on, which can be taller than the cursor, as on a
+        // list item, whose monospace prefix is shorter than its text.
+        let (y, height) = row_extents(&lines, at)?;
+        let mut target = if down { y + height + 1.0 } else { y - 1.0 };
         let last = lines.last()?;
         if target < MARGIN_TOP || target >= last.y + last.height {
             return None;
+        }
+        // A move that leaves its line goes past the space above a heading, to the next line's
+        // first row or the last row of the line before.
+        let index = lines.iter().rposition(|line| line.start <= at)?;
+        let current = &lines[index];
+        if down && target >= current.y + current.height {
+            if let Some(next) = lines.get(index + 1) {
+                target = target.max(next.y);
+            }
+        } else if !down
+            && target < current.y
+            && let Some(before) = index.checked_sub(1).and_then(|i| lines.get(i))
+        {
+            target = target.min(before.y + before.height - 1.0);
         }
         drop(lines);
         Some(self.position_at(goal, target))
@@ -348,7 +458,7 @@ impl EditorWidget {
     fn visual_line_edge(&self, at: usize, end: bool) -> usize {
         let lines = self.imp().lines.borrow();
         let Some(line) = lines.iter().rev().find(|line| line.start <= at) else { return at };
-        let local = i32::try_from(at - line.start).unwrap_or(0);
+        let local = i32::try_from(line.shown(at)).unwrap_or(0);
         let (number, _) = line.layout.index_to_line_x(local, false);
         let Some(row) = line.layout.line_readonly(number) else { return at };
         let start = usize::try_from(row.start_index()).unwrap_or(0);
@@ -358,7 +468,7 @@ impl EditorWidget {
         if edge < text.len() && text[..edge].ends_with(' ') {
             edge -= 1;
         }
-        line.start + if end { edge } else { start }
+        if end && edge > start { line.source_after(edge) } else { line.source(start) }
     }
 
     /// Runs `f` on the editor, and lays out, redraws, and reports the edit after.
@@ -368,14 +478,10 @@ impl EditorWidget {
         f(&mut editor);
         let changed = before != editor.text();
         *self.imp().editor.borrow_mut() = Some(editor);
-        if changed {
-            self.relayout();
-            if let Some(edited) = self.imp().edited.borrow().as_ref() {
-                edited();
-            }
-        } else {
-            self.queue_draw();
-            self.update_im_cursor();
+        // What hides depends on the selection, so a move can change the layout too.
+        self.relayout();
+        if changed && let Some(edited) = self.imp().edited.borrow().as_ref() {
+            edited();
         }
         self.after_selection();
     }
@@ -554,9 +660,14 @@ impl EditorWidget {
                     _ => None,
                 });
                 self.imp().drag_origin.borrow_mut().clone_from(&origin);
-                match origin {
-                    Some((range, _)) => self.edit(|e| e.select(range.start, range.end)),
-                    None => self.edit(|e| e.move_to(at, shift)),
+                if let Some((range, _)) = origin {
+                    self.edit(|e| e.select(range.start, range.end));
+                } else {
+                    let showing = self.imp().held.borrow().clone();
+                    self.edit(|e| {
+                        e.move_to(at, shift);
+                        e.take_in_syntax(&showing.unwrap_or_else(|| e.selection().range()));
+                    });
                 }
             }
             _ => {}
@@ -568,9 +679,14 @@ impl EditorWidget {
     fn dragged(&self, x: f64, y: f64) {
         let at = self.position_at(x, y);
         let origin = self.imp().drag_origin.borrow().clone();
-        self.edit(|e| match origin {
-            Some((origin, unit)) => e.select_by_unit(origin, at, unit),
-            None => e.select(e.selection().anchor, at),
+        let showing = self.imp().held.borrow().clone();
+        self.edit(|e| {
+            match origin {
+                Some((origin, unit)) => e.select_by_unit(origin, at, unit),
+                None => e.select(e.selection().anchor, at),
+            }
+            // Up to syntax that hides on screen, the selection takes it in too.
+            e.take_in_syntax(&showing.unwrap_or_else(|| e.selection().range()));
         });
     }
 }
@@ -643,7 +759,7 @@ fn pixels(units: i32) -> f64 {
 /// The caret's left edge, top, and height at `at`, in the widget's coordinates.
 fn caret_rect(lines: &[Line], at: usize) -> Option<(f64, f64, f64)> {
     let line = lines.iter().rev().find(|line| line.start <= at)?;
-    let local = i32::try_from(at - line.start).ok()?;
+    let local = i32::try_from(line.shown(at)).ok()?;
     let (strong, _) = line.layout.cursor_pos(local);
     Some((MARGIN_SIDES + pixels(strong.x()), line.y + pixels(strong.y()), pixels(strong.height())))
 }
@@ -716,4 +832,93 @@ fn foreground(rgba: (f64, f64, f64, f64)) -> Vec<pango::Attribute> {
 
 fn background(rgba: (f64, f64, f64, f64)) -> Vec<pango::Attribute> {
     color(rgba, pango::AttrColor::new_background, pango::AttrInt::new_background_alpha)
+}
+
+/// The parts of the line from `start` to `end` that show, around the `hidden` syntax.
+fn pieces(start: usize, end: usize, hidden: &[Range<usize>]) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    let (mut at, mut shown) = (start, 0);
+    for gap in hidden.iter().filter(|gap| gap.start < end && gap.end > start) {
+        if gap.start > at {
+            pieces.push(Piece { source: at, shown, len: gap.start - at });
+            shown += gap.start - at;
+        }
+        at = at.max(gap.end);
+    }
+    if at < end || pieces.is_empty() {
+        pieces.push(Piece { source: at.min(end), shown, len: end.saturating_sub(at) });
+    }
+    pieces
+}
+
+/// The top and height of the row, as the text wraps, that `at` lies on, in the widget's
+/// coordinates.
+fn row_extents(lines: &[Line], at: usize) -> Option<(f64, f64)> {
+    let line = lines.iter().rev().find(|line| line.start <= at)?;
+    let local = i32::try_from(line.shown(at)).ok()?;
+    let (number, _) = line.layout.index_to_line_x(local, false);
+    let mut rows = line.layout.iter();
+    for _ in 0..number {
+        if !rows.next_line() {
+            break;
+        }
+    }
+    let (_, logical) = rows.line_extents();
+    Some((line.y + pixels(logical.y()), pixels(logical.height())))
+}
+
+#[cfg(test)]
+mod tests {
+    use zib_core::editor::{Body, Editor};
+
+    use super::*;
+
+    /// A widget showing `text`, laid out 600 pixels wide, with the cursor at `|`. `None` without a
+    /// display to lay out on, such as in the Nix build, where these tests have nothing to check.
+    fn widget(text: &str) -> Option<EditorWidget> {
+        adw::init().ok()?;
+        let at = text.find('|')?;
+        let mut editor = Editor::new(Body::detached(&text.replace('|', "")));
+        editor.select(at, at);
+        let widget = EditorWidget::default();
+        widget.set_editor(Some(editor));
+        widget.lay_out(600);
+        Some(widget)
+    }
+
+    fn head(widget: &EditorWidget) -> usize {
+        widget.head().unwrap_or_default()
+    }
+
+    #[test]
+    fn moves_up_and_down_between_list_items() {
+        for text in [
+            "- [x] done\n  - [ ] this that\n|  - [ ] test\n",
+            concat!(
+                "    here's the title card ![[01m6pxatk1eear5tn3pseyqr9s]]\n",
+                "  - [ ] this ![[01m6pxatkxed0t26ngds48kzrv]] that\n",
+                "|  - [ ] test\n",
+            ),
+        ] {
+            let Some(widget) = widget(text) else { return };
+            let start = text.find('|').unwrap();
+            widget.move_vertically(false, false, 1);
+            let up = head(&widget);
+            assert!(up < start, "up from {start} stayed at {up} in {text:?}");
+            widget.move_vertically(true, false, 1);
+            assert_eq!(head(&widget), start, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn moves_up_and_down_around_headings() {
+        let text = "this is me editing the note\n|## a heading\n";
+        let Some(widget) = widget(text) else { return };
+        widget.move_vertically(false, false, 1);
+        assert_eq!(head(&widget), 0);
+        // The heading's `## ` hides while the cursor is above it, and a move down lands after it,
+        // as a click there does.
+        widget.move_vertically(true, false, 1);
+        assert_eq!(head(&widget), text.find("a heading").unwrap() - 1);
+    }
 }

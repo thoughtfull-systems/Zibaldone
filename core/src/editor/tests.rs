@@ -188,3 +188,60 @@ fn drags_after_a_triple_click_select_whole_lines() {
     e.select_by_unit(origin, 1, Unit::Line);
     assert_eq!(e.selection(), Selection { anchor: 8, head: 0 });
 }
+
+#[test]
+fn moves_onto_hidden_syntax_land_inside_its_element() {
+    let mut e = editor("a| **bold** c");
+    e.move_by(Unit::Grapheme, Direction::Forward, false);
+    assert_eq!(shown(&e), "a **|bold** c");
+    let mut e = editor("a **bold** |c");
+    e.move_by(Unit::Grapheme, Direction::Back, false);
+    assert_eq!(shown(&e), "a **bold|** c");
+}
+
+#[test]
+fn moves_past_syntax_that_follows_syntax() {
+    let mut e = editor("a| ***both*** c");
+    e.move_by(Unit::Grapheme, Direction::Forward, false);
+    assert_eq!(shown(&e), "a ***|both*** c");
+}
+
+#[test]
+fn moves_through_shown_syntax_a_character_at_a_time() {
+    let mut e = editor("a **|bold** c");
+    e.move_by(Unit::Grapheme, Direction::Back, false);
+    assert_eq!(shown(&e), "a *|*bold** c");
+}
+
+#[test]
+fn word_moves_never_stop_inside_hidden_syntax() {
+    let mut e = editor("see [the site](http://example.com/page) now|");
+    e.move_by(Unit::Word, Direction::Back, false);
+    assert_eq!(shown(&e), "see [the site](http://example.com/page) |now");
+    // The address hides, so the move goes past it into the link.
+    e.move_by(Unit::Word, Direction::Back, false);
+    assert_eq!(shown(&e), "see [the site|](http://example.com/page) now");
+}
+
+#[test]
+fn mouse_selections_take_in_hidden_syntax_at_their_ends() {
+    let text = "this is some ==task==";
+    let task = text.find("task").unwrap();
+    // To the end of the word, before its hidden `==`.
+    let mut e = editor(text);
+    e.select(0, task + 4);
+    e.take_in_syntax(&(0..0));
+    assert_eq!(e.selection(), Selection { anchor: 0, head: text.len() });
+    // To the middle of the `==`, as a whole-word drag past the word reaches.
+    e.select(0, task + 5);
+    e.take_in_syntax(&(0..0));
+    assert_eq!(e.selection().head, text.len());
+    // Back from the end, past the `==` before the word.
+    e.select(text.len(), task);
+    e.take_in_syntax(&(0..0));
+    assert_eq!(e.selection().head, task - 2);
+    // Syntax that shows stays as it is.
+    e.select(0, task + 4);
+    e.take_in_syntax(&(task..task));
+    assert_eq!(e.selection().head, task + 4);
+}

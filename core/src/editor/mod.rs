@@ -51,6 +51,19 @@ pub struct Body {
     pub(crate) text: LoroText,
 }
 
+impl Body {
+    /// A body of its own, holding `text`, in no space: for tests, and for editing text that isn't a
+    /// note's.
+    pub fn detached(text: &str) -> Self {
+        let doc = LoroDoc::new();
+        let body = doc.get_text("body");
+        // A new document's text takes any insertion.
+        let _ = body.insert(0, text);
+        crate::space::commit(&doc);
+        Self { doc, text: body }
+    }
+}
+
 /// Which way a move goes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Direction {
@@ -139,6 +152,11 @@ impl Editor {
         self.selection
     }
 
+    /// How the text looks with the selection as it is.
+    pub fn display(&self) -> display::Display {
+        display::display(&self.text, &self.selection.range())
+    }
+
     pub fn selected_text(&self) -> &str {
         &self.text[self.selection.range()]
     }
@@ -199,7 +217,7 @@ impl Editor {
             self.move_to(to, false);
             return;
         }
-        let to = self.step(head, unit, direction);
+        let to = self.step_shown(head, unit, direction);
         self.move_to(to, extend);
     }
 
@@ -228,6 +246,33 @@ impl Editor {
             self.select(origin.end, here.start);
         } else {
             self.select(origin.start, here.end.max(origin.end));
+        }
+    }
+
+    /// Moves the selection's head past syntax that hides while `showing` is selected, when the head
+    /// lies inside it or at its edge nearer the anchor. A selection dragged with the mouse to an
+    /// element whose syntax hides then takes in that syntax too, as the text shows it, and as a
+    /// move by the keyboard does. `showing` is the selection that decides what shows on screen,
+    /// which stays as it was while a mouse button is down.
+    pub fn take_in_syntax(&mut self, showing: &Range<usize>) {
+        let Selection { anchor, head } = self.selection;
+        if anchor == head {
+            return;
+        }
+        let forward = head > anchor;
+        let mut to = head;
+        for hidden in display::display(&self.text, showing).hidden {
+            let at_edge = if forward {
+                hidden.start <= to && to < hidden.end
+            } else {
+                hidden.start < to && to <= hidden.end
+            };
+            if at_edge {
+                to = if forward { hidden.end } else { hidden.start };
+            }
+        }
+        if to != head {
+            self.place(Selection { anchor, head: to });
         }
     }
 
@@ -398,6 +443,26 @@ impl Editor {
     /// The byte offset of the character offset `chars`.
     fn byte(&self, chars: usize) -> usize {
         self.text.char_indices().nth(chars).map_or(self.text.len(), |(at, _)| at)
+    }
+
+    /// The place one `unit` from `at` in `direction`, as the text shows before the move. A move by
+    /// a character or a word never stops inside syntax that hides, and one that lands at the edge
+    /// of such syntax goes past it, so the cursor lands inside the element it belongs to from
+    /// either side. Syntax that follows syntax, as `*` follows `**` in `***both***`, counts as one.
+    fn step_shown(&self, at: usize, unit: Unit, direction: Direction) -> usize {
+        let mut to = self.step(at, unit, direction);
+        if !matches!(unit, Unit::Grapheme | Unit::Word) {
+            return to;
+        }
+        let forward = direction == Direction::Forward;
+        for hidden in &self.display().hidden {
+            let inside = hidden.start < to && to < hidden.end;
+            let onto = if forward { to == hidden.start } else { to == hidden.end };
+            if inside || (onto && to != at) {
+                to = if forward { hidden.end } else { hidden.start };
+            }
+        }
+        to
     }
 
     /// The place one `unit` from `at` in `direction`.

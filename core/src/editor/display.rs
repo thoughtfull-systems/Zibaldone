@@ -47,13 +47,27 @@ pub struct Display {
     /// The lines that draw on a shade across the editor's width, as code blocks, display math,
     /// and pipe tables do, each without its line break.
     pub shaded: Vec<Range<usize>>,
+    /// The syntax that hides, because the selection doesn't touch what it belongs to, in order and
+    /// without overlaps. None of it holds a line break.
+    pub hidden: Vec<Range<usize>>,
 }
 
-/// How `text` looks, with all of its syntax showing.
-pub fn display(text: &str) -> Display {
+/// How `text` looks with `selection`, a byte range, selected. An element's syntax shows while the
+/// selection touches it, the cursor at either edge included, and hides otherwise. In a pipe table
+/// that the selection touches, all of it shows, so its columns line up.
+pub fn display(text: &str, selection: &Range<usize>) -> Display {
     let mut display = Display::default();
     let mut syntax = Vec::new();
-    for Span { range, style, syntax: pieces } in spans(text) {
+    let found = spans(text);
+    let tables: Vec<Range<usize>> = found
+        .iter()
+        .filter(|span| span.style == Style::Table && span.touches(selection))
+        .map(|span| span.range.clone())
+        .collect();
+    for span in found {
+        let shows = span.touches(selection)
+            || tables.iter().any(|t| t.start <= span.range.start && span.range.end <= t.end);
+        let Span { range, style, syntax: pieces } = span;
         let display_math = style == Style::Math && text[range.clone()].starts_with("$$");
         let looks = match style {
             Style::BlockQuote => vec![Look::Quote],
@@ -76,15 +90,32 @@ pub fn display(text: &str) -> Display {
         if display_math || matches!(style, Style::CodeBlock | Style::Table) {
             display.shaded.extend(lines(text, &range));
         }
-        // A task box and a list marker are drawn over, not dimmed, from the next step on.
+        // A task box and a list marker show until a later step draws over them.
         if !matches!(style, Style::Checkbox(_) | Style::ListMarker) {
+            if !shows {
+                display.hidden.extend(pieces.iter().filter(|p| !p.is_empty()).cloned());
+            }
             syntax.extend(pieces.into_iter().map(|range| Styled { range, look: Look::Syntax }));
         }
     }
     display.styles.extend(syntax);
     display.shaded.sort_by_key(|line| line.start);
     display.shaded.dedup();
+    display.hidden = merged(display.hidden);
     display
+}
+
+/// `ranges` in order, with those that overlap or meet joined.
+fn merged(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.sort_by_key(|range| range.start);
+    let mut joined: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match joined.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => joined.push(range),
+        }
+    }
+    joined
 }
 
 /// The lines that `range` touches, from the start of its first line, without their line breaks.
@@ -108,7 +139,7 @@ mod tests {
 
     /// The looks of `text`, each with the text it covers.
     fn looks(text: &str) -> Vec<(&str, Look)> {
-        display(text).styles.into_iter().map(|s| (&text[s.range], s.look)).collect()
+        display(text, &(0..0)).styles.into_iter().map(|s| (&text[s.range], s.look)).collect()
     }
 
     #[test]
@@ -126,13 +157,31 @@ mod tests {
     }
 
     #[test]
+    fn hides_syntax_away_from_the_selection() {
+        let text = "# Title\n\nSome **bold** and [a](http://x).\n\n| *a* | b |\n|---|---|\n\nend";
+        let hidden = |at: usize| -> Vec<&str> {
+            display(text, &(at..at)).hidden.iter().map(|r| &text[r.clone()]).collect()
+        };
+        let all = ["# ", "**", "**", "[", "](http://x)", "*", "*"];
+        assert_eq!(hidden(text.len()), all);
+        // The cursor at either edge of an element, or inside it, shows its syntax.
+        let bold = text.find("**").unwrap();
+        for at in [bold, bold + 4, bold + 8] {
+            assert_eq!(hidden(at), ["# ", "[", "](http://x)", "*", "*"]);
+        }
+        // Anywhere in a pipe table shows all of its syntax.
+        let table = text.find("| b").unwrap();
+        assert_eq!(hidden(table), ["# ", "**", "**", "[", "](http://x)"]);
+    }
+
+    #[test]
     fn shows_math_like_code() {
         assert_eq!(
             looks("a $x$ b"),
             [("$x$", Look::Code), ("$", Look::Syntax), ("$", Look::Syntax)]
         );
         let text = "a\n\n$$\nx\n$$\n";
-        let shown = display(text);
+        let shown = display(text, &(0..0));
         assert_eq!(shown.styles[0].look, Look::Monospace);
         let shaded: Vec<&str> = shown.shaded.iter().map(|r| &text[r.clone()]).collect();
         assert_eq!(shaded, ["$$", "x", "$$"]);
@@ -142,7 +191,7 @@ mod tests {
     fn shades_code_blocks_and_pipe_tables() {
         let text =
             "- item\n\n  ```rust\n  fn main() {}\n  ```\n\n| a | b |\n|---|---|\n| c | d |\n";
-        let shown = display(text);
+        let shown = display(text, &(0..0));
         let shaded: Vec<&str> = shown.shaded.iter().map(|r| &text[r.clone()]).collect();
         assert_eq!(
             shaded,
