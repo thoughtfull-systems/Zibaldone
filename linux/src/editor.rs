@@ -485,7 +485,7 @@ impl Preview {
 /// The color of a heading of `level`: a hue from the GNOME palette for each of the first four
 /// levels, purple, blue, green, and orange, in a darker shade on a light background and a lighter
 /// one on a dark background. Deeper levels share the fourth's.
-fn heading_color(level: u8, dark: bool) -> &'static str {
+pub fn heading_color(level: u8, dark: bool) -> &'static str {
     let (light, dark_shade) = match level {
         1 => ("#813d9c", "#dc8add"),
         2 => ("#1a5fb4", "#99c1f1"),

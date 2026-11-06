@@ -9,6 +9,7 @@
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
+use zib_core::editor::display::{Look, display};
 use zib_core::editor::{Direction, Editor, Unit};
 
 /// Space around the text, in pixels, as the text view has.
@@ -17,6 +18,14 @@ const MARGIN_TOP: f64 = 16.0;
 const MARGIN_BOTTOM: f64 = 24.0;
 /// The width of the caret, in pixels.
 const CARET: f32 = 1.5;
+/// The space above a heading, in pixels.
+const HEADING_SPACE: f64 = 6.0;
+/// The colors of syntax, links, highlights, and the shade behind code, as red, green, blue, and
+/// alpha, as the text view has them.
+const SYNTAX: (f64, f64, f64, f64) = (0.5, 0.5, 0.5, 0.9);
+const LINK: (f64, f64, f64, f64) = (0.21, 0.52, 0.89, 1.0);
+const HIGHLIGHT: (f64, f64, f64, f64) = (0.96, 0.83, 0.18, 0.45);
+const SHADE: (f64, f64, f64, f64) = (0.5, 0.5, 0.5, 0.15);
 
 /// Whether the development build shows notes in this editor.
 pub fn enabled() -> bool {
@@ -31,6 +40,8 @@ pub struct Line {
     /// Its top, from the widget's top.
     y: f64,
     height: f64,
+    /// Whether it draws on a shade across the editor's width, as a code block's lines do.
+    shaded: bool,
 }
 
 mod imp {
@@ -137,6 +148,13 @@ impl EditorWidget {
         self.set_focusable(true);
         self.set_cursor_from_name(Some("text"));
         self.set_overflow(gtk::Overflow::Hidden);
+        // Headings and other colors change between the light and dark styles.
+        let w = self.downgrade();
+        adw::StyleManager::default().connect_dark_notify(move |_| {
+            if let Some(w) = w.upgrade() {
+                w.relayout();
+            }
+        });
 
         let im = gtk::IMMulticontext::new();
         im.set_client_widget(Some(self));
@@ -198,18 +216,40 @@ impl EditorWidget {
             imp.laid_width.set(width);
             let editor = imp.editor.borrow();
             let text = editor.as_ref().map_or("", |e| e.text());
+            let shown = display(text);
+            let dark = adw::StyleManager::default().is_dark();
             let wrap = (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0);
             let mut lines = Vec::new();
             let mut y = MARGIN_TOP;
             let mut start = 0;
             for line in text.split('\n') {
+                let end = start + line.len();
                 let layout = self.create_pango_layout(Some(line));
                 layout.set_width(units(wrap));
                 layout.set_wrap(pango::WrapMode::WordChar);
+                let attributes = pango::AttrList::new();
+                let mut heading = false;
+                for styled in &shown.styles {
+                    let (from, to) = (styled.range.start.max(start), styled.range.end.min(end));
+                    if from >= to {
+                        continue;
+                    }
+                    heading |= matches!(styled.look, Look::Heading(_));
+                    for mut attribute in attributes_of(styled.look, dark) {
+                        attribute.set_start_index(u32::try_from(from - start).unwrap_or(0));
+                        attribute.set_end_index(u32::try_from(to - start).unwrap_or(u32::MAX));
+                        attributes.insert(attribute);
+                    }
+                }
+                layout.set_attributes(Some(&attributes));
+                if heading {
+                    y += HEADING_SPACE;
+                }
+                let shaded = shown.shaded.iter().any(|shaded| shaded.start == start);
                 let height = pixels(layout.size().1);
-                lines.push(Line { start, layout, y, height });
+                lines.push(Line { start, layout, y, height, shaded });
                 y += height;
-                start += line.len() + 1;
+                start = end + 1;
             }
             *imp.lines.borrow_mut() = lines;
         }
@@ -236,8 +276,17 @@ impl EditorWidget {
         let color = self.color();
         let selected = editor.selection().range();
         let highlight = adw::StyleManager::default().accent_color_rgba().with_alpha(0.3);
+        let (red, green, blue, alpha) = SHADE;
+        #[allow(clippy::cast_possible_truncation)]
+        let shade = gdk::RGBA::new(red as f32, green as f32, blue as f32, alpha as f32);
+        #[allow(clippy::cast_precision_loss)]
+        let width = self.width() as f32;
         #[allow(clippy::cast_possible_truncation)]
         for line in lines.iter() {
+            if line.shaded {
+                let rect = graphene::Rect::new(0.0, line.y as f32, width, line.height as f32);
+                snapshot.append_color(&shade, &rect);
+            }
             snapshot.save();
             snapshot.translate(&graphene::Point::new(MARGIN_SIDES as f32, line.y as f32));
             let end = line.start + line.layout.text().len();
@@ -597,4 +646,74 @@ fn caret_rect(lines: &[Line], at: usize) -> Option<(f64, f64, f64)> {
     let local = i32::try_from(at - line.start).ok()?;
     let (strong, _) = line.layout.cursor_pos(local);
     Some((MARGIN_SIDES + pixels(strong.x()), line.y + pixels(strong.y()), pixels(strong.height())))
+}
+
+/// The Pango attributes that give text `look`, in the light or `dark` style.
+fn attributes_of(look: Look, dark: bool) -> Vec<pango::Attribute> {
+    let monospace = || pango::AttrString::new_family("monospace").upcast();
+    match look {
+        Look::Heading(level) => {
+            let scale = match level {
+                1 => 1.6,
+                2 => 1.4,
+                3 => 1.2,
+                _ => 1.0,
+            };
+            let color = gdk::RGBA::parse(crate::editor::heading_color(level, dark))
+                .map_or((0.0, 0.0, 0.0, 1.0), |c| {
+                    (f64::from(c.red()), f64::from(c.green()), f64::from(c.blue()), 1.0)
+                });
+            let mut attributes = vec![
+                pango::AttrInt::new_weight(pango::Weight::Bold).upcast(),
+                pango::AttrFloat::new_scale(scale).upcast(),
+            ];
+            attributes.extend(foreground(color));
+            attributes
+        }
+        Look::Emphasis => vec![pango::AttrInt::new_style(pango::Style::Italic).upcast()],
+        Look::Strong => vec![pango::AttrInt::new_weight(pango::Weight::Bold).upcast()],
+        Look::Strikethrough => vec![pango::AttrInt::new_strikethrough(true).upcast()],
+        Look::Underline => vec![pango::AttrInt::new_underline(pango::Underline::Single).upcast()],
+        Look::Highlight => background(HIGHLIGHT),
+        Look::Code => {
+            let mut attributes = vec![monospace()];
+            attributes.extend(background(SHADE));
+            attributes
+        }
+        Look::Monospace => vec![monospace()],
+        Look::Link => {
+            let mut attributes =
+                vec![pango::AttrInt::new_underline(pango::Underline::Single).upcast()];
+            attributes.extend(foreground(LINK));
+            attributes
+        }
+        Look::Quote => {
+            let mut attributes = vec![pango::AttrInt::new_style(pango::Style::Italic).upcast()];
+            attributes.extend(foreground(SYNTAX));
+            attributes
+        }
+        Look::Completed | Look::Syntax => foreground(SYNTAX),
+    }
+}
+
+/// A Pango color and its alpha, from red, green, blue, and alpha between 0 and 1.
+fn color(
+    (red, green, blue, alpha): (f64, f64, f64, f64),
+    color: fn(u16, u16, u16) -> pango::AttrColor,
+    opacity: fn(u16) -> pango::AttrInt,
+) -> Vec<pango::Attribute> {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let channel = |value: f64| (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+    vec![
+        color(channel(red), channel(green), channel(blue)).upcast(),
+        opacity(channel(alpha)).upcast(),
+    ]
+}
+
+fn foreground(rgba: (f64, f64, f64, f64)) -> Vec<pango::Attribute> {
+    color(rgba, pango::AttrColor::new_foreground, pango::AttrInt::new_foreground_alpha)
+}
+
+fn background(rgba: (f64, f64, f64, f64)) -> Vec<pango::Attribute> {
+    color(rgba, pango::AttrColor::new_background, pango::AttrInt::new_background_alpha)
 }

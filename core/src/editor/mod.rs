@@ -5,6 +5,8 @@
 //! The editor edits the note's Loro text directly, and keeps the selection as Loro cursors, so it
 //! stays in place as edits from other machines arrive. Offsets are bytes of UTF-8 text.
 
+pub mod display;
+
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
