@@ -28,6 +28,10 @@ pub struct Presence {
 }
 
 impl Presence {
+    pub fn is_live(&self) -> bool {
+        !self.sessions.is_empty()
+    }
+
     pub fn started(&mut self, machine: Id) {
         self.sessions.insert(machine);
     }
@@ -106,15 +110,18 @@ mod tests {
         presence.received(machine, vec![selection.clone()]);
         assert!(presence.peers.is_empty());
         presence.started(machine);
+        assert!(presence.is_live());
         presence.received(machine, vec![selection.clone()]);
         let seen = presence.peers[&machine].seen;
         assert!(!presence.expire_at(seen + CURSOR_TIMEOUT / 2));
         assert!(presence.expire_at(seen + CURSOR_TIMEOUT));
+        assert!(presence.is_live());
         presence.set_name(machine, "late name".to_owned());
         assert!(presence.peers.is_empty());
         presence.received(machine, vec![selection.clone()]);
         assert_eq!(presence.peers.len(), 1);
         presence.ended(machine);
+        assert!(!presence.is_live());
         presence.received(machine, vec![selection]);
         presence.set_name(machine, "late name".to_owned());
         assert!(presence.peers.is_empty());

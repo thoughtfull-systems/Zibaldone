@@ -224,7 +224,6 @@ in
     # keep-sorted start
     pkgs.cargo-nextest
     pkgs.gtk4
-    pkgs.gtksourceview5
     pkgs.libadwaita
     pkgs.mold
     pkgs.pkg-config

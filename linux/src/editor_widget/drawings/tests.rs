@@ -24,7 +24,7 @@ fn inline_math_uses_natural_size_and_reveals_its_exact_source() {
     assert_eq!(line.layout.text(), "before \u{fffc} after");
     assert_eq!(line.images.len(), 1);
     let image = &line.images[0];
-    assert!((image.width - 60.0 * crate::drawings::math_scale(&widget)).abs() < 0.01);
+    assert!((image.width - 60.0 * crate::editor_widget::math_scale(&widget)).abs() < 0.01);
     assert_eq!(image.source, 7);
     assert_eq!(image.end, 12);
     let rect = image_rect(line, image);

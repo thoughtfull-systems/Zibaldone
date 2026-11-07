@@ -202,8 +202,22 @@ impl State {
     /// work.
     pub async fn start(channel: Channel, dirs: Dirs) -> Result<Arc<Self>> {
         let store = Store::open(&dirs, POLICY)?;
-        let secret = store.secret_key()?;
         let network = Network::Internet { relay: store.config.relay.clone() };
+        let state = Self::open(channel, dirs, store, network).await?;
+        tokio::spawn(state.node.clone().serve(state.pairing.clone()));
+        tokio::spawn(state.clone().sync_forever());
+        tokio::spawn(state.clone().save_forever());
+        tokio::spawn(state.clone().upkeep_forever());
+        Ok(state)
+    }
+
+    async fn open(
+        channel: Channel,
+        dirs: Dirs,
+        store: Store,
+        network: Network,
+    ) -> Result<Arc<Self>> {
+        let secret = store.secret_key()?;
         let node = Arc::new(
             Node::bind(secret, store.config.id, &store.config.name, POLICY, network).await?,
         );
@@ -236,11 +250,13 @@ impl State {
             let space = state.create_space(DEFAULT_SPACE).await?;
             state.set_last_space(space).await?;
         }
-        tokio::spawn(state.node.clone().serve(pairing));
-        tokio::spawn(state.clone().sync_forever());
-        tokio::spawn(state.clone().save_forever());
-        tokio::spawn(state.clone().upkeep_forever());
         Ok(state)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn for_test(dirs: Dirs) -> Result<Arc<Self>> {
+        let store = Store::open(&dirs, POLICY)?;
+        Self::open(Channel::Development, dirs, store, Network::Loopback).await
     }
 
     /// Sets where events for the window go.
@@ -440,17 +456,6 @@ impl State {
         self.reindex_note(space_id, &space, id);
         self.changed_here(space_id);
         Ok(id)
-    }
-
-    /// Stores a note's body as the editor holds it, with filled-in labels already removed.
-    pub async fn save_body(&self, space_id: Id, id: Id, body: &str) -> Result<()> {
-        let space = self.space(space_id).await?;
-        let mut space = space.lock().await;
-        space.set_body(id, body)?;
-        space.commit();
-        self.reindex_note(space_id, &space, id);
-        self.changed_here(space_id);
-        Ok(())
     }
 
     /// A note's body, for an editor to change directly.
@@ -726,20 +731,15 @@ impl State {
         self.node.open_note(space, note).await
     }
 
-    pub fn close_note(&self, space: Id, note: Id) {
-        self.node.close_note(space, note);
-    }
-
-    /// Encodes a position in a note's body as a Loro cursor.
-    pub async fn cursor_at(&self, space_id: Id, note: Id, position: usize) -> Option<Vec<u8>> {
-        let space = self.space(space_id).await.ok()?;
-        space.lock().await.cursor_at(note, position)
-    }
-
-    /// The position in a note's body that an encoded Loro cursor points to now.
-    pub async fn cursor_position(&self, space_id: Id, bytes: &[u8]) -> Option<usize> {
-        let space = self.space(space_id).await.ok()?;
-        space.lock().await.cursor_position(bytes)
+    pub async fn close_note(&self, space_id: Id, note: Id) {
+        self.node.close_note(space_id, note);
+        if let Ok(space) = self.space(space_id).await {
+            let mut space = space.lock().await;
+            if space.close_note(note).is_ok() {
+                self.reindex_note(space_id, &space, note);
+                self.changed_here(space_id);
+            }
+        }
     }
 
     /// This machine's address, as the Add machine screen shows it.

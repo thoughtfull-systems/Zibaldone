@@ -10,7 +10,6 @@ let
     buildInputs = [
       # keep-sorted start
       pkgs.gtk4
-      pkgs.gtksourceview5
       pkgs.libadwaita
       pkgs.sqlite
       # keep-sorted end

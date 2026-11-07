@@ -198,6 +198,10 @@ impl Editor {
         &mut self.presence
     }
 
+    pub fn is_live(&self) -> bool {
+        self.presence.is_live()
+    }
+
     /// Resolves remote cursors against the current body, in the same byte offsets as the display.
     /// A cursor from another note or an update that hasn't arrived can't point into this one.
     pub fn remote_selections(&self) -> Vec<presence::RemoteSelection> {

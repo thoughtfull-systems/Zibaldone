@@ -12,6 +12,16 @@ use crate::window::Window;
 
 static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) fn test_runtime() -> &'static tokio::runtime::Runtime {
+    static TEST_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let runtime = TEST_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a test runtime")
+    });
+    let _ = RUNTIME.set(runtime.handle().clone());
+    runtime
+}
+
 /// Runs `future` on the core's runtime, and lets GTK's main loop await its result.
 pub fn core<F, T>(future: F) -> impl Future<Output = T>
 where

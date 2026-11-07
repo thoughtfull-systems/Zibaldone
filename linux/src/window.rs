@@ -9,24 +9,24 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use zib_core::body::{self, ShownTitles};
-use zib_core::editing::{Drawing, LinkTarget, link_at};
+use zib_core::body;
+use zib_core::editing::{Drawing, LinkTarget};
 use zib_core::render::Kind;
 use zib_core::search::{MATCH_END, MATCH_START};
 use zib_core::sync::{LiveEvent, Selection, SyncState};
 use zib_core::{Channel, Id};
 
 use crate::app::core;
-use crate::drawings::Draw;
-use crate::editor;
-use crate::editor_widget::{self, EditorWidget, PasteTarget};
+use crate::editor_widget::{EditorWidget, PasteTarget};
 use crate::state::State;
 use crate::tables;
 
-/// How long the editor waits after typing stops before it commits, and how long while another
-/// machine edits the same note live.
-const COMMIT_PAUSE: Duration = Duration::from_secs(3);
-const COMMIT_LIVE: Duration = Duration::from_millis(50);
+#[cfg(test)]
+mod tests;
+
+/// How long metadata and search updates wait after typing stops, or while editing live.
+const REPORT_LIVE: Duration = Duration::from_millis(50);
+const REPORT_PAUSE: Duration = Duration::from_secs(3);
 
 /// The window, which the instance opens on `activate`.
 #[derive(Clone)]
@@ -54,8 +54,6 @@ pub struct Inner {
     drawing_generation: Cell<u64>,
     title: adw::WindowTitle,
     stack: gtk::Stack,
-    view: sourceview5::View,
-    buffer: gtk::TextBuffer,
     backlinks: gtk::MenuButton,
     /// The notes opened before the open one, the latest last, and those to go forward to again.
     back: RefCell<Vec<(Id, Id)>>,
@@ -65,15 +63,11 @@ pub struct Inner {
     open_file: gtk::Button,
     status: gtk::MenuButton,
     editor: RefCell<Option<Editor>>,
-    loading: Cell<bool>,
     /// Whether the note that opens next takes the focus, as a new note does.
     focus_body: Cell<bool>,
-    /// Other machines' cursors in the open note.
-    remote: Rc<crate::remote::Remote>,
-    /// The editor of decision ZIB0017, which shows notes in place of the text view while
-    /// `ZIB_EDITOR=new` is set in a development build.
-    new_editor: Option<EditorWidget>,
-    /// The report of the new editor's edits, which waits for a pause in typing.
+    /// The note editor, backed directly by the space's Loro text.
+    widget: EditorWidget,
+    /// The metadata and search update after a pause in typing.
     body_timer: RefCell<Option<glib::SourceId>>,
 }
 
@@ -82,15 +76,7 @@ struct Editor {
     space: Id,
     note: Id,
     type_name: String,
-    /// The body as stored, without filled-in labels.
-    stored: String,
-    shown: ShownTitles,
-    insertions: Vec<(usize, usize)>,
     titles: HashMap<Id, String>,
-    /// Link targets whose titles the editor asked for, so it asks once.
-    asked: std::collections::HashSet<Id>,
-    timer: Option<glib::SourceId>,
-    live: Cell<bool>,
     cursors: Option<tokio::sync::broadcast::Sender<(Id, Vec<Selection>)>>,
 }
 
@@ -194,24 +180,12 @@ impl Window {
             .build();
         content_header.pack_end(&backlinks);
 
-        let draw: Draw = {
-            let state = state.clone();
-            Rc::new(move |drawing, done| {
-                let (state, drawing) = (state.clone(), drawing.clone());
-                glib::spawn_future_local(async move { done(draw(state, drawing).await) });
-            })
-        };
-        let view = editor::new_view(draw);
-        let buffer = view.buffer();
-        let new_editor = editor_widget::enabled().then(EditorWidget::default);
-        let editor_scroll = match &new_editor {
-            Some(widget) => gtk::ScrolledWindow::builder()
-                .child(widget)
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .vexpand(true)
-                .build(),
-            None => gtk::ScrolledWindow::builder().child(&view).vexpand(true).build(),
-        };
+        let widget = EditorWidget::default();
+        let editor_scroll = gtk::ScrolledWindow::builder()
+            .child(&widget)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
         let empty = adw::StatusPage::builder()
             .icon_name("accessories-text-editor-symbolic")
             .title(state.channel.display_name())
@@ -247,8 +221,6 @@ impl Window {
             drawing_generation: Cell::new(0),
             title,
             stack,
-            view: view.clone(),
-            buffer,
             backlinks,
             back: RefCell::default(),
             forward: RefCell::default(),
@@ -257,28 +229,25 @@ impl Window {
             open_file,
             status,
             editor: RefCell::default(),
-            loading: Cell::new(false),
             focus_body: Cell::new(false),
-            remote: crate::remote::Remote::new(view.upcast_ref()),
-            new_editor,
+            widget,
             body_timer: RefCell::default(),
         }));
-        this.connect(&new_note, &add_file, &delete, &view);
-        this.connect_files(&view);
-        if let Some(widget) = &this.inner().new_editor {
-            let w = this.clone();
-            widget.connect_edited(move || w.new_editor_edited());
-            let w = this.clone();
-            widget.connect_selection_changed(move || w.cursor_moved());
-            let w = this.clone();
-            widget.connect_open_link(move |target| w.open_link(target));
-            let w = this.clone();
-            widget.connect_pick_link(move |range| w.open_widget_link_picker(range));
-            let w = this.clone();
-            widget.connect_paste_image(move |clipboard, target| {
-                w.paste_widget_image(clipboard, target);
-            });
-        }
+        this.connect(&new_note, &add_file, &delete);
+        this.connect_files();
+        let widget = &this.inner().widget;
+        let w = this.clone();
+        widget.connect_edited(move || w.body_edited());
+        let w = this.clone();
+        widget.connect_selection_changed(move || w.cursor_moved());
+        let w = this.clone();
+        widget.connect_open_link(move |target| w.open_link(target));
+        let w = this.clone();
+        widget.connect_pick_link(move |range| w.open_link_picker(range));
+        let w = this.clone();
+        widget.connect_paste_image(move |clipboard, target| {
+            w.paste_image(clipboard, target);
+        });
         this.update_history();
         this.reload_spaces();
         this.watch_status();
@@ -298,13 +267,7 @@ impl Window {
         self.inner().toasts.add_toast(adw::Toast::new(text));
     }
 
-    fn connect(
-        &self,
-        new_note: &adw::SplitButton,
-        add_file: &gtk::Button,
-        delete: &gtk::Button,
-        view: &sourceview5::View,
-    ) {
+    fn connect(&self, new_note: &adw::SplitButton, add_file: &gtk::Button, delete: &gtk::Button) {
         let w = self.clone();
         self.inner().search.connect_search_changed(move |_| w.reload_notes());
         let w = self.clone();
@@ -338,26 +301,7 @@ impl Window {
         let w = self.clone();
         self.inner().forward_button.connect_clicked(move |_| w.go(false));
         let w = self.clone();
-        self.inner().buffer.connect_changed(move |_| w.edited());
-        let w = self.clone();
-        self.inner().buffer.connect_insert_text(move |_, at, text| w.maybe_pick_link(at, text));
-        let w = self.clone();
         self.inner().backlinks.set_create_popup_func(move |button| w.show_backlinks(button));
-        let w = self.clone();
-        self.inner().buffer.connect_mark_set(move |_, _, mark| {
-            if mark.name().as_deref() == Some("insert") {
-                w.cursor_moved();
-            }
-        });
-        let w = self.clone();
-        let links = gtk::GestureClick::new();
-        links.connect_released(move |gesture, _, x, y| {
-            let modifiers = gesture.current_event_state();
-            if modifiers.contains(gdk::ModifierType::CONTROL_MASK) && w.open_link_at(x, y) {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-            }
-        });
-        view.add_controller(links);
         let w = self.clone();
         self.inner().window.connect_close_request(move |window| {
             w.close_editor();
@@ -587,8 +531,8 @@ impl Window {
         self.refresh_link_titles();
         self.refresh_images(true);
         let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
-        if let Some((open_space, note)) = open.filter(|(s, _)| *s == space) {
-            self.refresh_open(open_space, note);
+        if open.is_some_and(|(s, _)| s == space) {
+            self.refresh_open();
         }
     }
 
@@ -671,81 +615,56 @@ impl Window {
         self.load_note(space, note);
     }
 
-    /// Loads a note into the editor: syncs its space, starts live sessions, and fills in labels.
+    /// Opens the shared body and starts live sessions. A newer load discards earlier results.
     fn load_note(&self, space: Id, note: Id) {
         self.close_editor();
+        let session = self.inner().widget.session();
         let w = self.clone();
         let state = self.inner().state.clone();
         glib::spawn_future_local(async move {
-            let loaded = {
+            let loaded = core({
                 let state = state.clone();
-                core(async move {
-                    let note = state.note(space, note).await?;
-                    let targets: Vec<Id> = body::link_targets(&note.body).into_iter().collect();
+                async move {
+                    let loaded = state.note(space, note).await?;
+                    let body = state.open_body(space, note).await?;
+                    let targets: Vec<Id> = body::link_targets(&loaded.body).into_iter().collect();
                     let titles = state.titles(&targets).await;
-                    Ok::<_, zib_core::Error>((note, titles))
-                })
-                .await
-            };
-            let Ok((loaded, titles)) = loaded else {
-                w.toast("This note isn't here any more");
+                    Ok::<_, zib_core::Error>((loaded, body, titles))
+                }
+            })
+            .await;
+            if w.inner().widget.session() != session {
                 return;
+            }
+            let (loaded, body, titles) = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    w.toast(&format!("Couldn't open the note: {error}"));
+                    return;
+                }
             };
-            let mut shown = ShownTitles::default();
-            let (text, insertions) = body::fill_labels_mapped(
-                &loaded.body,
-                &mut |id| titles.get(&id).cloned(),
-                &mut shown,
-            );
-            let editor = Editor {
+            *w.inner().editor.borrow_mut() = Some(Editor {
                 space,
                 note,
                 type_name: loaded.type_name.clone(),
-                stored: loaded.body.clone(),
-                shown,
-                insertions,
-                titles,
-                asked: std::collections::HashSet::new(),
-                timer: None,
-                live: Cell::new(false),
+                titles: titles.clone(),
                 cursors: None,
-            };
-            let titles = editor.titles.clone();
-            w.set_text(&text);
-            *w.inner().editor.borrow_mut() = Some(editor);
-            if let Some(widget) = w.inner().new_editor.clone() {
-                let opened = core({
-                    let state = state.clone();
-                    async move { state.open_body(space, note).await }
-                })
-                .await;
-                match opened {
-                    Ok(body) => {
-                        widget.set_editor(Some(zib_core::editor::Editor::new(body)));
-                        widget.set_titles(titles);
-                        w.refresh_images(false);
-                    }
-                    Err(error) => w.toast(&format!("Couldn't open the note: {error}")),
-                }
-            }
+            });
+            let widget = &w.inner().widget;
+            widget.set_editor(Some(zib_core::editor::Editor::new(body)));
+            widget.set_titles(titles);
+            w.refresh_images(false);
             w.inner()
                 .open_file
                 .set_visible(loaded.type_name == "file" || loaded.type_name == "image");
             w.update_title();
             w.show_mode();
             if w.inner().focus_body.take() {
-                match &w.inner().new_editor {
-                    Some(widget) => widget.grab_focus(),
-                    None => w.inner().view.grab_focus(),
-                };
+                widget.grab_focus();
             }
-            let session = w.inner().new_editor.as_ref().map(EditorWidget::session);
-            let opened = core({
-                let state = state.clone();
-                async move { state.open_note(space, note).await }
-            })
-            .await;
-            if w.inner().new_editor.as_ref().map(EditorWidget::session) != session {
+            let session = widget.session();
+            let opened = core(async move { state.open_note(space, note).await }).await;
+            if w.inner().widget.session() != session {
                 return;
             }
             if let Ok(mut opened) = opened {
@@ -756,9 +675,7 @@ impl Window {
                 let listening = w.clone();
                 glib::spawn_future_local(async move {
                     while let Some(event) = core_recv(&mut opened.events).await {
-                        if listening.inner().new_editor.as_ref().map(EditorWidget::session)
-                            != session
-                        {
+                        if listening.inner().widget.session() != session {
                             break;
                         }
                         listening.live_event(space, note, event);
@@ -768,44 +685,11 @@ impl Window {
         });
     }
 
-    fn set_text(&self, text: &str) {
-        self.inner().loading.set(true);
-        self.inner().buffer.set_text(text);
-        self.inner().loading.set(false);
-    }
-
-    /// Changes the text to `text` by replacing only what differs between the parts the two share
-    /// at the start and at the end. The owner's cursor and selection, and other machines' cursors,
-    /// then keep their place in the text around them, as another machine's edit arrives.
-    fn replace_text(&self, text: &str) {
-        let buffer = &self.inner().buffer;
-        let old: Vec<char> = editor::text(buffer).chars().collect();
-        let new: Vec<char> = text.chars().collect();
-        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
-        let suffix = old[prefix..]
-            .iter()
-            .rev()
-            .zip(new[prefix..].iter().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let offset = |chars: usize| i32::try_from(chars).unwrap_or(i32::MAX);
-        let middle: String = new[prefix..new.len() - suffix].iter().collect();
-        self.inner().loading.set(true);
-        buffer.begin_irreversible_action();
-        let (mut from, mut to) = (
-            buffer.iter_at_offset(offset(prefix)),
-            buffer.iter_at_offset(offset(old.len() - suffix)),
-        );
-        buffer.delete(&mut from, &mut to);
-        buffer.insert(&mut buffer.iter_at_offset(offset(prefix)), &middle);
-        buffer.end_irreversible_action();
-        self.inner().loading.set(false);
-    }
-
     fn update_title(&self) {
         let editor = self.inner().editor.borrow();
         let Some(editor) = editor.as_ref() else { return };
-        let title = body::title(&editor.stored, &mut |id| {
+        let text = self.inner().widget.text().unwrap_or_default();
+        let title = body::title(&text, &mut |id| {
             editor
                 .titles
                 .get(&id)
@@ -813,140 +697,18 @@ impl Window {
         });
         let shown = if title.is_empty() { "Untitled".to_owned() } else { title.plain };
         self.inner().title.set_title(&shown);
-        self.inner().title.set_subtitle(if editor.live.get() { "Editing live" } else { "" });
-    }
-
-    /// The owner typed: commit after a pause, or at once while editing live.
-    fn edited(&self) {
-        if self.inner().loading.get() {
-            return;
-        }
-        let mut open = self.inner().editor.borrow_mut();
-        let Some(editor) = open.as_mut() else { return };
-        if let Some(timer) = editor.timer.take() {
-            timer.remove();
-        }
-        let wait = if editor.live.get() { COMMIT_LIVE } else { COMMIT_PAUSE };
-        let w = self.clone();
-        editor.timer = Some(glib::timeout_add_local_once(wait, move || {
-            if let Some(editor) = w.inner().editor.borrow_mut().as_mut() {
-                editor.timer = None;
-            }
-            w.commit();
-        }));
-        drop(open);
-        self.fill_new_labels();
-    }
-
-    /// Gives links the owner wrote without a label their target's title, as links show when a
-    /// note opens, asking the core for titles the editor lacks.
-    fn fill_new_labels(&self) {
-        let text = editor::text(&self.inner().buffer);
-        let links = body::wikilinks(&text);
-        let (note, wanted) = {
-            let mut editor = self.inner().editor.borrow_mut();
-            let Some(editor) = editor.as_mut() else { return };
-            let wanted: Vec<Id> = links
-                .iter()
-                .filter(|link| link.label.is_none() && !editor.titles.contains_key(&link.target))
-                .map(|link| link.target)
-                .filter(|target| editor.asked.insert(*target))
-                .collect();
-            (editor.note, wanted)
-        };
-        if wanted.is_empty() {
-            // After the buffer finishes reporting the change that called this.
-            let w = self.clone();
-            glib::idle_add_local_once(move || w.insert_labels());
-            return;
-        }
-        let w = self.clone();
-        let state = self.inner().state.clone();
-        glib::spawn_future_local(async move {
-            let titles = core(async move { state.titles(&wanted).await }).await;
-            if let Some(editor) = w.inner().editor.borrow_mut().as_mut().filter(|e| e.note == note)
-            {
-                editor.titles.extend(titles);
-            }
-            w.insert_labels();
+        self.inner().title.set_subtitle(if self.inner().widget.is_live() {
+            "Editing live"
+        } else {
+            ""
         });
     }
 
-    /// Puts the title the editor knows into each link without a label, except a link the cursor is
-    /// in, which the owner may still be writing.
-    fn insert_labels(&self) {
-        let buffer = &self.inner().buffer;
-        let text = editor::text(buffer);
-        let cursor = editor::byte_at(&text, buffer.cursor_position());
-        let mut labels = Vec::new();
-        {
-            let mut editor = self.inner().editor.borrow_mut();
-            let Some(editor) = editor.as_mut() else { return };
-            for link in body::wikilinks(&text) {
-                let typing = link.range.start < cursor && cursor < link.range.end;
-                let title = editor.titles.get(&link.target).filter(|title| !title.is_empty());
-                let Some(title) = title.filter(|_| link.label.is_none() && !typing) else {
-                    continue;
-                };
-                editor.shown.remember(link.target, title);
-                let at = text[..link.range.end - 2].chars().count();
-                labels.push((at, format!("|{}", body::escape_label(title))));
-            }
-        }
-        // From the end, so each insertion leaves the offsets before it as they were.
-        for (at, label) in labels.into_iter().rev() {
-            buffer.insert(&mut buffer.iter_at_offset(i32::try_from(at).unwrap_or(0)), &label);
-        }
-    }
-
-    /// Stores the editor's text without filled-in labels, applying only the differences.
-    fn commit(&self) {
-        // The new editor stores each edit as it happens, and the text view holds no edits then.
-        if self.inner().new_editor.is_some() {
+    /// Edits already live in the shared body. Metadata and search follow after a short pause.
+    fn body_edited(&self) {
+        if self.inner().editor.borrow().is_none() {
             return;
         }
-        let (space, note, stripped) = {
-            let mut editor = self.inner().editor.borrow_mut();
-            let Some(editor) = editor.as_mut() else { return };
-            let buffer = &self.inner().buffer;
-            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
-            let titles = editor.titles.clone();
-            let stripped =
-                body::strip_labels(&text, &mut |id| titles.get(&id).cloned(), &editor.shown);
-            // Labels the owner kept, and new links and their filled-in labels, change where
-            // filled-in labels sit, even when the stored text stays the same.
-            let mut shown = editor.shown.clone();
-            let (_, insertions) =
-                body::fill_labels_mapped(&stripped, &mut |id| titles.get(&id).cloned(), &mut shown);
-            editor.insertions = insertions;
-            if stripped == editor.stored {
-                return;
-            }
-            editor.stored.clone_from(&stripped);
-            (editor.space, editor.note, stripped)
-        };
-        self.update_title();
-        let w = self.clone();
-        let state = self.inner().state.clone();
-        glib::spawn_future_local(async move {
-            let _ = core(async move { state.save_body(space, note, &stripped).await }).await;
-            w.reload_notes();
-        });
-    }
-
-    /// The new editor changed the note's body, which it already stored: shows the title it has now,
-    /// and reports the edit once typing pauses, or at once while another machine edits the note
-    /// live.
-    fn new_editor_edited(&self) {
-        let Some(text) = self.inner().new_editor.as_ref().and_then(EditorWidget::text) else {
-            return;
-        };
-        let live = {
-            let mut editor = self.inner().editor.borrow_mut();
-            let Some(editor) = editor.as_mut() else { return };
-            editor.stored = text;
-            editor.live.get()
-        };
         self.update_title();
         self.refresh_link_titles();
         self.refresh_images(false);
@@ -954,7 +716,7 @@ impl Window {
             timer.remove();
         }
         let w = self.clone();
-        let wait = if live { COMMIT_LIVE } else { COMMIT_PAUSE };
+        let wait = if self.inner().widget.is_live() { REPORT_LIVE } else { REPORT_PAUSE };
         let timer = glib::timeout_add_local_once(wait, move || {
             w.inner().body_timer.take();
             w.report_body_edited_now();
@@ -964,7 +726,7 @@ impl Window {
 
     /// Resolves labels across all spaces, and discards a lookup if the open body changed.
     fn refresh_link_titles(&self) {
-        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let widget = self.inner().widget.clone();
         let Some(text) = widget.text() else { return };
         let generation = self.inner().label_generation.get().wrapping_add(1);
         self.inner().label_generation.set(generation);
@@ -978,7 +740,11 @@ impl Window {
                 && w.inner().editor.borrow().as_ref().map(|e| (e.space, e.note)) == open
                 && widget.text().as_deref() == Some(&text)
             {
+                if let Some(editor) = w.inner().editor.borrow_mut().as_mut() {
+                    editor.titles.clone_from(&titles);
+                }
                 widget.set_titles(titles);
+                w.update_title();
             }
         });
     }
@@ -986,7 +752,7 @@ impl Window {
     /// Shows a local preview first, then replaces it with the original once it arrives.
     fn refresh_images(&self, reload: bool) {
         self.refresh_drawings(reload);
-        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let widget = self.inner().widget.clone();
         let (generation, targets) = widget.image_requests(reload);
         for target in targets {
             let (widget, state) = (widget.clone(), self.inner().state.clone());
@@ -1009,7 +775,7 @@ impl Window {
     /// Render after a short pause, then let the widget reject results from an older note session.
     /// Results use the complete source as their key, so an older formula can't replace an edit.
     fn refresh_drawings(&self, reload: bool) {
-        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let widget = self.inner().widget.clone();
         if reload {
             widget.reload_tables();
         }
@@ -1056,7 +822,7 @@ impl Window {
         });
     }
 
-    /// Reports the new editor's edits now if a report waits.
+    /// Reports the editor's edits now if a report waits.
     fn report_body_edited(&self) {
         if let Some(timer) = self.inner().body_timer.take() {
             timer.remove();
@@ -1078,26 +844,19 @@ impl Window {
         });
     }
 
-    /// Commits pending typing, and ends the note's live sessions.
+    /// Reports pending metadata and ends the note's live sessions.
     fn close_editor(&self) {
         self.inner().label_generation.set(self.inner().label_generation.get().wrapping_add(1));
+        self.inner().drawing_generation.set(self.inner().drawing_generation.get().wrapping_add(1));
         self.report_body_edited();
-        if let Some(widget) = &self.inner().new_editor {
-            widget.set_editor(None);
-        }
-        let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
-        if let Some(timer) = pending {
-            timer.remove();
-            self.commit();
-        }
+        self.inner().widget.set_editor(None);
         if let Some(editor) = self.inner().editor.borrow_mut().take() {
             let state = self.inner().state.clone();
             let (space, note) = (editor.space, editor.note);
             glib::spawn_future_local(async move {
-                core(async move { state.close_note(space, note) }).await;
+                core(async move { state.close_note(space, note).await }).await;
             });
         }
-        self.inner().remote.clear();
         self.inner().open_file.set_visible(false);
     }
 
@@ -1112,214 +871,65 @@ impl Window {
         if !is_open {
             return;
         }
-        let remote = &self.inner().remote;
+        let widget = &self.inner().widget;
         match event {
             LiveEvent::Started { machine } => {
-                remote.started(machine);
-                if let Some(widget) = &self.inner().new_editor {
-                    widget.remote_started(machine);
-                }
-                // The other machine sees this one's cursor at once, not at the next move.
+                widget.remote_started(machine);
+                self.report_body_edited();
                 self.cursor_moved();
             }
             LiveEvent::Changed { machine } => {
-                remote.started(machine);
-                if let Some(widget) = &self.inner().new_editor {
-                    widget.remote_started(machine);
-                }
-                self.refresh_open(space, note);
+                widget.remote_started(machine);
+                self.refresh_open();
                 let state = self.inner().state.clone();
                 glib::spawn_future_local(async move {
                     core(async move { state.live_changed(space).await }).await;
                 });
             }
             LiveEvent::Cursor { machine, selections } => {
-                if let Some(widget) = &self.inner().new_editor {
-                    // Record the cursor before looking up its name. A slower lookup mustn't
-                    // replace a newer selection or bring back an ended session.
-                    widget.remote_received(machine, selections);
-                    let (state, widget, session) =
-                        (self.inner().state.clone(), widget.clone(), widget.session());
-                    glib::spawn_future_local(async move {
-                        if let Some(name) =
-                            core(async move { state.machine_name(space, machine).await }).await
-                        {
-                            widget.remote_name(session, machine, name);
-                        }
-                    });
-                    return;
-                }
-                let name = self.inner().state.clone();
-                let w = self.clone();
+                // A delayed name lookup mustn't replace a newer selection or revive a session.
+                widget.remote_received(machine, selections);
+                let (state, widget, session) =
+                    (self.inner().state.clone(), widget.clone(), widget.session());
                 glib::spawn_future_local(async move {
-                    let name = core(async move { name.machine_name(space, machine).await })
-                        .await
-                        .unwrap_or_default();
-                    w.inner().remote.received(machine, name, selections);
-                    w.place_remote(space);
+                    if let Some(name) =
+                        core(async move { state.machine_name(space, machine).await }).await
+                    {
+                        widget.remote_name(session, machine, name);
+                    }
                 });
             }
-            LiveEvent::Ended { machine } => {
-                remote.ended(machine);
-                if let Some(widget) = &self.inner().new_editor {
-                    widget.remote_ended(machine);
-                }
-            }
-        }
-        if let Some(editor) = self.inner().editor.borrow().as_ref() {
-            editor.live.set(remote.live());
+            LiveEvent::Ended { machine } => widget.remote_ended(machine),
         }
         self.update_title();
     }
 
-    /// Reloads the open note after another machine changed it, keeping the owner's typing.
-    fn refresh_open(&self, space: Id, note: Id) {
-        if let Some(widget) = &self.inner().new_editor {
-            widget.refresh();
-            if let (Some(text), Some(editor)) =
-                (widget.text(), self.inner().editor.borrow_mut().as_mut())
-            {
-                editor.stored = text;
-            }
-            self.update_title();
-            self.refresh_link_titles();
-            self.refresh_images(false);
-            return;
-        }
-        let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
-        if let Some(timer) = pending {
-            timer.remove();
-            self.commit();
-        }
-        let w = self.clone();
-        let state = self.inner().state.clone();
-        glib::spawn_future_local(async move {
-            let loaded = core(async move {
-                let note = state.note(space, note).await?;
-                let targets: Vec<Id> = body::link_targets(&note.body).into_iter().collect();
-                let titles = state.titles(&targets).await;
-                Ok::<_, zib_core::Error>((note.body, titles))
-            })
-            .await;
-            let Ok((stored, titles)) = loaded else { return };
-            let text = {
-                let mut editor = w.inner().editor.borrow_mut();
-                let Some(editor) = editor.as_mut().filter(|e| e.space == space && e.note == note)
-                else {
-                    return;
-                };
-                if editor.stored == stored && editor.titles == titles {
-                    return;
-                }
-                let (text, insertions) = body::fill_labels_mapped(
-                    &stored,
-                    &mut |id| titles.get(&id).cloned(),
-                    &mut editor.shown,
-                );
-                editor.stored = stored;
-                editor.insertions = insertions;
-                editor.titles = titles;
-                text
-            };
-            w.replace_text(&text);
-            w.update_title();
-            // Replacing the text moved every mark, so the cursors go back where they belong.
-            w.place_remote(space);
-        });
+    /// Reads imported edits from the shared body without replacing the owner's editor state.
+    fn refresh_open(&self) {
+        self.inner().widget.refresh();
+        self.update_title();
+        self.refresh_link_titles();
+        self.refresh_images(false);
     }
 
-    /// Sends the owner's cursor and selection to machines editing the same note.
+    /// Sends the owner's actual Loro selection to machines editing the same note.
     fn cursor_moved(&self) {
-        let (space, note, sender, insertions) = {
-            let editor = self.inner().editor.borrow();
-            let Some(editor) = editor.as_ref() else { return };
-            let Some(sender) = editor.cursors.clone() else { return };
-            (editor.space, editor.note, sender, editor.insertions.clone())
-        };
-        if let Some(widget) = &self.inner().new_editor {
-            if let Some(selection) = widget.encoded_selection() {
-                let _ = sender.send((note, vec![selection]));
-            }
-            return;
+        let editor = self.inner().editor.borrow();
+        let Some(editor) = editor.as_ref() else { return };
+        if let Some(sender) = &editor.cursors
+            && let Some(selection) = self.inner().widget.encoded_selection()
+        {
+            let _ = sender.send((editor.note, vec![selection]));
         }
-        let buffer = &self.inner().buffer;
-        let (anchor, head) = buffer.selection_bounds().map_or_else(
-            || {
-                let at = buffer.cursor_position();
-                (at, at)
-            },
-            |(a, b)| (a.offset(), b.offset()),
-        );
-        let to_stored =
-            |offset: i32| body::shown_to_stored(usize::try_from(offset).unwrap_or(0), &insertions);
-        let (anchor, head) = (to_stored(anchor), to_stored(head));
-        let state = self.inner().state.clone();
-        glib::spawn_future_local(async move {
-            let encoded = core(async move {
-                let a = state.cursor_at(space, note, anchor).await?;
-                let h = state.cursor_at(space, note, head).await?;
-                Some(Selection { anchor: a, head: h })
-            })
-            .await;
-            if let Some(selection) = encoded {
-                let _ = sender.send((note, vec![selection]));
-            }
-        });
     }
 
-    /// Turns each machine's cursors into places in the text, and shows them there.
-    fn place_remote(&self, space: Id) {
-        let w = self.clone();
-        let state = self.inner().state.clone();
-        let selections = self.inner().remote.selections();
-        glib::spawn_future_local(async move {
-            let positions = core(async move {
-                let mut out = Vec::new();
-                for (machine, selections) in selections {
-                    let mut places = Vec::new();
-                    for selection in selections {
-                        if let (Some(a), Some(h)) = (
-                            state.cursor_position(space, &selection.anchor).await,
-                            state.cursor_position(space, &selection.head).await,
-                        ) {
-                            places.push((a, h));
-                        }
-                    }
-                    out.push((machine, places));
-                }
-                out
-            })
-            .await;
-            let insertions = w
-                .inner()
-                .editor
-                .borrow()
-                .as_ref()
-                .filter(|e| e.space == space)
-                .map(|e| e.insertions.clone());
-            let Some(insertions) = insertions else { return };
-            let shown = |stored: usize| {
-                i32::try_from(body::stored_to_shown(stored, &insertions)).unwrap_or(i32::MAX)
-            };
-            for (machine, places) in positions {
-                let offsets: Vec<(i32, i32)> =
-                    places.into_iter().map(|(a, h)| (shown(a), shown(h))).collect();
-                w.inner().remote.place_at(machine, &offsets);
-            }
-        });
-    }
-
-    /// Sends the owner's cursor again while it stays still, and drops other machines' cursors
-    /// that went quiet, as live editing in the sync specification asks.
+    /// Repeats the owner's selection and removes remote cursors that go quiet.
     fn resend_cursor(&self) {
         let w = Rc::downgrade(&self.0);
-        glib::timeout_add_local(crate::remote::RESEND, move || {
+        glib::timeout_add_local(zib_core::sync::CURSOR_REPEAT, move || {
             let Some(w) = w.upgrade().map(Self) else { return glib::ControlFlow::Break };
             w.cursor_moved();
-            w.inner().remote.expire();
-            if let Some(widget) = &w.inner().new_editor {
-                widget.expire_remote();
-            }
+            w.inner().widget.expire_remote();
             glib::ControlFlow::Continue
         });
     }
@@ -1330,29 +940,17 @@ impl Window {
         self.inner().stack.set_visible_child_name(if open { "editor" } else { "empty" });
     }
 
-    /// Adds files dropped on the editor, and images pasted into it, as notes.
-    fn connect_files(&self, view: &sourceview5::View) {
-        let mut widgets: Vec<&gtk::Widget> = vec![view.upcast_ref()];
-        if let Some(widget) = &self.inner().new_editor {
-            widgets.push(widget.upcast_ref());
-        }
-        for widget in widgets {
-            let w = self.clone();
-            let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
-            target.connect_drop(move |_, value, _, _| {
-                if let Ok(files) = value.get::<gdk::FileList>() {
-                    w.add_files(files.files());
-                }
-                true
-            });
-            widget.add_controller(target);
-        }
+    /// Adds files dropped on the editor as notes. The widget handles image clipboard input.
+    fn connect_files(&self) {
         let w = self.clone();
-        view.connect_paste_clipboard(move |view| {
-            if w.paste_image() {
-                view.stop_signal_emission_by_name("paste-clipboard");
+        let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        target.connect_drop(move |_, value, _, _| {
+            if let Ok(files) = value.get::<gdk::FileList>() {
+                w.add_files(files.files());
             }
+            true
         });
+        self.inner().widget.add_controller(target);
     }
 
     fn pick_files(&self) {
@@ -1397,61 +995,9 @@ impl Window {
         });
     }
 
-    /// Pastes an image from the clipboard as an `image` note in the open note's space, with an
-    /// embed of it in place of the selection. Returns whether the clipboard held an image to
-    /// paste. A clipboard that also holds text, as a copied spreadsheet range does, pastes the
-    /// text.
-    fn paste_image(&self) -> bool {
-        let Some((space, open)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
-        else {
-            return false;
-        };
-        let clipboard = self.inner().view.clipboard();
-        if !editor_widget::image_only(clipboard.formats()) {
-            return false;
-        }
-        let buffer = &self.inner().buffer;
-        let (from, to) = buffer.selection_bounds().unwrap_or_else(|| {
-            let cursor = buffer.iter_at_mark(&buffer.get_insert());
-            (cursor, cursor)
-        });
-        let start = buffer.create_mark(None, &from, true);
-        let end = buffer.create_mark(None, &to, false);
-        let w = self.clone();
-        let state = self.inner().state.clone();
-        glib::spawn_future_local(async move {
-            let (note, name) = match pasted_image(state.clone(), space, clipboard).await {
-                Ok(added) => added,
-                Err(error) => {
-                    let buffer = &w.inner().buffer;
-                    buffer.delete_mark(&start);
-                    buffer.delete_mark(&end);
-                    w.toast(&format!("Couldn't paste the image: {error}"));
-                    return;
-                }
-            };
-            // The embed commits before the thumbnail's derivation changes the space, since the
-            // editor reloads the stored text when a space changes.
-            let embed = format!("!{}", w.titled_link(note, name));
-            if w.place_link(&start, &end, &embed, Some(open)) {
-                let pending = w.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
-                if let Some(timer) = pending {
-                    timer.remove();
-                }
-                w.commit();
-            }
-            w.reload_notes();
-            // A future of its own starts after the one that saves the commit.
-            glib::spawn_future_local(async move {
-                let _ = core(async move { state.derive(space).await }).await;
-            });
-        });
-        true
-    }
-
-    fn paste_widget_image(&self, clipboard: gdk::Clipboard, target: PasteTarget) {
+    fn paste_image(&self, clipboard: gdk::Clipboard, target: PasteTarget) {
         let Some(space) = self.inner().editor.borrow().as_ref().map(|e| e.space) else { return };
-        let Some(widget) = self.inner().new_editor.clone() else { return };
+        let widget = self.inner().widget.clone();
         let w = self.clone();
         let state = self.inner().state.clone();
         glib::spawn_future_local(async move {
@@ -1569,11 +1115,7 @@ impl Window {
     /// Prints the open note, and with `linked`, the notes it links to, through GTK's print dialog,
     /// which sends the PDF to a printer or saves it.
     fn print(&self, linked: bool) {
-        let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
-        if let Some(timer) = pending {
-            timer.remove();
-            self.commit();
-        }
+        self.report_body_edited();
         let Some(note) = self.inner().editor.borrow().as_ref().map(|e| e.note) else { return };
         let w = self.clone();
         let state = self.inner().state.clone();
@@ -1618,61 +1160,8 @@ impl Window {
         });
     }
 
-    /// Opens the link picker when the owner types `[[`, or wraps a selection in it, which then
-    /// becomes the label. Runs before the buffer inserts `text` at `at`.
-    fn maybe_pick_link(&self, at: &gtk::TextIter, text: &str) {
-        if self.inner().loading.get() || self.inner().editor.borrow().is_none() {
-            return;
-        }
-        let mut before = *at;
-        let typed = text == "[" && before.backward_char() && before.char() == '[';
-        let wrapped = text.len() > 4
-            && text.starts_with("[[")
-            && text.ends_with("]]")
-            && !text[2..text.len() - 2].contains('\n')
-            && body::wikilinks(text).is_empty();
-        if !typed && !wrapped {
-            return;
-        }
-        let start = if typed { at.offset() - 1 } else { at.offset() };
-        let end = at.offset() + i32::try_from(text.chars().count()).unwrap_or(0);
-        let label = wrapped.then(|| text[2..text.len() - 2].to_owned());
-        let w = self.clone();
-        // The picker works on the text after the buffer inserts it.
-        glib::idle_add_local_once(move || w.open_link_picker(start, end, label));
-    }
-
-    /// Shows a search for the note to link to, which replaces the characters from `start` to `end`
-    /// with a link to it.
-    fn open_link_picker(&self, start: i32, end: i32, label: Option<String>) {
-        let view = &self.inner().view;
-        let buffer = &self.inner().buffer;
-        let start = buffer.create_mark(None, &buffer.iter_at_offset(start), true);
-        let end = buffer.create_mark(None, &buffer.iter_at_offset(end), false);
-        let place = view.iter_location(&buffer.iter_at_mark(&end));
-        let (x, y) =
-            view.buffer_to_window_coords(gtk::TextWindowType::Widget, place.x(), place.y());
-        let w = self.clone();
-        let (from, to) = (start.clone(), end.clone());
-        let chosen = Rc::new(Cell::new(false));
-        let picked = chosen.clone();
-        let pick = move |target| {
-            picked.set(true);
-            w.insert_link(&from, &to, target, label.clone());
-        };
-        let w = self.clone();
-        let closed = move || {
-            if !chosen.get() {
-                w.inner().buffer.delete_mark(&start);
-                w.inner().buffer.delete_mark(&end);
-            }
-            w.inner().view.grab_focus();
-        };
-        self.show_link_picker(view, &gdk::Rectangle::new(x, y, 1, place.height()), pick, closed);
-    }
-
-    fn open_widget_link_picker(&self, range: std::ops::Range<usize>) {
-        let Some(widget) = self.inner().new_editor.clone() else { return };
+    fn open_link_picker(&self, range: std::ops::Range<usize>) {
+        let widget = self.inner().widget.clone();
         let Some(text) = widget.text() else { return };
         let Some(expected) = text.get(range.clone()).map(str::to_owned) else { return };
         let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
@@ -1689,7 +1178,7 @@ impl Window {
         });
     }
 
-    /// The search and results shared by both editors' link pickers.
+    /// The link picker's search and results.
     fn show_link_picker(
         &self,
         parent: &impl IsA<gtk::Widget>,
@@ -1812,70 +1301,6 @@ impl Window {
             .collect()
     }
 
-    /// Replaces the text between two marks with a link to `target`, and deletes the marks. A link
-    /// without a label the owner chose shows its target's title, which the editor removes again
-    /// when it commits.
-    fn insert_link(
-        &self,
-        start: &gtk::TextMark,
-        end: &gtk::TextMark,
-        target: Id,
-        label: Option<String>,
-    ) {
-        let w = self.clone();
-        let state = self.inner().state.clone();
-        let (start, end) = (start.clone(), end.clone());
-        let open = self.inner().editor.borrow().as_ref().map(|e| e.note);
-        glib::spawn_future_local(async move {
-            let link = if let Some(label) = label {
-                body::wikilink(target, Some(&label))
-            } else {
-                let titles = core(async move { state.titles(&[target]).await }).await;
-                w.titled_link(target, titles.get(&target).cloned().unwrap_or_default())
-            };
-            w.place_link(&start, &end, &link, open);
-        });
-    }
-
-    /// A link to `target` that shows `title`, which the editor remembers giving it.
-    fn titled_link(&self, target: Id, title: String) -> String {
-        let link = if title.is_empty() {
-            body::wikilink(target, None)
-        } else {
-            format!("[[{target}|{}]]", body::escape_label(&title))
-        };
-        if let Some(editor) = self.inner().editor.borrow_mut().as_mut() {
-            editor.shown.remember(target, &title);
-            editor.titles.insert(target, title);
-        }
-        link
-    }
-
-    /// Replaces the text between two marks with `link`, and deletes the marks. Returns whether it
-    /// did, which it doesn't once a note other than `open` has the editor.
-    fn place_link(
-        &self,
-        start: &gtk::TextMark,
-        end: &gtk::TextMark,
-        link: &str,
-        open: Option<Id>,
-    ) -> bool {
-        let buffer = &self.inner().buffer;
-        let mut from = buffer.iter_at_mark(start);
-        let mut to = buffer.iter_at_mark(end);
-        buffer.delete_mark(start);
-        buffer.delete_mark(end);
-        if self.inner().editor.borrow().as_ref().map(|e| e.note) != open {
-            return false;
-        }
-        buffer.begin_user_action();
-        buffer.delete(&mut from, &mut to);
-        buffer.insert(&mut from, link);
-        buffer.end_user_action();
-        buffer.place_cursor(&from);
-        true
-    }
-
     /// Fills the popover of notes that link to the open note.
     fn show_backlinks(&self, button: &gtk::MenuButton) {
         let list = gtk::ListBox::new();
@@ -1931,20 +1356,6 @@ impl Window {
         });
     }
 
-    /// Opens the wikilink or web link under a point in the editor. Returns whether there was one.
-    fn open_link_at(&self, x: f64, y: f64) -> bool {
-        let view = &self.inner().view;
-        #[allow(clippy::cast_possible_truncation)]
-        let (bx, by) =
-            view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-        let Some(iter) = view.iter_at_location(bx, by) else { return false };
-        let text = editor::text(&self.inner().buffer);
-        let byte = editor::byte_at(&text, iter.offset());
-        let Some(target) = link_at(&text, byte) else { return false };
-        self.open_link(target);
-        true
-    }
-
     fn open_link(&self, target: LinkTarget) {
         match target {
             LinkTarget::Note(note) => self.open_uri(&format!("zib:note/{note}")),
@@ -1964,11 +1375,7 @@ impl Window {
 
     /// Moves the open note to another space, once its pending edits are in the document.
     fn move_note(&self) {
-        let pending = self.inner().editor.borrow_mut().as_mut().and_then(|e| e.timer.take());
-        if let Some(timer) = pending {
-            timer.remove();
-            self.commit();
-        }
+        self.report_body_edited();
         let Some((space, note)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
         else {
             return;
@@ -2105,7 +1512,7 @@ fn arrow_keys(list: &gtk::ListBox) -> gtk::EventControllerKey {
     keys
 }
 
-/// The same table references serve both editors, including drawings and links in nested cells.
+/// Resolves drawing images and linked titles throughout a table, including nested cells.
 async fn table_refs(state: Arc<State>, table: &zib_core::body::ListTable) -> tables::Refs {
     let targets = tables::link_targets(table);
     let drawings = tables::drawings(table);
@@ -2122,53 +1529,6 @@ async fn table_refs(state: Arc<State>, table: &zib_core::body::ListTable) -> tab
     .await
 }
 
-/// Draws math, a diagram, or an embedded image for the editor, at its natural size. Math that
-/// can't be drawn keeps its source in the line; a block that can't shows its source and the error.
-async fn draw(state: Arc<State>, drawing: Drawing) -> Option<gtk::Widget> {
-    let (kind, source) = match drawing {
-        Drawing::InlineMath(source) => (Kind::InlineMath, source),
-        Drawing::DisplayMath(source) => (Kind::DisplayMath, source),
-        Drawing::Diagram(source) => (Kind::Mermaid, source),
-        Drawing::Embed(target) => return embedded_image(state, target).await,
-        Drawing::Table(table) => {
-            let refs = table_refs(state, &table).await;
-            return Some(tables::widget(&table, &refs));
-        }
-    };
-    let shown = source.clone();
-    match core(async move { state.render(kind, source).await }).await {
-        Ok(image) => {
-            let texture = gdk::Texture::from_bytes(&glib::Bytes::from(&image.png)).ok()?;
-            let picture = gtk::Picture::for_paintable(&texture);
-            picture.set_can_shrink(true);
-            picture.set_size_request(
-                i32::try_from(image.width).unwrap_or(1),
-                i32::try_from(image.height).unwrap_or(1),
-            );
-            Some(picture.upcast())
-        }
-        Err(_) if kind == Kind::InlineMath => None,
-        Err(error) => {
-            let label = gtk::Label::builder()
-                .label(format!("{}\n{error}", shown.trim()))
-                .xalign(0.0)
-                .build();
-            label.add_css_class("error");
-            label.add_css_class("monospace");
-            Some(label.upcast())
-        }
-    }
-}
-
-/// The picture of an image note, for an embed of it. Embeds of other notes stay links.
-async fn embedded_image(state: Arc<State>, target: Id) -> Option<gtk::Widget> {
-    let texture = embedded_texture(state, target).await?;
-    let picture = gtk::Picture::for_paintable(&texture);
-    picture.set_can_shrink(true);
-    picture.set_size_request(texture.width(), texture.height());
-    Some(picture.upcast())
-}
-
 /// The original image, fetching its blob when this machine doesn't hold it yet.
 async fn embedded_texture(state: Arc<State>, target: Id) -> Option<gdk::Texture> {
     let path = core(async move {
@@ -2183,7 +1543,7 @@ async fn embedded_texture(state: Arc<State>, target: Id) -> Option<gdk::Texture>
     gdk::Texture::from_filename(&path).ok()
 }
 
-/// Adds a clipboard image through the same file-note path as the existing editor.
+/// Adds a clipboard image as a note in the current space.
 async fn pasted_image(
     state: Arc<State>,
     space: Id,

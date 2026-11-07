@@ -10,7 +10,27 @@ use zib_core::sync::Selection;
 
 use super::{EditorWidget, Line, caret_rect, image_rect, selection_rects, source_rect};
 
+/// Stable machine colors, kept in the same order as the original editor's palette.
+const COLORS: [(u8, u8, u8); 6] = [
+    (0xe0, 0x1b, 0x24),
+    (0x1a, 0x5f, 0xb4),
+    (0x26, 0xa2, 0x69),
+    (0x91, 0x41, 0xac),
+    (0xc6, 0x46, 0x00),
+    (0x1c, 0x71, 0xd8),
+];
+
+fn color(machine: Id) -> gdk::RGBA {
+    let sum: usize = machine.as_bytes().iter().map(|b| usize::from(*b)).sum();
+    let (r, g, b) = COLORS[sum % COLORS.len()];
+    gdk::RGBA::new(f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0)
+}
+
 impl EditorWidget {
+    pub fn is_live(&self) -> bool {
+        self.imp().editor.borrow().as_ref().is_some_and(zib_core::editor::Editor::is_live)
+    }
+
     pub fn session(&self) -> u64 {
         self.imp().session.get()
     }
@@ -63,7 +83,7 @@ pub(super) fn draw(
     selections: &[RemoteSelection],
 ) {
     for remote in selections {
-        let color = crate::remote::color(remote.machine, 1.0);
+        let color = color(remote.machine);
         // Composite the union once: an image can overlap its visual row's selection rectangle.
         snapshot.push_opacity(0.25);
         for rect in rects(lines, &remote.selection.range()) {

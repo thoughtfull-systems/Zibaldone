@@ -4,18 +4,14 @@
 pub mod adding;
 pub mod app;
 pub mod derive;
-pub mod drawings;
-pub mod editor;
 pub mod editor_widget;
 pub mod icon;
 pub mod instance;
-pub mod remote;
 pub mod sharing;
 pub mod state;
 pub mod status;
 pub mod tables;
 pub mod tray;
-pub mod view;
 pub mod window;
 
 use zib_core::Channel;

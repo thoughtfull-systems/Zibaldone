@@ -91,7 +91,7 @@ fn picture(kind: Kind, source: &str, refs: &Refs) -> Option<gtk::Widget> {
     let (width, height) = (f64::from(image.width), f64::from(image.height));
     let scale = match kind {
         Kind::Mermaid => (f64::from(MAX_DIAGRAM_WIDTH) / width).min(1.0),
-        Kind::DisplayMath | Kind::InlineMath => crate::drawings::math_scale(&picture),
+        Kind::DisplayMath | Kind::InlineMath => crate::editor_widget::math_scale(&picture),
     };
     #[allow(clippy::cast_possible_truncation)]
     let (width, height) = ((width * scale).round() as i32, (height * scale).round() as i32);

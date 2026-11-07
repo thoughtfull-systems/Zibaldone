@@ -2,9 +2,6 @@
 //! the core's `Editor` holds the text and the selection and makes every edit. Each line of the
 //! text is a Pango paragraph. The widget answers what depends on how lines wrap, such as the place
 //! one line down, and turns keys, clicks, and the input method's text into the core's commands.
-//!
-//! It shows a note while `ZIB_EDITOR=new` is set in the development build, until it does
-//! everything the text view does.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -41,11 +38,6 @@ const SYNTAX: (f64, f64, f64, f64) = (0.5, 0.5, 0.5, 0.9);
 const LINK: (f64, f64, f64, f64) = (0.21, 0.52, 0.89, 1.0);
 const HIGHLIGHT: (f64, f64, f64, f64) = (0.96, 0.83, 0.18, 0.45);
 const SHADE: (f64, f64, f64, f64) = (0.5, 0.5, 0.5, 0.15);
-
-/// Whether the development build shows notes in this editor.
-pub fn enabled() -> bool {
-    !cfg!(feature = "production") && std::env::var("ZIB_EDITOR").is_ok_and(|v| v == "new")
-}
 
 /// A line of the text, with hidden syntax left out and link titles drawn in its place.
 pub struct Line {
@@ -762,7 +754,7 @@ impl EditorWidget {
             &ImageContext {
                 available: wrap - pad - inset,
                 display: shown,
-                math_scale: crate::drawings::math_scale(self),
+                math_scale: math_scale(self),
                 renders: &imp.drawings.borrow(),
                 text,
                 textures: &imp.images.borrow(),
@@ -1576,6 +1568,27 @@ fn style_markers(
     }
 }
 
+/// Math shows at 1.21 times the editor's font size; the renderer uses 20 pixels.
+pub(crate) fn math_scale(widget: &impl IsA<gtk::Widget>) -> f64 {
+    let font = widget.pango_context().font_description().unwrap_or_default();
+    let size = f64::from(font.size()) / f64::from(pango::SCALE);
+    let pixels = if font.is_size_absolute() { size } else { size * 96.0 / 72.0 };
+    pixels * 1.21 / 20.0
+}
+
+/// The color of a heading of `level`: a hue from the GNOME palette for each of the first four
+/// levels, purple, blue, green, and orange, in a darker shade on a light background and a lighter
+/// one on a dark background. Deeper levels share the fourth's.
+fn heading_color(level: u8, dark: bool) -> &'static str {
+    let (light, dark_shade) = match level {
+        1 => ("#813d9c", "#dc8add"),
+        2 => ("#1a5fb4", "#99c1f1"),
+        3 => ("#26a269", "#8ff0a4"),
+        _ => ("#c64600", "#ffbe6f"),
+    };
+    if dark { dark_shade } else { light }
+}
+
 fn units(pixels: f64) -> i32 {
     #[allow(clippy::cast_possible_truncation)]
     let units = (pixels * f64::from(pango::SCALE)).round() as i32;
@@ -1736,7 +1749,7 @@ fn attributes_of(look: Look, dark: bool) -> Vec<pango::Attribute> {
                 3 => 1.2,
                 _ => 1.0,
             };
-            let color = gdk::RGBA::parse(crate::editor::heading_color(level, dark))
+            let color = gdk::RGBA::parse(heading_color(level, dark))
                 .map_or((0.0, 0.0, 0.0, 1.0), |c| {
                     (f64::from(c.red()), f64::from(c.green()), f64::from(c.blue()), 1.0)
                 });

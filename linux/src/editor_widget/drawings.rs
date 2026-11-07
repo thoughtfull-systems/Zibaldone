@@ -103,7 +103,7 @@ pub(super) fn append(
     let (content, w, h) = match resource {
         Resource::Image(texture, size) => {
             let math = matches!(drawing.source, Drawing::InlineMath(_) | Drawing::DisplayMath(_));
-            let scale = if math { crate::drawings::math_scale(widget) } else { 1.0 };
+            let scale = if math { crate::editor_widget::math_scale(widget) } else { 1.0 };
             let w = f64::from(size.width) * scale;
             let h = f64::from(size.height) * scale;
             let fit = (available / w.max(1.0)).min(1.0);
