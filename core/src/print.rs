@@ -213,7 +213,20 @@ impl Writer<'_> {
         rows: &[Vec<Vec<Block>>],
     ) {
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
-        let _ = write!(self.out, "#table(columns: {columns}, align: (");
+        // The Linux editor's table style: borders and header shading in the text's color at a
+        // quarter and 6% opacity on white, and padding of 6 and 10 pixels, at 0.75pt a pixel.
+        let _ = write!(
+            self.out,
+            concat!(
+                "#table(columns: {columns}, stroke: 0.75pt + luma(191), ",
+                "inset: (x: 7.5pt, y: 4.5pt), ",
+                "fill: (x, y) => if y < {header_rows} or x < {header_columns} {{ luma(240) }}, ",
+                "align: ("
+            ),
+            columns = columns,
+            header_rows = header_rows,
+            header_columns = header_columns
+        );
         for column in 0..columns {
             self.out.push_str(match alignments.get(column) {
                 Some(Alignment::Center) => "center, ",
