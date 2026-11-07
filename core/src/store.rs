@@ -2,7 +2,7 @@
 //! settings, the pet names of its spaces, and each space's saved document.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,9 @@ const DOCUMENT: &str = "document.loro";
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct MachineConfig {
+    /// Agent preferences and credentials belong to this machine alone.
+    #[serde(default)]
+    pub agent: crate::agent::Settings,
     pub id: Id,
     /// The machine's own name, which it gives itself when it joins a space.
     pub name: String,
@@ -156,6 +159,7 @@ impl Store {
                 .map_err(|e| Error::Space(format!("{}: {e}", path.display())))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = MachineConfig {
+                    agent: crate::agent::Settings::default(),
                     id: Id::generate(),
                     name: default_name(),
                     relay: None,
@@ -343,7 +347,15 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
 /// Writes a file through a temporary file and a rename, so a crash never leaves half of it.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension("tmp");
-    let mut file = File::create(&temporary).map_err(|e| Error::io(&temporary, e))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|e| Error::io(&temporary, e))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::io(&temporary, e))?;
     file.write_all(bytes).map_err(|e| Error::io(&temporary, e))?;
     file.sync_all().map_err(|e| Error::io(&temporary, e))?;
     fs::rename(&temporary, path).map_err(|e| Error::io(path, e))
@@ -374,6 +386,28 @@ mod tests {
         assert_eq!(config(&format!(r#", "page": {saved}"#)).page, chosen);
         let half = config(r#", "page": {"paper": "a5", "margin-x": 10.0, "margin-y": 15.0}"#);
         assert_eq!(half.page, Page::default());
+    }
+
+    #[test]
+    fn agent_settings_stay_local_and_credentials_are_private_and_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(root.path());
+        let mut store = Store::open(&dirs, Policy::All).unwrap();
+        store.config.agent = crate::agent::Settings {
+            api_key: "private-test-credential".into(),
+            model: "chosen-model".into(),
+            system_prompt_note: Some(Id::generate()),
+        };
+        store.save().unwrap();
+        let reopened = Store::open(&dirs, Policy::All).unwrap();
+        assert_eq!(reopened.config.agent, store.config.agent);
+        assert!(!format!("{:?}", reopened.config).contains("private-test-credential"));
+        let mode = fs::metadata(dirs.data.join(MACHINE)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let mut old_config = serde_json::to_value(&store.config).unwrap();
+        old_config.as_object_mut().unwrap().remove("agent");
+        let old: MachineConfig = serde_json::from_value(old_config).unwrap();
+        assert_eq!(old.agent, crate::agent::Settings::default());
     }
 
     #[test]

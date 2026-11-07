@@ -66,6 +66,13 @@ fn startup(app: &adw::Application, state: Arc<State>) {
     glib::spawn_future_local(async move {
         while let Ok(event) = receiver.recv().await {
             match event {
+                UiEvent::AgentDestination { title, reply } => {
+                    if let Some(window) = window.borrow().clone() {
+                        crate::chat::request_destination(window, state.clone(), title, reply);
+                    } else {
+                        let _ = reply.send(None);
+                    }
+                }
                 UiEvent::Activate(uri) => {
                     let shown = window.borrow().clone();
                     let shown = if let Some(shown) = shown {

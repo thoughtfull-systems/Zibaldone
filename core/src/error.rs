@@ -5,6 +5,9 @@ use std::path::PathBuf;
 /// A failure in the core.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// An agent request or its local session failed.
+    #[error("agent: {0}")]
+    Agent(String),
     /// Text that should hold an identifier, an address, or a link doesn't.
     #[error("invalid {what}: {text:?}")]
     Invalid { what: &'static str, text: String },

@@ -4,6 +4,7 @@
 //! feature, so the apps only draw screens and connect platform services.
 
 pub mod address;
+pub mod agent;
 pub mod base32;
 pub mod body;
 pub mod channel;

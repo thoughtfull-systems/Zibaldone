@@ -179,6 +179,7 @@ mod imp {
 
     #[derive(Default)]
     pub struct EditorWidget {
+        pub read_only: Cell<bool>,
         pub asked_drawings: RefCell<HashSet<Drawing>>,
         pub(super) drawings: RefCell<drawings::Resources>,
         pub(super) table_views: RefCell<Vec<tables::View>>,
@@ -273,6 +274,11 @@ impl Default for EditorWidget {
 }
 
 impl EditorWidget {
+    /// A conversation message still allows selection, copying, and opening links.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.imp().read_only.set(read_only);
+    }
+
     /// Shows `editor`'s text, or nothing.
     pub fn set_editor(&self, editor: Option<Editor>) {
         let imp = self.imp();
@@ -477,6 +483,9 @@ impl EditorWidget {
 
     /// Modifier-assisted input commits literal text, bypassing structural typing shortcuts.
     fn commit_text(&self, text: &str, state: gdk::ModifierType) {
+        if self.imp().read_only.get() {
+            return;
+        }
         let modifiers = state & gtk::accelerator_get_default_mod_mask();
         if (modifiers - gdk::ModifierType::SHIFT_MASK).is_empty() {
             self.type_text(text);
@@ -502,9 +511,7 @@ impl EditorWidget {
 
     /// Shows edits that arrived from elsewhere.
     pub fn refresh(&self) {
-        let scrolled = self
-            .ancestor(gtk::ScrolledWindow::static_type())
-            .and_then(|s| s.downcast::<gtk::ScrolledWindow>().ok());
+        let scrolled = self.own_scroller();
         let anchor = self.head().and_then(|head| {
             let (_, y, height) = caret_rect(&self.imp().lines.borrow(), head)?;
             let adjustment = scrolled.as_ref()?.vadjustment();
@@ -797,9 +804,7 @@ impl EditorWidget {
     /// Keeps the text's baseline at the selection in place while an image rises above its source.
     /// Changes elsewhere above the selection keep the view focused on the same text too.
     fn relayout(&self) {
-        let scrolled = self
-            .ancestor(gtk::ScrolledWindow::static_type())
-            .and_then(|s| s.downcast::<gtk::ScrolledWindow>().ok());
+        let scrolled = self.own_scroller();
         let anchor = self.head().and_then(|head| {
             let lines = self.imp().lines.borrow();
             let line = line_at(&lines, head)?;
@@ -823,6 +828,26 @@ impl EditorWidget {
         if let (Some(scrolled), Some((y, screen_y))) = (scrolled, caret) {
             self.restore_view(&scrolled, y - screen_y);
         }
+    }
+
+    /// A conversation contains several editors in one scroll area. Only its direct content may
+    /// change the adjustment's extent or add space to preserve an editing position.
+    fn own_scroller(&self) -> Option<gtk::ScrolledWindow> {
+        let (scrolled, content) = self.scroll_parent()?;
+        (content == self.clone().upcast::<gtk::Widget>()).then_some(scrolled)
+    }
+
+    fn scroll_parent(&self) -> Option<(gtk::ScrolledWindow, gtk::Widget)> {
+        let scrolled = self
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())?;
+        let child = scrolled.child()?;
+        let content = if let Some(viewport) = child.downcast_ref::<gtk::Viewport>() {
+            viewport.child()?
+        } else {
+            child
+        };
+        Some((scrolled, content))
     }
 
     /// Scrolling cannot go before the start of a note. Move its origin when necessary, so a
@@ -1116,9 +1141,7 @@ impl EditorWidget {
         let before = editor.text().to_owned();
         let head = editor.selection().head;
         let images = images_through(&self.imp().lines.borrow(), head);
-        let viewport = self
-            .ancestor(gtk::ScrolledWindow::static_type())
-            .and_then(|s| s.downcast::<gtk::ScrolledWindow>().ok());
+        let viewport = self.own_scroller();
         let anchor = viewport.as_ref().and_then(|scrolled| {
             let (_, y, height) = caret_rect(&self.imp().lines.borrow(), head)?;
             let adjustment = scrolled.vadjustment();
@@ -1176,13 +1199,19 @@ impl EditorWidget {
     }
 
     fn scroll_to_cursor(&self) {
-        let Some(scrolled) = self.ancestor(gtk::ScrolledWindow::static_type()) else { return };
-        let Some(scrolled) = scrolled.downcast_ref::<gtk::ScrolledWindow>() else { return };
+        let Some((scrolled, content)) = self.scroll_parent() else { return };
         let Some(head) = self.imp().editor.borrow().as_ref().map(|e| e.selection().head) else {
             return;
         };
         let lines = self.imp().lines.borrow();
         let Some((_, y, height)) = caret_rect(&lines, head) else { return };
+        // Message coordinates are local to the message; the adjustment belongs to the whole chat.
+        #[allow(clippy::cast_possible_truncation)]
+        let Some(position) = self.compute_point(&content, &graphene::Point::new(0.0, y as f32))
+        else {
+            return;
+        };
+        let y = f64::from(position.y());
         let adjustment = scrolled.vadjustment();
         if y < adjustment.value() {
             adjustment.set_value(y);
@@ -1209,6 +1238,30 @@ impl EditorWidget {
         let modifiers = state & gtk::accelerator_get_default_mod_mask();
         let control = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+        if self.imp().read_only.get()
+            && !matches!(
+                key,
+                gdk::Key::Left
+                    | gdk::Key::KP_Left
+                    | gdk::Key::Right
+                    | gdk::Key::KP_Right
+                    | gdk::Key::Home
+                    | gdk::Key::KP_Home
+                    | gdk::Key::End
+                    | gdk::Key::KP_End
+                    | gdk::Key::Up
+                    | gdk::Key::KP_Up
+                    | gdk::Key::Down
+                    | gdk::Key::KP_Down
+                    | gdk::Key::Page_Up
+                    | gdk::Key::KP_Page_Up
+                    | gdk::Key::Page_Down
+                    | gdk::Key::KP_Page_Down
+            )
+            && !(control && matches!(key, gdk::Key::a | gdk::Key::c | gdk::Key::Insert))
+        {
+            return glib::Propagation::Stop;
+        }
         if modifiers.contains(gdk::ModifierType::ALT_MASK) {
             return glib::Propagation::Proceed;
         }
@@ -1323,6 +1376,9 @@ impl EditorWidget {
     }
 
     fn paste(&self, clipboard: &gdk::Clipboard) {
+        if self.imp().read_only.get() {
+            return;
+        }
         let target = self.imp().editor.borrow().as_ref().map(|editor| PasteTarget {
             session: self.imp().session.get(),
             selection: editor.edit_target(),
@@ -1372,6 +1428,7 @@ impl EditorWidget {
         let plain = gesture.current_event_state() & gtk::accelerator_get_default_mod_mask();
         if gesture.current_button() == gdk::BUTTON_PRIMARY
             && plain.is_empty()
+            && !self.imp().read_only.get()
             && let Some(at) = self.box_at(x, y)
         {
             self.imp().on_box.set(true);
@@ -2337,6 +2394,46 @@ mod tests {
 
     pub(super) fn head(widget: &EditorWidget) -> usize {
         widget.head().unwrap_or_default()
+    }
+
+    #[test]
+    fn conversation_messages_allow_selection_but_reject_edits_and_undo() {
+        let Some(widget) = widget("A message| with **markdown**") else { return };
+        let original = widget.text().unwrap();
+        widget.set_read_only(true);
+        widget.commit_text("Typing", gdk::ModifierType::empty());
+        for key in [gdk::Key::BackSpace, gdk::Key::Delete, gdk::Key::Return] {
+            widget.key(key, gdk::ModifierType::empty());
+        }
+        for key in [gdk::Key::v, gdk::Key::x, gdk::Key::z] {
+            widget.key(key, gdk::ModifierType::CONTROL_MASK);
+        }
+        assert_eq!(widget.text().as_deref(), Some(original.as_str()));
+        widget.key(gdk::Key::a, gdk::ModifierType::CONTROL_MASK);
+        assert_eq!(widget.imp().editor.borrow().as_ref().unwrap().selected_text(), original);
+    }
+
+    #[test]
+    fn chat_messages_do_not_pad_the_shared_history_when_link_titles_refresh() {
+        let Some(widget) = widget("|A short agent reply.") else { return };
+        widget.set_read_only(true);
+        let history = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        let earlier = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        earlier.set_height_request(1200);
+        history.append(&earlier);
+        history.append(&widget);
+        let scrolled = gtk::ScrolledWindow::builder().child(&history).build();
+        let before = widget.measure(gtk::Orientation::Vertical, 360).1;
+        let adjustment = scrolled.vadjustment();
+        adjustment.configure(1200.0, 0.0, 2000.0, 10.0, 400.0, 480.0);
+        for _ in 0..4 {
+            // Label resolution runs asynchronously after each streamed message update.
+            widget.set_titles(HashMap::new());
+            assert_eq!(widget.measure(gtk::Orientation::Vertical, 360).1, before);
+            assert_eq!(widget.imp().bottom_space.get(), 0.0);
+            assert_eq!(widget.imp().top_space.get(), 0.0);
+            assert_eq!(adjustment.upper(), 2000.0);
+        }
     }
 
     fn has_image_source(widget: &EditorWidget) -> bool {

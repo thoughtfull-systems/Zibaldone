@@ -284,6 +284,17 @@ impl Space {
         Ok(id)
     }
 
+    /// Finishes a durable agent reservation without replacing an existing or deleted note.
+    pub fn create_reserved_note(&mut self, id: Id, type_name: &str, body: &str) -> Result<()> {
+        if self.note(id).is_ok() {
+            return Ok(());
+        }
+        if self.tombstone(id).is_some() {
+            return Err(crate::Error::NotFound(format!("reserved note {id} was deleted")));
+        }
+        self.create_note_with_id(id, type_name, body)
+    }
+
     fn create_note_with_id(&mut self, id: Id, type_name: &str, body: &str) -> Result<()> {
         if !schema::is_name(type_name) {
             return Err(Error::invalid("type name", type_name));

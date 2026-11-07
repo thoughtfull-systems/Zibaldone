@@ -3,10 +3,12 @@
 
 pub mod adding;
 pub mod app;
+pub mod chat;
 pub mod derive;
 pub mod editor_widget;
 pub mod icon;
 pub mod instance;
+pub mod settings;
 pub mod sharing;
 pub mod state;
 pub mod status;

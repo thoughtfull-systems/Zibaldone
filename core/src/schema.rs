@@ -150,9 +150,10 @@ pub struct TypeDef {
 }
 
 /// The names of the built-in types.
-pub const NOTE: &str = "note";
+pub const AGENT_TRANSCRIPT: &str = "agent-transcript";
 pub const FILE: &str = "file";
 pub const IMAGE: &str = "image";
+pub const NOTE: &str = "note";
 
 /// The types this release defines, as the built-in types specification lists them.
 pub fn built_in() -> Vec<TypeDef> {
@@ -160,7 +161,7 @@ pub fn built_in() -> Vec<TypeDef> {
         list.into_iter().map(|(name, def)| (name.to_owned(), def)).collect()
     };
     vec![
-        TypeDef { name: NOTE.into(), fields: BTreeMap::new() },
+        TypeDef { name: AGENT_TRANSCRIPT.into(), fields: BTreeMap::new() },
         TypeDef {
             name: FILE.into(),
             fields: fields(vec![
@@ -176,6 +177,7 @@ pub fn built_in() -> Vec<TypeDef> {
                 ("thumbnail", FieldDef::derived("thumbnail", "image", SearchMode::None).preview()),
             ]),
         },
+        TypeDef { name: NOTE.into(), fields: BTreeMap::new() },
     ]
 }
 

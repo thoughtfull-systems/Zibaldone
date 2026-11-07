@@ -71,6 +71,12 @@ baseline. The picture moves up by a text line to make room. The inline position 
 of whichever is wider, the picture or the source, so following text moves right or wraps when the
 source needs more room. A missing or unreadable picture keeps the link text.
 
+## `agent-transcript`
+
+An archived agent conversation, as the [agent specification](agent.md#transcripts) defines it. It
+has no fields and no preview. Its title comes from its body's first line, as for every note. The
+owner can edit, move, and delete it like an ordinary note. It can't become a live agent session.
+
 ## Platforms
 
 No platform differs in the types it defines. Which derivations each platform runs is in the

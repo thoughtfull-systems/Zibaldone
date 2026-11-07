@@ -33,6 +33,7 @@ const REPORT_PAUSE: Duration = Duration::from_secs(3);
 pub struct Window(Rc<Inner>);
 
 pub struct Inner {
+    chat: crate::chat::Chat,
     state: Arc<State>,
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
@@ -108,6 +109,7 @@ impl Window {
         menu.append(Some("Share space…"), Some("win.share-space"));
         menu.append(Some("Move note to space…"), Some("win.move-note"));
         menu.append(Some("Move notes to space…"), Some("win.move-notes"));
+        menu.append(Some("Settings…"), Some("win.settings"));
         menu.append(Some("Add machine…"), Some("win.add-machine"));
         menu.append(Some("Quit"), Some("app.quit"));
         let menu_button =
@@ -145,6 +147,9 @@ impl Window {
         let title = adw::WindowTitle::new("", "");
         let content_header = adw::HeaderBar::new();
         content_header.set_title_widget(Some(&title));
+        let chat_toggle = gtk::Button::from_icon_name("user-available-symbolic");
+        chat_toggle.set_tooltip_text(Some("Show or hide AI chat (Ctrl+Tab)"));
+        content_header.pack_end(&chat_toggle);
         let open_file = gtk::Button::from_icon_name("document-open-symbolic");
         open_file.set_tooltip_text(Some("Open the file"));
         open_file.set_visible(false);
@@ -201,11 +206,19 @@ impl Window {
         let split = adw::NavigationSplitView::new();
         split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Notes")));
         split.set_content(Some(&adw::NavigationPage::new(&content, "Note")));
+        let chat = crate::chat::Chat::new(state.clone());
+        let panes = gtk::Paned::new(gtk::Orientation::Horizontal);
+        panes.set_start_child(Some(&split));
+        panes.set_end_child(Some(chat.widget()));
+        panes.set_resize_end_child(false);
+        panes.set_shrink_end_child(false);
+        panes.set_position(720);
         let toasts = adw::ToastOverlay::new();
-        toasts.set_child(Some(&split));
+        toasts.set_child(Some(&panes));
         window.set_content(Some(&toasts));
 
         let this = Self(Rc::new(Inner {
+            chat,
             state,
             window,
             toasts,
@@ -234,6 +247,9 @@ impl Window {
             body_timer: RefCell::default(),
         }));
         this.connect(&new_note, &add_file, &delete);
+        this.inner().chat.connect(this.clone());
+        let w = this.clone();
+        chat_toggle.connect_clicked(move |_| w.inner().chat.toggle());
         this.connect_files();
         let widget = &this.inner().widget;
         let w = this.clone();
@@ -310,14 +326,15 @@ impl Window {
         });
         let actions = gio::SimpleActionGroup::new();
         for (name, handler) in [
-            ("new-space", Self::new_space as fn(&Self)),
-            ("rename-space", Self::rename_space as fn(&Self)),
             ("add-machine", Self::add_machine as fn(&Self)),
-            ("share-space", |w: &Self| crate::sharing::share(w, w.inner().state.clone())),
             ("move-note", Self::move_note),
             ("move-notes", |w: &Self| crate::sharing::move_all(w, w.inner().state.clone())),
+            ("new-space", Self::new_space),
             ("print", |w: &Self| w.print(false)),
             ("print-linked", |w: &Self| w.print(true)),
+            ("rename-space", Self::rename_space),
+            ("settings", |w: &Self| crate::settings::show(w, w.inner().state.clone())),
+            ("share-space", |w: &Self| crate::sharing::share(w, w.inner().state.clone())),
         ] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
@@ -347,6 +364,14 @@ impl Window {
         let w = self.clone();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
             let modifiers = modifiers & gtk::accelerator_get_default_mod_mask();
+            if modifiers == gdk::ModifierType::CONTROL_MASK && key == gdk::Key::Tab {
+                if w.inner().chat.has_focus() {
+                    w.inner().widget.grab_focus();
+                } else {
+                    w.inner().chat.focus();
+                }
+                return glib::Propagation::Stop;
+            }
             if modifiers != gdk::ModifierType::ALT_MASK {
                 return glib::Propagation::Proceed;
             }
@@ -523,6 +548,7 @@ impl Window {
 
     /// Something in a space changed through sync or a derivation.
     pub fn space_changed(&self, space: Id) {
+        self.inner().chat.refresh_resources(self);
         if !self.inner().spaces.borrow().iter().any(|(id, _, _)| *id == space) {
             self.reload_spaces();
             return;
@@ -1401,6 +1427,137 @@ impl Window {
 
     pub fn gtk_window(&self) -> gtk::Window {
         self.inner().window.clone().upcast()
+    }
+
+    pub(crate) fn agent_context(&self) -> Option<zib_core::agent::Context> {
+        let editor = self.inner().editor.borrow();
+        Some(zib_core::agent::Context {
+            id: editor.as_ref()?.note,
+            title: self.inner().title.title().to_string(),
+        })
+    }
+
+    /// Connects the same link, image, table, and drawing features for detached markdown editors.
+    pub(crate) fn connect_aux_editor(&self, widget: &EditorWidget, editable: bool) {
+        let w = self.clone();
+        widget.connect_open_link(move |target| w.open_link(target));
+        if !editable {
+            return;
+        }
+        let (w, editing) = (self.clone(), widget.clone());
+        widget.connect_pick_link(move |range| {
+            let Some(text) = editing.text() else { return };
+            let Some(expected) = text.get(range.clone()).map(str::to_owned) else { return };
+            let (target, closed) = (editing.clone(), editing.clone());
+            let (range, expected) = (range.clone(), expected.clone());
+            w.show_link_picker(
+                &editing,
+                &editing.cursor_rectangle(),
+                move |id| {
+                    target.insert_link(range.clone(), &expected, id);
+                },
+                move || {
+                    closed.grab_focus();
+                },
+            );
+        });
+        let (w, editing) = (self.clone(), widget.clone());
+        widget.connect_paste_image(move |clipboard, target| {
+            let (w, editing) = (w.clone(), editing.clone());
+            glib::spawn_future_local(async move {
+                let Some(space) =
+                    crate::chat::choose_destination(&w, w.inner().state.clone(), "Pasted image")
+                        .await
+                else {
+                    return;
+                };
+                match pasted_image(w.inner().state.clone(), space, clipboard).await {
+                    Ok((note, _)) => {
+                        editing.insert_image(&target, note);
+                        w.reload_notes();
+                    }
+                    Err(error) => w.toast(&format!("Couldn't paste the image: {error}")),
+                }
+            });
+        });
+    }
+
+    pub(crate) fn refresh_aux_editor(&self, widget: &EditorWidget) {
+        self.aux_resources(widget, false);
+    }
+
+    pub(crate) fn reload_aux_editor(&self, widget: &EditorWidget) {
+        self.aux_resources(widget, true);
+    }
+
+    fn aux_resources(&self, widget: &EditorWidget, reload: bool) {
+        if reload {
+            widget.reload_tables();
+        }
+        let (widget, state) = (widget.clone(), self.inner().state.clone());
+        let text = widget.text().unwrap_or_default();
+        let session = widget.session();
+        let (labels, label_state) = (widget.clone(), state.clone());
+        glib::spawn_future_local(async move {
+            let targets: Vec<Id> = body::link_targets(&text).into_iter().collect();
+            let titles = core(async move { label_state.titles(&targets).await }).await;
+            if labels.session() == session && labels.text().as_deref() == Some(&text) {
+                labels.set_titles(titles);
+            }
+        });
+        let (generation, images) = widget.image_requests(reload);
+        for target in images {
+            let (widget, state) = (widget.clone(), state.clone());
+            glib::spawn_future_local(async move {
+                let preview = core({
+                    let state = state.clone();
+                    async move { state.image_preview(target).await }
+                })
+                .await
+                .and_then(|path| gdk::Texture::from_filename(path).ok());
+                if preview.is_some() {
+                    widget.set_image(generation, target, preview.clone());
+                }
+                let texture = embedded_texture(state, target).await;
+                widget.set_image(generation, target, texture.or(preview));
+            });
+        }
+        let (session, drawings) = widget.drawing_requests();
+        for drawing in drawings {
+            let (widget, state) = (widget.clone(), state.clone());
+            if let Drawing::Table(table) = &drawing {
+                let table = table.clone();
+                let revision = widget.table_revision();
+                glib::spawn_future_local(async move {
+                    let refs = table_refs(state, &table).await;
+                    widget.set_table(session, revision, drawing, refs);
+                });
+                continue;
+            }
+            let (kind, source) = match &drawing {
+                Drawing::InlineMath(s) => (Kind::InlineMath, s.clone()),
+                Drawing::DisplayMath(s) => (Kind::DisplayMath, s.clone()),
+                Drawing::Diagram(s) => (Kind::Mermaid, s.clone()),
+                _ => continue,
+            };
+            glib::spawn_future_local(async move {
+                let image = core(async move { state.render(kind, source).await }).await;
+                let result = image.map_err(|e| e.to_string()).and_then(|image| {
+                    let size = zib_core::editor::display::ImageSize {
+                        width: image.width,
+                        height: image.height,
+                    };
+                    gdk::Texture::from_bytes(&glib::Bytes::from(&image.png))
+                        .map(|texture| (texture, size))
+                        .map_err(|e| e.to_string())
+                });
+                widget.set_drawing(session, drawing, result);
+            });
+        }
+    }
+
+    pub(crate) fn agent_notes_changed(&self) {
+        self.reload_notes();
     }
 
     /// Shows the sync status in the header, every few seconds.

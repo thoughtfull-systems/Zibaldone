@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, oneshot};
 use zib_core::address::{Address, MachineKey};
+use zib_core::agent::Agent;
 use zib_core::channel::Dirs;
 use zib_core::files::{self, Blobs, GarbageRecords};
 use zib_core::net::{Nearby, Network, Node, OpenNote, Pairing};
@@ -22,6 +23,8 @@ use zib_core::sync::{Exchanged, SyncState};
 use zib_core::{Channel, Error, Id, Result, Space};
 
 use crate::derive;
+
+mod agent;
 
 /// The Linux app keeps every file, as decision ZIB0004 sets for it.
 pub const POLICY: Policy = Policy::All;
@@ -41,6 +44,8 @@ const UPKEEP_PERIOD: Duration = Duration::from_secs(60);
 /// What the instance tells the window.
 #[derive(Debug)]
 pub enum UiEvent {
+    /// An agent tool waits for the owner to choose a note's destination.
+    AgentDestination { title: String, reply: oneshot::Sender<Option<Id>> },
     /// Open the window, and a note if a URI names one.
     Activate(Option<String>),
     /// The owner asked to quit.
@@ -88,6 +93,7 @@ pub struct NoteRow {
 
 /// The running instance.
 pub struct State {
+    pub agent: Agent,
     pub channel: Channel,
     pub dirs: Dirs,
     pub store: Mutex<Store>,
@@ -228,6 +234,7 @@ impl State {
             state: std::sync::OnceLock::new(),
         });
         let state = Arc::new(Self {
+            agent: Agent::open(&dirs.data)?,
             channel,
             renderer: Renderer::new(dirs.cache.join("rendered")),
             dirs,
@@ -1204,6 +1211,8 @@ impl State {
 
     /// Syncs what it can within 10 seconds, saves every space, and closes the endpoint.
     pub async fn finish(self: &Arc<Self>) {
+        self.agent.stop();
+        let _ = self.agent.save();
         // Everything goes to disk first, so nothing waits on the network to be safe.
         self.save_dirty().await;
         let _ = tokio::time::timeout(QUIT_SYNC, self.start_exchanges(true)).await;
