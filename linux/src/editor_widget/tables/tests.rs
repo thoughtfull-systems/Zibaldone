@@ -104,6 +104,17 @@ fn identical_tables_get_distinct_native_children_and_note_switches_remove_them()
 }
 
 #[test]
+fn small_tables_start_at_the_left_margin() {
+    for text in ["| h |\n|---|\n| 1 |\n\nend", "```table\n- - h\n```\n\nend"] {
+        let Some((editor, _window)) = editor(text, 600) else { return };
+        let grid = grids(&editor).remove(0);
+        let bounds = grid.compute_bounds(&editor).unwrap();
+        assert!(bounds.width() < 300.0);
+        assert!((bounds.x() - 24.0).abs() < 0.01, "{text}: {}", bounds.x());
+    }
+}
+
+#[test]
 fn narrow_tables_fit_and_scaled_cell_hit_testing_selects_the_right_source() {
     let text = concat!(
         "| h | h | h | h | h | h | h | h |\n",

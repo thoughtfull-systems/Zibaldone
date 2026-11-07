@@ -89,7 +89,7 @@ pub(super) fn collapse(line: &mut Line, drawing: &display::Drawing) {
     }
 }
 
-/// Adds a preview below this line, centered in the width left after its original source's inset.
+/// Adds a preview below this line, at the left of the width left after its original source's inset.
 /// Errors use their own wrapped layout and never enter the editable source or its undo history.
 pub(super) fn append(
     widget: &super::EditorWidget,
@@ -128,7 +128,7 @@ pub(super) fn append(
             (Content::Table(layout), w, h)
         }
     };
-    let x = origin - line.left + (available - w) / 2.0;
+    let x = origin - line.left;
     #[allow(clippy::cast_possible_truncation)]
     let rect = graphene::Rect::new(x as f32, (line.height + PAD) as f32, w as f32, h as f32);
     line.blocks.push(Block {

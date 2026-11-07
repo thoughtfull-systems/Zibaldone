@@ -95,7 +95,9 @@ fn blocks_collapse_their_lines_and_stay_below_revealed_source() {
     let block = &line.blocks[0];
     let natural = f64::from(block.rect.width());
     assert_eq!(natural, 480.0);
-    assert!(line.left + f64::from(block.rect.x()) > 44.0);
+    let (_, marker) = line.layout.index_to_line_x(2, false);
+    assert!((f64::from(block.rect.x()) - crate::editor_widget::pixels(marker)).abs() < 0.01);
+    assert!(block.rect.x() > 0.0);
     assert!(line.left + f64::from(block.rect.x() + block.rect.width()) <= 576.01);
     let entry = widget.text().unwrap().find("flowchart").unwrap();
     assert_eq!(block.cursor, entry);
@@ -193,6 +195,20 @@ fn moving_into_a_drawn_block_reveals_its_source_for_editing() {
         e.insert("z");
     });
     assert!(widget.text().unwrap().contains("\nzx+y\n"));
+}
+
+#[test]
+fn narrow_diagrams_and_block_math_start_at_the_left_margin() {
+    for text in ["```mermaid\na-->b\n```\n\n|end", "$$\nx^2\n$$\n\n|end"] {
+        let Some(widget) = widget(text) else { return };
+        supply(&widget, ImageSize { width: 100, height: 50 });
+        widget.lay_out(600);
+        let lines = widget.imp().lines.borrow();
+        let line = &lines[0];
+        let block = &line.blocks[0];
+        assert!(block.rect.width() < 300.0);
+        assert!((line.left + f64::from(block.rect.x()) - 24.0).abs() < 0.01);
+    }
 }
 
 #[test]
