@@ -74,13 +74,15 @@ pub struct PairedMachine {
 pub struct Page {
     /// A paper size by Typst's name for it, such as `a4` or `us-letter`.
     pub paper: String,
-    /// The margin on every side, in millimetres.
-    pub margin: f64,
+    /// The margin on the left and right, in millimetres.
+    pub margin_x: f64,
+    /// The margin on the top and bottom, in millimetres.
+    pub margin_y: f64,
 }
 
 impl Default for Page {
     fn default() -> Self {
-        Self { paper: "a4".into(), margin: 20.0 }
+        Self { paper: "us-letter".into(), margin_x: 12.7, margin_y: 25.4 }
     }
 }
 

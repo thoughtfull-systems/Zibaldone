@@ -77,9 +77,10 @@ impl Writer<'_> {
     fn preamble(&mut self, page: &Page) {
         let _ = writeln!(
             self.out,
-            "#set page(paper: {}, margin: {}mm, numbering: \"1\")",
+            "#set page(paper: {}, margin: (x: {}mm, y: {}mm), numbering: \"1\")",
             string(&page.paper),
-            page.margin
+            page.margin_x,
+            page.margin_y
         );
         let _ = writeln!(self.out, "#set text(font: \"Libertinus Serif\", size: {TEXT_SIZE}pt)");
         self.out.push_str(concat!(
