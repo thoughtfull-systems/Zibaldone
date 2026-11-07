@@ -12,6 +12,7 @@ use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
+use typst::visualize::{ExchangeFormat, RasterImage};
 use typst::{Library, LibraryExt, World};
 use typst_kit::fonts::{self, FontStore};
 use typst_layout::PagedDocument;
@@ -325,8 +326,13 @@ impl Writer<'_> {
                 "image/webp" => "webp",
                 _ => "png",
             };
+            let width = image_width(data, media);
             let path = self.file(extension, data.clone());
-            let _ = write!(self.out, "#align(center, image({}))", string(&path));
+            // Inline at the size the editor shows, sitting on the baseline, and no wider than
+            // the line.
+            let width = width.map_or("auto".into(), |w| format!("calc.min({w:.2}pt, size.width)"));
+            let _ =
+                write!(self.out, "#box(layout(size => image({}, width: {width})))", string(&path));
             return;
         }
         self.out.push_str("#box(stroke: 0.5pt + luma(160), inset: 4pt, radius: 2pt)[");
@@ -370,6 +376,19 @@ fn string(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The width of an image note's file, in points, as the editor shows it: a pixel for each of its
+/// pixels, whatever resolution the file records, at three quarters of a point.
+fn image_width(data: &[u8], media: &str) -> Option<f64> {
+    let pixels = if media == "image/svg+xml" {
+        let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default()).ok()?;
+        f64::from(tree.size().width())
+    } else {
+        let format = ExchangeFormat::detect(data)?;
+        f64::from(RasterImage::plain(Bytes::new(data.to_vec()), format).ok()?.width())
+    };
+    Some(pixels * 0.75)
 }
 
 /// The width of an SVG image, in points. usvg measures in pixels, three quarters of a point.
@@ -473,9 +492,26 @@ mod tests {
             "---\n",
         ]
         .concat();
+        let image = Id::generate();
+        let body = format!("{body}\nAn image ![[{image}]] in a line.\n");
         let mut refs = Refs::default();
         refs.titles.insert(target, "Other **note**".into());
+        refs.images.insert(image, (png(40, 20), "image/png".into()));
         let pdf = pdf(&[body, "Second note".into()], &refs, &Page::default()).unwrap();
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn images_print_at_the_size_the_editor_shows() {
+        assert_eq!(image_width(&png(40, 20), "image/png"), Some(30.0));
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="10"/>"#;
+        assert_eq!(image_width(svg, "image/svg+xml"), Some(60.0));
+        assert_eq!(image_width(b"not an image", "image/png"), None);
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).unwrap();
+        pixmap.fill(resvg::tiny_skia::Color::BLACK);
+        pixmap.encode_png().unwrap()
     }
 }
