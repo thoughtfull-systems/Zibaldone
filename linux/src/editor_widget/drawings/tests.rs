@@ -15,6 +15,48 @@ fn supply(widget: &EditorWidget, size: ImageSize) -> Drawing {
 }
 
 #[test]
+fn superseded_render_textures_are_released_while_the_note_stays_open() {
+    let Some(widget) = widget("$x$\n|end") else { return };
+    let mut versions = Vec::new();
+    for version in 0..8 {
+        widget.edit(|e| {
+            // Keep the drawing occurrence, changing only its expression.
+            let end = e.text()[1..].find('$').unwrap() + 1;
+            e.select(1, end);
+            e.insert(&format!("x_{version}"));
+        });
+        let (session, requests) = widget.drawing_requests();
+        assert_eq!(requests.len(), 1);
+        let texture = texture(64, 64);
+        versions.push(texture.downgrade());
+        widget.set_drawing(
+            session,
+            requests[0].clone(),
+            Ok((texture, ImageSize { width: 64, height: 64 })),
+        );
+    }
+    assert_eq!(versions.iter().filter(|v| v.upgrade().is_some()).count(), 1);
+    widget.edit(|e| {
+        assert!(e.undo());
+    });
+    assert!(versions.last().unwrap().upgrade().is_some(), "undo keeps the pending preview");
+    let (session, requests) = widget.drawing_requests();
+    assert_eq!(requests, vec![Drawing::InlineMath("x_6".into())]);
+    widget.set_drawing(
+        session,
+        requests[0].clone(),
+        Ok((texture(64, 64), ImageSize { width: 64, height: 64 })),
+    );
+    assert!(versions.iter().all(|v| v.upgrade().is_none()));
+    widget.edit(|e| {
+        e.select_all();
+        e.insert("plain text");
+    });
+    assert!(widget.imp().drawings.borrow().is_empty());
+    assert_eq!(widget.imp().asked_drawings.borrow().len(), 0);
+}
+
+#[test]
 fn inline_math_uses_natural_size_and_reveals_its_exact_source() {
     let Some(widget) = widget("before $x^2$ after\n|end") else { return };
     let source = supply(&widget, ImageSize { width: 60, height: 30 });

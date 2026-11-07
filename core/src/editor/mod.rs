@@ -9,7 +9,7 @@ pub mod display;
 pub mod presence;
 mod tables;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -271,6 +271,16 @@ impl Editor {
             .collect()
     }
 
+    /// Current sources and the settled previews still needed while their replacements render.
+    /// The platform can release every other result, including superseded in-flight results.
+    pub fn drawing_keys(&self) -> HashSet<Drawing> {
+        self.previews
+            .iter()
+            .flat_map(|preview| std::iter::once(&preview.source).chain(preview.settled.as_ref()))
+            .cloned()
+            .collect()
+    }
+
     /// Targets whose images the app can load, including embeds with explicit captions.
     pub fn image_targets(&self) -> Vec<Id> {
         let mut targets: Vec<Id> = body::wikilinks(&self.text)
@@ -295,6 +305,12 @@ impl Editor {
     /// Inserts an embed where a paste started, as one undo step. Changes within the remembered
     /// selection cancel the paste rather than replacing text that arrived since it started.
     pub fn insert_image(&mut self, target: &EditTarget, image: Id) -> bool {
+        self.paste(target, &format!("!{}", body::wikilink(image, None)))
+    }
+
+    /// Pastes at the original selection, following edits around it. Changes within the selection
+    /// cancel the paste instead of replacing newer text. Each paste is one undo step.
+    pub fn paste(&mut self, target: &EditTarget, text: &str) -> bool {
         self.refresh();
         let selection = match &target.cursors {
             Some((anchor, head)) => {
@@ -310,7 +326,7 @@ impl Editor {
             return false;
         }
         self.place(selection);
-        self.replace(range, &format!("!{}", body::wikilink(image, None)), true);
+        self.replace(range, text, true);
         true
     }
 
@@ -785,6 +801,8 @@ impl Editor {
                 source: drawn.drawing,
             });
         }
+        let retained = self.drawing_keys();
+        self.drawings.retain(|drawing, _| retained.contains(drawing));
     }
 
     /// An undo creates a redo step, and a redo creates an undo step. Each remembers the selection

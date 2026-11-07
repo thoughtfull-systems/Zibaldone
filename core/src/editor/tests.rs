@@ -386,6 +386,28 @@ fn a_pending_image_paste_follows_edits_around_its_selection() {
 }
 
 #[test]
+fn delayed_text_pastes_follow_the_original_selection_and_leave_changed_source_alone() {
+    let mut e = editor("before |café| after");
+    let target = e.edit_target();
+    e.move_to(e.text().len(), false);
+    e.insert("!");
+    assert!(e.paste(&target, "tea"));
+    assert_eq!(e.text(), "before tea after!");
+    assert!(e.undo());
+    assert_eq!(e.text(), "before café after!");
+    assert_eq!(e.selected_text(), "café");
+    assert!(e.undo());
+    assert_eq!(e.text(), "before café after");
+
+    let start = e.text().find("café").unwrap();
+    e.select(start, start + "café".len());
+    let target = e.edit_target();
+    e.insert("changed");
+    assert!(!e.paste(&target, "stale clipboard"));
+    assert_eq!(e.text(), "before changed after");
+}
+
+#[test]
 fn moves_onto_images_at_their_source_edges_and_selects_them_whole() {
     let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
     let text = format!("before ![[{id}]] after");
@@ -786,6 +808,25 @@ fn table_availability_collapses_source_and_survives_pending_cell_edits() {
     e.move_to(e.text().len(), false);
     assert!(e.display().drawings[0].collapsed());
     assert_eq!(e.display().paragraphs(e.text()).len(), 2);
+}
+
+#[test]
+fn superseded_render_metadata_is_released_without_losing_the_pending_preview() {
+    let mut e = editor("$x|$\nend");
+    let size = display::ImageSize { width: 64, height: 64 };
+    let mut previous = e.drawing_targets()[0].clone();
+    e.set_drawing(previous.clone(), display::Rendered::Image(size));
+    for version in 0..8 {
+        let end = e.text()[1..].find('$').unwrap() + 1;
+        e.select(1, end);
+        e.insert(&format!("x_{version}"));
+        assert_eq!(e.display().drawings[0].preview.as_ref(), Some(&previous));
+        let current = e.drawing_targets()[0].clone();
+        e.set_drawing(current.clone(), display::Rendered::Image(size));
+        assert_eq!(e.drawings.len(), 1);
+        assert_eq!(e.display().drawings[0].preview.as_ref(), Some(&current));
+        previous = current;
+    }
 }
 
 #[test]

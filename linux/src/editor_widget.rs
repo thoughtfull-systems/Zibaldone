@@ -107,7 +107,7 @@ struct Layout<'a> {
     wrap: f64,
 }
 
-/// Where an image paste started, including which open editor it belongs to.
+/// Where a paste started, including which open editor it belongs to.
 pub struct PasteTarget {
     session: u64,
     selection: EditTarget,
@@ -629,6 +629,7 @@ impl EditorWidget {
     fn lay_out(&self, width: i32) -> i32 {
         let imp = self.imp();
         if imp.laid_width.get() != width || imp.lines.borrow().is_empty() {
+            self.prune_drawings();
             imp.laid_width.set(width);
             let editor = imp.editor.borrow();
             let text = editor.as_ref().map_or("", |e| e.text());
@@ -693,6 +694,15 @@ impl EditorWidget {
         #[allow(clippy::cast_possible_truncation)]
         let height = (bottom + MARGIN_BOTTOM + imp.bottom_space.get()).ceil() as i32;
         height
+    }
+
+    /// Keep current sources and the previous results that still appear while replacements render.
+    /// Evicted requests can run again after undo, and late results don't accumulate in the cache.
+    fn prune_drawings(&self) {
+        let imp = self.imp();
+        let retained = imp.editor.borrow().as_ref().map(Editor::drawing_keys).unwrap_or_default();
+        imp.drawings.borrow_mut().retain(|drawing, _| retained.contains(drawing));
+        imp.asked_drawings.borrow_mut().retain(|drawing| retained.contains(drawing));
     }
 
     fn layout_line(
@@ -1313,24 +1323,31 @@ impl EditorWidget {
     }
 
     fn paste(&self, clipboard: &gdk::Clipboard) {
-        if image_only(clipboard.formats()) {
-            let target = self.imp().editor.borrow().as_ref().map(|editor| PasteTarget {
-                session: self.imp().session.get(),
-                selection: editor.edit_target(),
-            });
-            if let Some(target) = target
-                && let Some(paste) = self.imp().paste_image.borrow().as_ref()
-            {
-                paste((clipboard.clone(), target));
-                return;
-            }
+        let target = self.imp().editor.borrow().as_ref().map(|editor| PasteTarget {
+            session: self.imp().session.get(),
+            selection: editor.edit_target(),
+        });
+        let Some(target) = target else { return };
+        if image_only(clipboard.formats())
+            && let Some(paste) = self.imp().paste_image.borrow().as_ref()
+        {
+            paste((clipboard.clone(), target));
+            return;
         }
         let w = self.clone();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |text| {
             if let Ok(Some(text)) = text {
-                w.edit(|e| e.insert(&text));
+                w.paste_text(&target, &text);
             }
         });
+    }
+
+    fn paste_text(&self, target: &PasteTarget, text: &str) {
+        if target.session == self.session() {
+            self.edit(|e| {
+                e.paste(&target.selection, text);
+            });
+        }
     }
 
     fn pressed(&self, gesture: &gtk::GestureClick, count: i32, x: f64, y: f64) {
@@ -3078,6 +3095,19 @@ mod tests {
         widget.set_editor(Some(Editor::new(Body::detached("other note"))));
         widget.insert_image(&target, id);
         assert_eq!(widget.text().as_deref(), Some("other note"));
+    }
+
+    #[test]
+    fn delayed_text_pastes_leave_a_new_note_untouched() {
+        let Some(widget) = widget("first note|") else { return };
+        let target = PasteTarget {
+            session: widget.session(),
+            selection: widget.imp().editor.borrow().as_ref().unwrap().edit_target(),
+        };
+        widget.set_editor(Some(Editor::new(Body::detached("second note"))));
+        widget.paste_text(&target, "pasted ");
+        assert_eq!(widget.text().as_deref(), Some("second note"));
+        assert!(!widget.imp().editor.borrow().as_ref().unwrap().can_undo());
     }
 
     #[test]
