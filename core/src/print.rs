@@ -153,18 +153,15 @@ impl Writer<'_> {
                 Ok(svg) => {
                     let width = svg_width(&svg) * TEXT_SIZE / MATH_SIZE;
                     let path = self.file("svg", svg.into_bytes());
-                    let _ = write!(
-                        self.out,
-                        "#align(center, image({}, width: {width:.2}pt))",
-                        string(&path)
-                    );
+                    let _ =
+                        write!(self.out, "#block(image({}, width: {width:.2}pt))", string(&path));
                 }
                 Err(_) => self.code_text(source),
             },
             Block::Diagram(source) => match mermaid_svg(source) {
                 Ok(svg) => {
                     let path = self.file("svg", svg.into_bytes());
-                    let _ = write!(self.out, "#align(center, image({}))", string(&path));
+                    let _ = write!(self.out, "#block(image({}))", string(&path));
                 }
                 Err(_) => self.code_text(source),
             },
@@ -323,8 +320,7 @@ impl Writer<'_> {
         let width = svg_width(&svg) * TEXT_SIZE / MATH_SIZE;
         let path = self.file("svg", svg.into_bytes());
         if display {
-            let _ =
-                write!(self.out, "#align(center, image({}, width: {width:.2}pt))", string(&path));
+            let _ = write!(self.out, "#block(image({}, width: {width:.2}pt))", string(&path));
         } else {
             let _ = write!(
                 self.out,
