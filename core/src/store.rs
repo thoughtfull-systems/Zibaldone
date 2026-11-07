@@ -53,8 +53,9 @@ pub struct MachineConfig {
     /// describes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub paired: BTreeMap<Id, PairedMachine>,
-    /// The page that notes print on, which depends on the printer at hand.
-    #[serde(default)]
+    /// The page that notes print on, which depends on the printer at hand. Saved only when it
+    /// differs from the default, so a machine that never chose a page follows the default.
+    #[serde(default, skip_serializing_if = "Page::is_default")]
     pub page: Page,
 }
 
@@ -70,19 +71,56 @@ pub struct PairedMachine {
 
 /// The page that notes print on, a machine setting from decision ZIB0003.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(from = "StoredPage", rename_all = "kebab-case")]
 pub struct Page {
+    /// The margin on each side, in millimetres.
+    pub margin_bottom: f64,
+    pub margin_left: f64,
+    pub margin_right: f64,
+    pub margin_top: f64,
     /// A paper size by Typst's name for it, such as `a4` or `us-letter`.
     pub paper: String,
-    /// The margin on the left and right, in millimetres.
-    pub margin_x: f64,
-    /// The margin on the top and bottom, in millimetres.
-    pub margin_y: f64,
 }
 
 impl Default for Page {
     fn default() -> Self {
-        Self { paper: "us-letter".into(), margin_x: 12.7, margin_y: 25.4 }
+        Self {
+            margin_bottom: 25.4,
+            margin_left: 12.7,
+            margin_right: 12.7,
+            margin_top: 25.4,
+            paper: "us-letter".into(),
+        }
+    }
+}
+
+impl Page {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A page as saved. One without a margin for each side comes from before the sides had their
+/// own, when every machine saved the default of the time and nothing could change it, so it reads
+/// as today's default.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct StoredPage {
+    margin_bottom: Option<f64>,
+    margin_left: Option<f64>,
+    margin_right: Option<f64>,
+    margin_top: Option<f64>,
+    paper: String,
+}
+
+impl From<StoredPage> for Page {
+    fn from(stored: StoredPage) -> Self {
+        match (stored.margin_bottom, stored.margin_left, stored.margin_right, stored.margin_top) {
+            (Some(margin_bottom), Some(margin_left), Some(margin_right), Some(margin_top)) => {
+                Self { margin_bottom, margin_left, margin_right, margin_top, paper: stored.paper }
+            }
+            _ => Self::default(),
+        }
     }
 }
 
@@ -315,6 +353,28 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::schema;
+
+    #[test]
+    fn page_follows_the_default_unless_chosen() {
+        let config = |page: &str| -> MachineConfig {
+            let json = format!(r#"{{"id": "{}", "name": "m"{page}}}"#, Id::generate());
+            serde_json::from_str(&json).unwrap()
+        };
+        let old = config(r#", "page": {"paper": "a4", "margin": 20.0}"#);
+        assert_eq!(old.page, Page::default());
+        assert!(!serde_json::to_string(&old).unwrap().contains("page"));
+        let chosen = Page {
+            margin_bottom: 1.0,
+            margin_left: 2.0,
+            margin_right: 3.0,
+            margin_top: 4.0,
+            paper: "a5".into(),
+        };
+        let saved = serde_json::to_string(&chosen).unwrap();
+        assert_eq!(config(&format!(r#", "page": {saved}"#)).page, chosen);
+        let half = config(r#", "page": {"paper": "a5", "margin-x": 10.0, "margin-y": 15.0}"#);
+        assert_eq!(half.page, Page::default());
+    }
 
     #[test]
     fn keeps_identity_spaces_and_keys() {
