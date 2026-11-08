@@ -239,6 +239,15 @@ mod imp {
     }
 
     impl WidgetImpl for EditorWidget {
+        fn root(&self) {
+            self.parent_root();
+            // The editor scrolls to its caret. GTK would scroll to the whole widget's top when
+            // focus returns from another pane, since it doesn't know where the caret is.
+            if let Some(viewport) = self.obj().parent().and_downcast::<gtk::Viewport>() {
+                viewport.set_scroll_to_focus(false);
+            }
+        }
+
         fn request_mode(&self) -> gtk::SizeRequestMode {
             gtk::SizeRequestMode::HeightForWidth
         }
@@ -573,6 +582,11 @@ impl EditorWidget {
             entered.focus_in();
             if let Some(w) = w.upgrade() {
                 w.queue_draw();
+                glib::idle_add_local_once(move || {
+                    if w.is_focus() {
+                        w.scroll_to_cursor();
+                    }
+                });
             }
         });
         let w = self.downgrade();
@@ -2444,6 +2458,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn returning_focus_keeps_the_scrolled_caret_in_view() {
+        let text = format!("{}Caret|\n{}", "Earlier line\n".repeat(80), "Later line\n".repeat(40));
+        let Some(note) = widget(&text) else { return };
+        let Some(draft) = widget("Chat draft|") else { return };
+        gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
+        let scrolled = gtk::ScrolledWindow::builder().child(&note).vexpand(true).build();
+        let panes = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        panes.append(&scrolled);
+        panes.append(&draft);
+        let window = gtk::Window::builder().child(&panes).default_width(600).build();
+        window.present();
+        allocate_viewport(&scrolled, 600, 300);
+        assert!(note.grab_focus());
+        note.scroll_to_cursor();
+        let adjustment = scrolled.vadjustment();
+        let before = adjustment.value();
+        let at = head(&note);
+        assert!(before > 0.0);
+        for _ in 0..3 {
+            assert!(draft.grab_focus());
+            assert!(note.grab_focus());
+            allocate_viewport(&scrolled, 600, 300);
+            assert!(note.is_focus());
+            assert_eq!(head(&note), at);
+            assert_eq!(adjustment.value(), before);
+        }
+        assert!(draft.grab_focus());
+        adjustment.set_value(0.0);
+        assert!(note.grab_focus());
+        allocate_viewport(&scrolled, 600, 300);
+        let (_, y, height) = caret_rect(&note.imp().lines.borrow(), at).unwrap();
+        assert_eq!(head(&note), at);
+        assert!(y >= adjustment.value());
+        assert!(y + height <= adjustment.value() + adjustment.page_size());
+        window.destroy();
     }
 
     #[test]
