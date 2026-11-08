@@ -372,6 +372,17 @@ impl State {
         self.store.lock().await.set_last_space(space)
     }
 
+    /// A deleted note or a space no longer held cannot reopen.
+    pub async fn last_note(&self) -> Option<(Id, Id)> {
+        let last = self.store.lock().await.config.last_note?;
+        self.note(last.space, last.note).await.ok()?;
+        Some((last.space, last.note))
+    }
+
+    pub async fn remember_note(&self, space: Id, note: Id) -> Result<()> {
+        self.store.lock().await.set_last_note(space, note)
+    }
+
     pub async fn create_space(&self, name: &str) -> Result<Id> {
         let mut store = self.store.lock().await;
         let mut space = store.create_space(name)?;

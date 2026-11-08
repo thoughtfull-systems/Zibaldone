@@ -39,8 +39,16 @@ pub struct Image {
     pub height: u32,
 }
 
+/// The font size of math SVGs, whose dimensions are in points.
+const MATH_FONT_SIZE: f64 = 20.0;
 /// The scale at which images are drawn.
 const SCALE: f32 = 2.0;
+
+/// Scales the renderer's natural pixel dimensions to a surrounding text size, in pixels or points.
+/// SVG points become pixels at 96 pixels per inch, so undo that conversion before scaling the em.
+pub fn math_scale(text_size: f64) -> f64 {
+    text_size * 0.75 / MATH_FONT_SIZE
+}
 
 /// Draws math and diagrams and keeps the results in `dir`.
 #[derive(Clone, Debug)]
@@ -88,7 +96,7 @@ pub fn math_svg(source: &str, display: bool) -> Result<String> {
     validate_layout(&laid_out).map_err(Error::Render)?;
     let list = to_display_list(&laid_out);
     let options = ratex_svg::SvgOptions {
-        font_size: 20.0,
+        font_size: MATH_FONT_SIZE,
         padding: 2.0,
         embed_glyphs: true,
         ..ratex_svg::SvgOptions::default()

@@ -85,6 +85,8 @@ fn startup(app: &adw::Application, state: Arc<State>) {
                     shown.present();
                     if let Some(uri) = uri {
                         shown.open_uri(&uri);
+                    } else {
+                        shown.restore_last_note();
                     }
                 }
                 UiEvent::Quit => app.quit(),

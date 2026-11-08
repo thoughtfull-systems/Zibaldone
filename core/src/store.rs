@@ -49,6 +49,9 @@ pub struct MachineConfig {
     /// against what other members hold.
     #[serde(default)]
     pub peers: BTreeMap<Id, Vec<u64>>,
+    /// The note last opened on this machine, restored when its window opens again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_note: Option<LastNote>,
     /// The space that the owner last put a note into, where new notes go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_space: Option<Id>,
@@ -60,6 +63,13 @@ pub struct MachineConfig {
     /// differs from the default, so a machine that never chose a page follows the default.
     #[serde(default, skip_serializing_if = "Page::is_default")]
     pub page: Page,
+}
+
+/// The last open note and the space that holds it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LastNote {
+    pub note: Id,
+    pub space: Id,
 }
 
 /// A machine this one paired with.
@@ -167,6 +177,7 @@ impl Store {
                     versions: BTreeMap::new(),
                     last_synced: BTreeMap::new(),
                     peers: BTreeMap::new(),
+                    last_note: None,
                     last_space: None,
                     page: Page::default(),
                     paired: BTreeMap::new(),
@@ -291,6 +302,16 @@ impl Store {
         self.save()
     }
 
+    /// Records a successfully opened note without changing the destination for new notes.
+    pub fn set_last_note(&mut self, space: Id, note: Id) -> Result<()> {
+        let last = Some(LastNote { note, space });
+        if self.config.last_note == last {
+            return Ok(());
+        }
+        self.config.last_note = last;
+        self.save()
+    }
+
     /// Records a machine that this one paired with, or updates its name.
     pub fn add_paired(&mut self, party: &Party) -> Result<()> {
         let entry = PairedMachine {
@@ -365,6 +386,22 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::schema;
+
+    #[test]
+    fn last_open_note_defaults_to_none_and_survives_reopening_the_machine_store() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(root.path());
+        let mut store = Store::open(&dirs, Policy::All).unwrap();
+        assert_eq!(store.config.last_note, None);
+        let space = Id::generate();
+        let note = Id::generate();
+        store.set_last_note(space, note).unwrap();
+        let reopened = Store::open(&dirs, Policy::All).unwrap();
+        assert_eq!(reopened.config.last_note, Some(LastNote { note, space }));
+        let old = format!(r#"{{"id":"{}","name":"old"}}"#, store.config.id);
+        let old: MachineConfig = serde_json::from_str(&old).unwrap();
+        assert_eq!(old.last_note, None);
+    }
 
     #[test]
     fn page_follows_the_default_unless_chosen() {

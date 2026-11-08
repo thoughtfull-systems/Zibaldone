@@ -61,6 +61,17 @@ it.
 - **Tray icon.** The icon uses the StatusNotifierItem interface over D-Bus, which Waybar's tray
   shows. The owner's desktop, sway on Wayland with Waybar, is the one Linux desktop the app targets.
 
+## The last open note
+
+The machine's `machine.json` configuration can hold `last-note`, an object with `note` and `space`.
+Both values are canonical identifiers as text. The instance records this object after the window
+opens a note. This setting stays on the machine and uses the build channel's data directory.
+
+When the owner opens an empty window without a note URI, the window reopens the recorded note if
+this machine still holds it. A deleted note or an unavailable space leaves the window empty. An
+explicit request to open a note takes precedence over restoration. Closing the window keeps the
+recorded note for the next opening.
+
 ## The `zib` command
 
 The `zib` command never opens a space or the machine store itself. For each command, it:

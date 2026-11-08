@@ -4,6 +4,7 @@ use zib_core::editor::{Body, Editor};
 
 use super::*;
 use crate::editor_widget::drawings::Content;
+use crate::editor_widget::tests::allocate_viewport;
 
 fn editor(text: &str, width: i32) -> Option<(EditorWidget, gtk::Window)> {
     adw::init().ok()?;
@@ -80,10 +81,20 @@ fn pipe_and_list_tables_use_the_existing_grid_headers_and_cell_selection() {
         assert_eq!(selected(&editor), "a");
         assert_eq!(grids(&editor)[0], grid);
         assert!(editor.imp().lines.borrow().len() >= 5);
-        editor.key(gdk::Key::Tab, gdk::ModifierType::empty());
-        assert_eq!(selected(&editor), "b");
-        editor.key(gdk::Key::ISO_Left_Tab, gdk::ModifierType::SHIFT_MASK);
-        assert_eq!(selected(&editor), "a");
+        if text.starts_with('|') {
+            editor.key(gdk::Key::Tab, gdk::ModifierType::empty());
+            assert_eq!(selected(&editor), "b");
+            editor.key(gdk::Key::ISO_Left_Tab, gdk::ModifierType::SHIFT_MASK);
+            assert_eq!(selected(&editor), "a");
+        } else {
+            click_label(&editor, &grid, "b");
+            editor.key(gdk::Key::ISO_Left_Tab, gdk::ModifierType::SHIFT_MASK);
+            assert!(editor.text().unwrap().contains("\n- b"));
+            assert_eq!(selected(&editor), "b");
+            editor.key(gdk::Key::Tab, gdk::ModifierType::empty());
+            assert_eq!(editor.text().as_deref(), Some(text));
+            assert_eq!(selected(&editor), "b");
+        }
     }
 }
 
@@ -115,6 +126,33 @@ fn small_tables_start_at_the_left_margin() {
 }
 
 #[test]
+fn entering_and_leaving_a_table_near_the_title_does_not_extend_the_document() {
+    for table in ["| header |\n|---|\n| value |", "```table\n- - header\n- - value\n```"] {
+        let text = format!("# Title\n\n{table}\n\nend");
+        let Some((editor, window)) = editor(&text, 600) else { return };
+        window.set_child(None::<&gtk::Widget>);
+        let scrolled = gtk::ScrolledWindow::builder().child(&editor).build();
+        allocate_viewport(&scrolled, 600, 700);
+        let height = editor.lay_out(600);
+        let title_y = editor.imp().lines.borrow()[0].y;
+        let adjustment = scrolled.vadjustment();
+        adjustment.configure(0.0, 0.0, f64::from(height), 10.0, 680.0, 700.0);
+        for _ in 0..4 {
+            let grid = grids(&editor).remove(0);
+            click_label(&editor, &grid, "value");
+            editor.scroll_to_cursor();
+            assert_eq!(editor.imp().lines.borrow()[0].y, title_y);
+            editor.edit(|e| e.move_to(text.len(), false));
+            editor.scroll_to_cursor();
+            assert_eq!(editor.imp().lines.borrow()[0].y, title_y);
+            assert_eq!(editor.lay_out(600), height);
+            assert_eq!(adjustment.value(), 0.0);
+        }
+        assert_eq!(editor.text().as_deref(), Some(text.as_str()));
+    }
+}
+
+#[test]
 fn narrow_tables_fit_and_scaled_cell_hit_testing_selects_the_right_source() {
     let text = concat!(
         "| h | h | h | h | h | h | h | h |\n",
@@ -140,8 +178,6 @@ fn nested_pipe_and_list_table_cells_select_the_inner_source() {
         let grid = grids(&editor).remove(0);
         click_label(&editor, &grid, "value");
         assert_eq!(selected(&editor), "value");
-        editor.key(gdk::Key::ISO_Left_Tab, gdk::ModifierType::SHIFT_MASK);
-        assert_eq!(selected(&editor), "inner");
     }
 }
 

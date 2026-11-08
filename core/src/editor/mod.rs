@@ -7,7 +7,6 @@
 
 pub mod display;
 pub mod presence;
-mod tables;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -35,6 +34,29 @@ const TYPING_PAUSE: i64 = 1000;
 pub struct Selection {
     pub anchor: usize,
     pub head: usize,
+}
+
+/// Indenting preserves each line's suffix, including its content and newline. Map a selection
+/// through the changed prefixes, including indentation after block-quote markers.
+fn reindented_offset(before: &str, after: &str, at: usize) -> usize {
+    let (mut from, mut to) = (0, 0);
+    for (old, new) in before.split_inclusive('\n').zip(after.split_inclusive('\n')) {
+        if at <= from + old.len() {
+            let suffix =
+                old.bytes().rev().zip(new.bytes().rev()).take_while(|(a, b)| a == b).count();
+            let (removed, inserted) = (old.len() - suffix, new.len() - suffix);
+            let relative = at - from;
+            return to
+                + if relative < removed {
+                    relative.min(inserted)
+                } else {
+                    inserted + relative - removed
+                };
+        }
+        from += old.len();
+        to += new.len();
+    }
+    after.len()
 }
 
 /// A selection remembered while the app prepares a paste. Its cursors follow edits around it.
@@ -604,24 +626,46 @@ impl Editor {
         }
     }
 
-    /// Makes the edit that Enter, Shift+Enter, Tab, or Shift+Tab makes in a list item, as an undo
-    /// step of its own: a new item, a continuation line, or the item moved in or out a level.
-    /// Returns whether the cursor was in a list item, where the key needs nothing else. With a
-    /// selection, it isn't, and the key does what it does in other text.
+    /// Edits a list item as one undo step. Structural commands also accept a selection within one
+    /// item, such as the contents selected by clicking a drawn list-table cell.
     pub fn list_key(&mut self, key: ListKey) -> bool {
-        if !self.selection.is_empty() {
+        if !self.selection.is_empty() && matches!(key, ListKey::Enter | ListKey::ShiftEnter) {
             return false;
         }
-        let Some(edit) = list_edit(&self.text, self.selection.head, key) else { return false };
-        if !edit.range.is_empty() || !edit.text.is_empty() {
-            self.replace(edit.range, &edit.text, true);
-            let at = self.boundary(edit.cursor);
-            self.place(Selection::cursor(at));
+        let range = self.selection.range();
+        let Some(edit) = list_edit(&self.text, range.start, key) else { return false };
+        if edit.range.is_empty() && edit.text.is_empty() {
+            return true;
         }
+        let selection = if range.is_empty() {
+            Selection::cursor(edit.cursor)
+        } else {
+            if range.start < edit.range.start || range.end > edit.range.end {
+                return false;
+            }
+            let map = |at| {
+                if matches!(key, ListKey::MoveDown | ListKey::MoveUp) {
+                    edit.cursor + at - range.start
+                } else {
+                    edit.range.start
+                        + reindented_offset(
+                            &self.text[edit.range.clone()],
+                            &edit.text,
+                            at - edit.range.start,
+                        )
+                }
+            };
+            Selection { anchor: map(self.selection.anchor), head: map(self.selection.head) }
+        };
+        self.replace(edit.range, &edit.text, true);
+        self.place(Selection {
+            anchor: self.boundary(selection.anchor),
+            head: self.boundary(selection.head),
+        });
         true
     }
 
-    /// Table navigation precedes list indentation and accepts the selection left by the last Tab.
+    /// Pipe-table navigation precedes list indentation and accepts the last selected cell.
     pub fn table_key(&mut self, back: bool) -> bool {
         if let Some((edit, selected)) =
             crate::pipe_tables::table_edit(&self.text, self.selection.head, back)
@@ -633,11 +677,7 @@ impl Editor {
             }
             return true;
         }
-        let Some(selected) = tables::next_cell(&self.text, &self.selection.range(), back) else {
-            return false;
-        };
-        self.select(selected.start, selected.end);
-        true
+        false
     }
 
     /// Selects a drawn cell's current source, including a cell in a table nested inside it.

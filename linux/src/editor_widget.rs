@@ -191,10 +191,10 @@ mod imp {
         pub session: Cell<u64>,
         pub paste_image: Callback<(gtk::gdk::Clipboard, PasteTarget)>,
         pub lines: RefCell<Vec<Line>>,
-        /// Space at the document's edges lets a disappearing drawing leave the caret in place
-        /// even when scrolling alone would hit the start or end of the document.
-        pub bottom_space: Cell<f64>,
-        pub top_space: Cell<f64>,
+        /// The note's viewport controls its trailing scroll space, including after a resize.
+        pub scroll_adjustment: RefCell<Option<(gtk::Adjustment, glib::SignalHandlerId)>>,
+        /// The page height applied after the viewport finishes allocating.
+        pub viewport_height: Cell<f64>,
         /// The width the lines last laid out at.
         pub laid_width: Cell<i32>,
         pub im: RefCell<Option<gtk::IMMulticontext>>,
@@ -224,6 +224,9 @@ mod imp {
 
     impl ObjectImpl for EditorWidget {
         fn dispose(&self) {
+            if let Some((adjustment, handler)) = self.scroll_adjustment.borrow_mut().take() {
+                adjustment.disconnect(handler);
+            }
             while let Some(child) = self.obj().first_child() {
                 child.unparent();
             }
@@ -292,8 +295,6 @@ impl EditorWidget {
             child.unparent();
         }
         imp.table_views.borrow_mut().clear();
-        imp.bottom_space.set(0.0);
-        imp.top_space.set(0.0);
         *imp.editor.borrow_mut() = editor;
         self.rebuild_layout();
     }
@@ -656,7 +657,7 @@ impl EditorWidget {
             };
             tables::begin(self);
             let mut lines = Vec::new();
-            let mut y = MARGIN_TOP + imp.top_space.get();
+            let mut y = MARGIN_TOP;
             for paragraph in shown.paragraphs(text) {
                 let mut line = self.layout_line(&context, paragraph.range, y, lines.last());
                 if let Some(index) = paragraph.drawing {
@@ -699,7 +700,7 @@ impl EditorWidget {
         let lines = imp.lines.borrow();
         let bottom = lines.last().map_or(MARGIN_TOP, |line| line.y + line.height);
         #[allow(clippy::cast_possible_truncation)]
-        let height = (bottom + MARGIN_BOTTOM + imp.bottom_space.get()).ceil() as i32;
+        let height = (bottom + MARGIN_BOTTOM + self.end_space()).ceil() as i32;
         height
     }
 
@@ -831,7 +832,7 @@ impl EditorWidget {
     }
 
     /// A conversation contains several editors in one scroll area. Only its direct content may
-    /// change the adjustment's extent or add space to preserve an editing position.
+    /// change the adjustment's extent or add trailing scroll space.
     fn own_scroller(&self) -> Option<gtk::ScrolledWindow> {
         let (scrolled, content) = self.scroll_parent()?;
         (content == self.clone().upcast::<gtk::Widget>()).then_some(scrolled)
@@ -850,30 +851,58 @@ impl EditorWidget {
         Some((scrolled, content))
     }
 
-    /// Scrolling cannot go before the start of a note. Move its origin when necessary, so a
-    /// collapsed image moves earlier content down instead of pulling the caret up. Undo and
-    /// restored images reclaim that space. The same rule keeps the view stable near the end.
-    fn restore_view(&self, scrolled: &gtk::ScrolledWindow, requested: f64) {
-        let imp = self.imp();
-        let adjustment = scrolled.vadjustment();
-        let previous = imp.top_space.get();
-        let space = (previous - requested).max(0.0);
-        let shift = space - previous;
-        imp.top_space.set(space);
-        for line in imp.lines.borrow_mut().iter_mut() {
-            line.y += shift;
+    /// An 80% viewport buffer below a note keeps its last lines visible. Editors inside a chat's
+    /// shared history don't add space between messages.
+    fn end_space(&self) -> f64 {
+        let adjustment = self.own_scroller().map(|scrolled| scrolled.vadjustment());
+        let mut watched = self.imp().scroll_adjustment.borrow_mut();
+        if watched.as_ref().map(|(adjustment, _)| adjustment) != adjustment.as_ref() {
+            if let Some((adjustment, handler)) = watched.take() {
+                adjustment.disconnect(handler);
+            }
+            self.imp().viewport_height.set(0.0);
+            if let Some(adjustment) = &adjustment {
+                let weak = self.downgrade();
+                let handler = adjustment.connect_page_size_notify(move |adjustment| {
+                    if let Some(widget) = weak.upgrade() {
+                        widget.update_end_space_later(adjustment);
+                    }
+                });
+                *watched = Some((adjustment.clone(), handler));
+                self.update_end_space_later(adjustment);
+            }
         }
-        let target = (requested + shift).max(0.0);
-        let bottom = imp.lines.borrow().last().map_or(MARGIN_TOP + space, |l| l.y + l.height);
-        let height = bottom + MARGIN_BOTTOM;
-        let bottom_space =
-            if target > 0.0 { (target + adjustment.page_size() - height).max(0.0) } else { 0.0 };
-        imp.bottom_space.set(bottom_space);
-        adjustment.set_upper((height + imp.bottom_space.get()).max(adjustment.page_size()));
-        adjustment.set_value(target);
-        self.queue_resize();
-        self.queue_draw();
-        self.update_im_cursor();
+        self.imp().viewport_height.get() * 0.8
+    }
+
+    /// GTK can change the page size or first attach the adjustment while allocating the viewport.
+    /// Keep the old buffer until that allocation finishes, then invalidate the cached request.
+    fn update_end_space_later(&self, adjustment: &gtk::Adjustment) {
+        let adjustment = adjustment.clone();
+        let weak = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(widget) = weak.upgrade()
+                && widget
+                    .own_scroller()
+                    .is_some_and(|scrolled| scrolled.vadjustment() == adjustment)
+            {
+                let page = adjustment.page_size();
+                let previous = widget.imp().viewport_height.replace(page);
+                if (previous - page).abs() > f64::EPSILON {
+                    widget.queue_resize();
+                }
+            }
+        });
+    }
+
+    /// Keeps the editing position stable as far as the document's natural scroll range allows.
+    /// Revealing or hiding source must not add blank space above the note or grow its end buffer.
+    fn restore_view(&self, scrolled: &gtk::ScrolledWindow, requested: f64) {
+        let adjustment = scrolled.vadjustment();
+        let height = f64::from(self.lay_out(self.imp().laid_width.get()));
+        let upper = height.max(adjustment.page_size());
+        adjustment.set_upper(upper);
+        adjustment.set_value(requested.clamp(0.0, upper - adjustment.page_size()));
     }
 
     /// Lays the lines out again after the text changed, and redraws.
@@ -1293,7 +1322,14 @@ impl EditorWidget {
             gdk::Key::BackSpace => self.edit(|e| e.delete(word, back)),
             gdk::Key::Delete | gdk::Key::KP_Delete => self.edit(|e| e.delete(word, forward)),
             gdk::Key::Return | gdk::Key::KP_Enter => {
-                self.edit(|e| e.newline(shift));
+                if control {
+                    let key = if shift { ListKey::MoveUp } else { ListKey::MoveDown };
+                    self.edit(|e| {
+                        e.list_key(key);
+                    });
+                } else {
+                    self.edit(|e| e.newline(shift));
+                }
             }
             gdk::Key::Tab | gdk::Key::ISO_Left_Tab => {
                 let back = shift || key == gdk::Key::ISO_Left_Tab;
@@ -1642,12 +1678,12 @@ fn style_markers(
     }
 }
 
-/// Math shows at 1.21 times the editor's font size; the renderer uses 20 pixels.
+/// The core shares the same math scale between the editor and printing.
 pub(crate) fn math_scale(widget: &impl IsA<gtk::Widget>) -> f64 {
     let font = widget.pango_context().font_description().unwrap_or_default();
     let size = f64::from(font.size()) / f64::from(pango::SCALE);
     let pixels = if font.is_size_absolute() { size } else { size * 96.0 / 72.0 };
-    pixels * 1.21 / 20.0
+    zib_core::render::math_scale(pixels)
 }
 
 /// The color of a heading of `level`: a hue from the GNOME palette for each of the first four
@@ -2396,6 +2432,20 @@ mod tests {
         widget.head().unwrap_or_default()
     }
 
+    /// Completes the viewport's allocation and the deferred buffer update it schedules.
+    pub(super) fn allocate_viewport(scrolled: &gtk::ScrolledWindow, width: i32, height: i32) {
+        for _ in 0..2 {
+            scrolled.measure(gtk::Orientation::Horizontal, -1);
+            scrolled.measure(gtk::Orientation::Vertical, width);
+            scrolled.allocate(width, height, -1, None);
+            for _ in 0..100 {
+                if !glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+        }
+    }
+
     #[test]
     fn conversation_messages_allow_selection_but_reject_edits_and_undo() {
         let Some(widget) = widget("A message| with **markdown**") else { return };
@@ -2411,6 +2461,17 @@ mod tests {
         assert_eq!(widget.text().as_deref(), Some(original.as_str()));
         widget.key(gdk::Key::a, gdk::ModifierType::CONTROL_MASK);
         assert_eq!(widget.imp().editor.borrow().as_ref().unwrap().selected_text(), original);
+    }
+
+    #[test]
+    fn control_enter_moves_list_items_and_shift_control_enter_moves_them_back() {
+        let Some(widget) = widget("- first\n- second|\n- third") else { return };
+        let before = widget.text().unwrap();
+        widget.key(gdk::Key::Return, gdk::ModifierType::CONTROL_MASK);
+        assert_eq!(widget.text().as_deref(), Some("- first\n- third\n- second"));
+        widget
+            .key(gdk::Key::Return, gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+        assert_eq!(widget.text().as_deref(), Some(before.as_str()));
     }
 
     #[test]
@@ -2430,9 +2491,34 @@ mod tests {
             // Label resolution runs asynchronously after each streamed message update.
             widget.set_titles(HashMap::new());
             assert_eq!(widget.measure(gtk::Orientation::Vertical, 360).1, before);
-            assert_eq!(widget.imp().bottom_space.get(), 0.0);
-            assert_eq!(widget.imp().top_space.get(), 0.0);
             assert_eq!(adjustment.upper(), 2000.0);
+        }
+    }
+
+    #[test]
+    fn a_notes_end_buffer_tracks_the_viewport_and_keeps_text_onscreen() {
+        let Some(widget) = widget("# Title\n\nLast line|") else { return };
+        let natural = widget.measure(gtk::Orientation::Vertical, 600).1;
+        let title_y = widget.imp().lines.borrow()[0].y;
+        let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
+        for page in [180, 400, 180] {
+            allocate_viewport(&scrolled, 600, page);
+            let height = widget.measure(gtk::Orientation::Vertical, 600).1;
+            assert_eq!(height, natural + page * 4 / 5);
+            let adjustment = scrolled.vadjustment();
+            assert_eq!(adjustment.upper(), f64::from(height.max(page)));
+            adjustment.set_value(adjustment.upper());
+            let scroll = adjustment.value();
+            let bottom = {
+                let lines = widget.imp().lines.borrow();
+                let last = lines.last().unwrap();
+                last.y + last.height
+            };
+            assert!(bottom > scroll && bottom < scroll + f64::from(page));
+            widget.set_titles(HashMap::new());
+            assert_eq!(widget.measure(gtk::Orientation::Vertical, 600).1, height);
+            assert_eq!(widget.imp().lines.borrow()[0].y, title_y);
+            assert_eq!(adjustment.value(), scroll);
         }
     }
 
@@ -2443,6 +2529,55 @@ mod tests {
             .borrow()
             .iter()
             .any(|line| line.images.iter().any(|image| image.source_layout.is_some()))
+    }
+
+    #[test]
+    fn deleting_embeds_near_the_title_restores_the_natural_document_extent() {
+        let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
+        for embed in [
+            format!("![[{id}]]"),
+            "| header |\n|---|\n| value |".to_owned(),
+            "```table\n- - header\n- - value\n```".to_owned(),
+        ] {
+            let Some(widget) = widget("|") else { return };
+            let text = format!("# Title\n\n{embed}\n\nend");
+            let mut editor = Editor::new(Body::detached(&text));
+            editor.move_to(text.len(), false);
+            widget.set_editor(Some(editor));
+            let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
+            let (generation, _) = widget.image_requests(false);
+            widget.set_image(generation, id, Some(texture(160, 300)));
+            let (session, requests) = widget.drawing_requests();
+            for drawing in requests {
+                widget.set_table(
+                    session,
+                    widget.table_revision(),
+                    drawing,
+                    crate::tables::Refs::default(),
+                );
+            }
+            allocate_viewport(&scrolled, 600, 700);
+            let height = widget.lay_out(600);
+            scrolled.vadjustment().configure(0.0, 0.0, f64::from(height), 10.0, 680.0, 700.0);
+            let title_y = widget.imp().lines.borrow()[0].y;
+            let start = text.find(&embed).unwrap();
+            widget.edit(|e| e.select(start, start + embed.len()));
+            widget.edit(Editor::backspace);
+            widget.scroll_to_cursor();
+            assert_eq!(widget.text().as_deref(), Some("# Title\n\n\n\nend"));
+            assert_eq!(widget.imp().lines.borrow()[0].y, title_y, "{embed}");
+            let clean = EditorWidget::default();
+            let mut editor = Editor::new(Body::detached(&widget.text().unwrap()));
+            editor.move_to(start, false);
+            clean.set_editor(Some(editor));
+            assert_eq!(
+                f64::from(widget.lay_out(600)),
+                f64::from(clean.lay_out(600)) + scrolled.vadjustment().page_size() * 0.8,
+                "{embed}"
+            );
+            assert!(widget.lay_out(600) < height, "{embed}");
+            assert_eq!(scrolled.vadjustment().value(), 0.0);
+        }
     }
 
     /// A colored image with a stripe, so rendering checks show its aspect ratio and placement.
@@ -2943,14 +3078,14 @@ mod tests {
     }
 
     #[test]
-    fn invalidating_and_restoring_an_image_keeps_the_caret_still_at_the_note_start() {
+    fn invalidating_and_restoring_an_image_keeps_the_caret_still_with_room_to_scroll() {
         let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
         let text = format!(
             "{}before ![[{id}]] after\n|{}",
             "earlier line\n".repeat(40),
             "later line\n".repeat(40)
         );
-        for scrolled_down in [false, true] {
+        for width in [240, 600] {
             let Some(widget) = widget(&text) else { return };
             let at = widget.text().unwrap().find('!').unwrap() + 13;
             let (generation, _) = widget.image_requests(false);
@@ -2958,14 +3093,12 @@ mod tests {
             widget.edit(|e| e.move_to(at, false));
             let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
             scrolled.measure(gtk::Orientation::Horizontal, -1);
-            scrolled.measure(gtk::Orientation::Vertical, 600);
-            scrolled.allocate(600, 500, -1, None);
-            let height = widget.lay_out(600);
+            scrolled.measure(gtk::Orientation::Vertical, width);
+            scrolled.allocate(width, 500, -1, None);
+            let height = widget.lay_out(width);
             let caret_y = caret_rect(&widget.imp().lines.borrow(), at).unwrap().1;
-            #[allow(clippy::cast_possible_truncation)]
-            let page = if scrolled_down { 500 } else { (caret_y + 100.0).ceil() as i32 };
-            scrolled.allocate(600, page, -1, None);
-            let scroll = if scrolled_down { (caret_y - 100.0).floor() } else { 0.0 };
+            let page = 500;
+            let scroll = (caret_y - 100.0).floor();
             let adjustment = scrolled.vadjustment();
             adjustment.configure(
                 scroll,
@@ -2982,14 +3115,11 @@ mod tests {
                 widget.edit(Editor::backspace);
                 widget.scroll_to_cursor();
                 scrolled.measure(gtk::Orientation::Horizontal, -1);
-                scrolled.measure(gtk::Orientation::Vertical, 600);
-                scrolled.allocate(600, page, -1, None);
+                scrolled.measure(gtk::Orientation::Vertical, width);
+                scrolled.allocate(width, page, -1, None);
                 assert!(!has_image_source(&widget));
                 let y = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
                 assert!((y - adjustment.value() - screen_y).abs() < 0.01);
-                if scroll < 1.0 {
-                    assert!(widget.imp().top_space.get() > 300.0);
-                }
                 widget.edit(|e| {
                     assert!(e.undo());
                 });
@@ -2997,8 +3127,6 @@ mod tests {
                 let y = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
                 assert!((y - adjustment.value() - screen_y).abs() < 0.01);
                 assert!(has_image_source(&widget));
-                assert_eq!(widget.imp().top_space.get(), 0.0);
-                assert_eq!(widget.imp().bottom_space.get(), 0.0);
                 assert_eq!(adjustment.value(), scroll);
             }
             // Ordinary typing still moves to the next line; it must not pin the caret in place.
@@ -3009,13 +3137,12 @@ mod tests {
             let next = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
             assert!(next > y);
             widget.set_editor(Some(Editor::new(Body::detached("another note"))));
-            assert_eq!(widget.imp().top_space.get(), 0.0);
-            assert_eq!(widget.imp().bottom_space.get(), 0.0);
+            assert_eq!(widget.imp().lines.borrow()[0].y, MARGIN_TOP);
         }
     }
 
     #[test]
-    fn an_image_disappearing_near_the_note_end_keeps_the_caret_still() {
+    fn an_image_disappearing_near_the_note_end_keeps_the_caret_still_with_the_end_buffer() {
         let id: Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
         let text = format!("before ![[{id}|{}]] after", "word ".repeat(20));
         let Some(widget) = widget("|") else { return };
@@ -3026,9 +3153,7 @@ mod tests {
         let (generation, _) = widget.image_requests(false);
         widget.set_image(generation, id, Some(texture(80, 120)));
         let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
-        scrolled.measure(gtk::Orientation::Horizontal, -1);
-        scrolled.measure(gtk::Orientation::Vertical, 240);
-        scrolled.allocate(240, 200, -1, None);
+        allocate_viewport(&scrolled, 240, 200);
         let height = widget.lay_out(240);
         let adjustment = scrolled.vadjustment();
         adjustment.configure(130.0, 0.0, f64::from(height), 10.0, 180.0, 200.0);
@@ -3039,23 +3164,20 @@ mod tests {
         scrolled.measure(gtk::Orientation::Horizontal, -1);
         scrolled.measure(gtk::Orientation::Vertical, 240);
         scrolled.allocate(240, 200, -1, None);
+        let height = f64::from(widget.lay_out(240));
+        assert_eq!(adjustment.upper(), height.max(adjustment.page_size()));
         let y = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
         assert!((y - adjustment.value() - screen_y).abs() < 0.01);
-        assert!(
-            widget.imp().bottom_space.get() > 0.0,
-            "old height {height}, screen {screen_y}, new caret {y}, scroll {}, top {}, bottom {}",
-            adjustment.value(),
-            widget.imp().top_space.get(),
-            widget.imp().bottom_space.get()
-        );
+        assert_eq!(widget.imp().lines.borrow()[0].y, MARGIN_TOP);
         widget.edit(|e| {
             assert!(e.undo());
         });
         widget.scroll_to_cursor();
+        let height = f64::from(widget.lay_out(240));
+        assert_eq!(adjustment.upper(), height.max(adjustment.page_size()));
+        assert_eq!(widget.imp().lines.borrow()[0].y, MARGIN_TOP);
         let y = caret_rect(&widget.imp().lines.borrow(), head(&widget)).unwrap().1;
         assert!((y - adjustment.value() - screen_y).abs() < 0.01);
-        assert_eq!(widget.imp().bottom_space.get(), 0.0);
-        assert_eq!(widget.imp().top_space.get(), 0.0);
     }
 
     #[test]

@@ -745,20 +745,70 @@ fn table_tabs_align_pipe_cells_and_undo_restores_the_original_source() {
 }
 
 #[test]
-fn list_table_tabs_select_cells_without_changing_their_markdown() {
-    let text = "```table\n- - alpha\n  - beta\n- - gamma\n  - delta\n```\nend";
+fn list_table_tabs_indent_selected_contents_and_undo_restores_selection() {
+    let text = "```table\n- - alpha\n  - beta\n```\nend";
     let mut e = Editor::new(Body::detached(text));
-    e.move_to(text.find("alpha").unwrap(), false);
-    for next in ["beta", "gamma", "delta", "delta"] {
-        assert!(e.table_key(false));
-        assert_eq!(e.selected_text(), next);
-    }
-    for next in ["gamma", "beta", "alpha", "alpha"] {
-        assert!(e.table_key(true));
-        assert_eq!(e.selected_text(), next);
-    }
+    let start = text.find("beta").unwrap();
+    e.select(start, start + 4);
+    let selected = e.selection();
+    assert!(!e.table_key(false));
+    assert!(e.list_key(ListKey::ShiftTab));
+    assert_eq!(e.text(), text.replace("  - beta", "- beta"));
+    assert_eq!(e.selected_text(), "beta");
+    assert!(e.list_key(ListKey::Tab));
     assert_eq!(e.text(), text);
-    assert!(!e.can_undo());
+    assert_eq!(e.selection(), selected);
+    assert!(e.undo());
+    assert_eq!(e.text(), text.replace("  - beta", "- beta"));
+    assert_eq!(e.selected_text(), "beta");
+    assert!(e.undo());
+    assert_eq!(e.text(), text);
+    assert_eq!(e.selection(), selected);
+}
+
+#[test]
+fn indenting_a_selected_cell_keeps_its_nested_list_and_directed_selection() {
+    for prefix in ["", "> "] {
+        let text = "```table\n- row\n  - first\n  - second\n    - child\n```\nend";
+        let text =
+            text.lines().map(|line| format!("{prefix}{line}")).collect::<Vec<_>>().join("\n");
+        let mut e = Editor::new(Body::detached(&text));
+        let start = text.find("second").unwrap();
+        let end = text.find("child").unwrap() + 5;
+        // Reverse selections keep their direction while the whole cell subtree changes depth.
+        e.select(end, start);
+        assert!(e.list_key(ListKey::Tab));
+        assert_eq!(
+            e.text(),
+            text.replace("  - second", "    - second").replace("    - child", "      - child")
+        );
+        assert!(e.selection().anchor > e.selection().head);
+        assert!(e.selected_text().starts_with("second"));
+        assert!(e.selected_text().ends_with("child"));
+        assert!(e.list_key(ListKey::ShiftTab));
+        assert_eq!(e.text(), text);
+        assert_eq!(e.selection(), Selection { anchor: end, head: start });
+    }
+}
+
+#[test]
+fn moving_a_selected_list_item_is_one_undo_step_and_keeps_its_children() {
+    let text = "- first\n- café\n  - child\n- last";
+    let mut e = Editor::new(Body::detached(text));
+    let start = text.find("café").unwrap();
+    e.select(start, start + "café".len());
+    let selection = e.selection();
+    assert!(e.list_key(ListKey::MoveDown));
+    assert_eq!(e.text(), "- first\n- last\n- café\n  - child");
+    assert_eq!(e.selected_text(), "café");
+    assert!(e.undo());
+    assert_eq!(e.text(), text);
+    assert_eq!(e.selection(), selection);
+    assert!(e.redo());
+    assert_eq!(e.selected_text(), "café");
+    assert!(e.list_key(ListKey::MoveUp));
+    assert_eq!(e.text(), text);
+    assert_eq!(e.selection(), selection);
 }
 
 #[test]
@@ -782,7 +832,7 @@ fn clicking_a_table_cell_selects_its_source_for_replacement_and_undo() {
 }
 
 #[test]
-fn nested_table_cells_select_and_navigate_their_innermost_source() {
+fn nested_table_cells_select_their_innermost_source() {
     for inner in ["```table\n- - inner\n  - value\n```", "| inner | value |\n|---|---|"] {
         let content = inner.replace('\n', "\n    ");
         let text = format!("````table\n- - outer\n  - {content}\n````\nend");
@@ -790,9 +840,7 @@ fn nested_table_cells_select_and_navigate_their_innermost_source() {
         let range = e.display().drawings[0].range.clone();
         assert!(e.select_table_cell(range, 0, 1, &[(0, 0, 1)]), "{text:?}");
         assert_eq!(e.selected_text(), "value");
-        assert!(e.table_key(true));
-        assert_eq!(e.selected_text(), "inner");
-        assert!(e.table_key(false));
+        assert!(!e.table_key(true));
         assert_eq!(e.selected_text(), "value");
         assert_eq!(e.text(), text);
     }

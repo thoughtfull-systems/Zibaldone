@@ -35,6 +35,52 @@ fn undo(widget: &EditorWidget) {
 }
 
 #[test]
+fn last_note_restores_after_close_and_restart_and_explicit_navigation_takes_precedence() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(root.path());
+    let state = runtime.block_on(State::for_test(dirs.clone())).unwrap();
+    let (space, first, second) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let first = state.create_note(space, "First note").await.unwrap();
+        let second = state.create_note(space, "Second note").await.unwrap();
+        (space, first, second)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.RestoreTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    window.open_note(space, first);
+    until(|| runtime.block_on(state.last_note()) == Some((space, first)));
+    window.close_editor();
+    window.restore_last_note();
+    until(|| window.inner().widget.text().as_deref() == Some("First note"));
+    window.close_editor();
+    window.restore_last_note();
+    window.open_uri(&format!("zib:note/{second}"));
+    until(|| runtime.block_on(state.last_note()) == Some((space, second)));
+    assert_eq!(window.inner().widget.text().as_deref(), Some("Second note"));
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+
+    let reopened = runtime.block_on(State::for_test(dirs)).unwrap();
+    let window = Window::new(&app, reopened.clone());
+    window.restore_last_note();
+    until(|| window.inner().widget.text().as_deref() == Some("Second note"));
+    window.close_editor();
+    runtime.block_on(reopened.delete_note(space, second)).unwrap();
+    assert_eq!(runtime.block_on(reopened.last_note()), None);
+    runtime.block_on(reopened.finish());
+    window.inner().window.destroy();
+}
+
+#[test]
 fn chat_draft_undo_is_independent_and_transcripts_are_editable_notes() {
     if adw::init().is_err() {
         return;

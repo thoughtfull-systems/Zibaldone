@@ -49,6 +49,8 @@ pub struct Inner {
     rows: RefCell<Vec<(Id, Id)>>,
     /// Counts reloads of the list, so only the latest one fills it.
     generation: Cell<u64>,
+    /// Orders restoration, URI lookups, and direct note navigation.
+    opening: Cell<u64>,
     /// Counts title lookups, so an older result cannot overwrite a newer title.
     label_generation: Cell<u64>,
     /// Counts drawing refreshes so typing waits for a short pause before rendering.
@@ -230,6 +232,7 @@ impl Window {
             list,
             rows: RefCell::default(),
             generation: Cell::new(0),
+            opening: Cell::new(0),
             label_generation: Cell::new(0),
             drawing_generation: Cell::new(0),
             title,
@@ -277,6 +280,30 @@ impl Window {
 
     pub fn present(&self) {
         self.inner().window.present();
+    }
+
+    fn begin_open(&self) -> u64 {
+        let next = self.inner().opening.get().wrapping_add(1);
+        self.inner().opening.set(next);
+        next
+    }
+
+    /// Restores only an available note, and yields to any explicit navigation started meanwhile.
+    pub fn restore_last_note(&self) {
+        if self.inner().editor.borrow().is_some() {
+            return;
+        }
+        let opening = self.begin_open();
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            let last = core(async move { state.last_note().await }).await;
+            if w.inner().opening.get() == opening
+                && let Some((space, note)) = last
+            {
+                w.open_note(space, note);
+            }
+        });
     }
 
     pub fn toast(&self, text: &str) {
@@ -576,8 +603,13 @@ impl Window {
         };
         let w = self.clone();
         let state = self.inner().state.clone();
+        let opening = self.begin_open();
         glib::spawn_future_local(async move {
-            match core(async move { state.find_note(note).await }).await {
+            let space = core(async move { state.find_note(note).await }).await;
+            if w.inner().opening.get() != opening {
+                return;
+            }
+            match space {
                 Some(space) => w.open_note(space, note),
                 None => w.toast("This machine doesn't hold that note"),
             }
@@ -689,6 +721,15 @@ impl Window {
                 widget.grab_focus();
             }
             let session = widget.session();
+            let remembering = state.clone();
+            if let Err(error) =
+                core(async move { remembering.remember_note(space, note).await }).await
+            {
+                w.toast(&format!("Couldn't remember the open note: {error}"));
+            }
+            if widget.session() != session {
+                return;
+            }
             let opened = core(async move { state.open_note(space, note).await }).await;
             if w.inner().widget.session() != session {
                 return;
@@ -872,6 +913,7 @@ impl Window {
 
     /// Reports pending metadata and ends the note's live sessions.
     fn close_editor(&self) {
+        self.begin_open();
         self.inner().label_generation.set(self.inner().label_generation.get().wrapping_add(1));
         self.inner().drawing_generation.set(self.inner().drawing_generation.get().wrapping_add(1));
         self.report_body_edited();

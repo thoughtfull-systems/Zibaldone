@@ -15,6 +15,35 @@ fn supply(widget: &EditorWidget, size: ImageSize) -> Drawing {
 }
 
 #[test]
+fn math_matches_text_line_height_and_uses_the_same_size_inline_and_in_blocks() {
+    let Some(widget) = widget("Text $x+y$\n\n$$x+y$$\n\n|end") else { return };
+    let plain_height = widget.create_pango_layout(Some("Text")).pixel_size().1;
+    let root = tempfile::tempdir().unwrap();
+    let renderer = zib_core::render::Renderer::new(root.path());
+    let (session, requests) = widget.drawing_requests();
+    for drawing in requests {
+        let (kind, source) = match &drawing {
+            Drawing::DisplayMath(source) => (zib_core::render::Kind::DisplayMath, source),
+            Drawing::InlineMath(source) => (zib_core::render::Kind::InlineMath, source),
+            other => panic!("unexpected drawing: {other:?}"),
+        };
+        let image = renderer.image(kind, source).unwrap();
+        let texture = gdk::Texture::from_bytes(&glib::Bytes::from(&image.png)).unwrap();
+        widget.set_drawing(
+            session,
+            drawing,
+            Ok((texture, ImageSize { width: image.width, height: image.height })),
+        );
+    }
+    let lines = widget.imp().lines.borrow();
+    let inline = lines[0].images[0].height;
+    let block = lines.iter().flat_map(|l| &l.blocks).next().unwrap();
+    assert!(inline <= f64::from(plain_height));
+    assert!(lines[0].height <= f64::from(plain_height) + 1.0);
+    assert!((inline - f64::from(block.rect.height())).abs() < 1.0);
+}
+
+#[test]
 fn superseded_render_textures_are_released_while_the_note_stays_open() {
     let Some(widget) = widget("$x$\n|end") else { return };
     let mut versions = Vec::new();

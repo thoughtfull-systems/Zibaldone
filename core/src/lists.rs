@@ -9,6 +9,10 @@ pub enum ListKey {
     /// Starts a new item, or moves a blank item out a level, or ends the list. Before the marker of
     /// a list's first item, it inserts a blank line above the list.
     Enter,
+    /// Swaps the item, with its children, with its next sibling.
+    MoveDown,
+    /// Swaps the item, with its children, with its previous sibling.
+    MoveUp,
     /// Starts a continuation line in the current item.
     ShiftEnter,
     /// Moves the item, with its children, out a level.
@@ -33,14 +37,16 @@ pub struct Edit {
 /// code, Enter and Shift+Enter keep the line's indentation, and Tab and Shift+Tab move the list
 /// item that holds the block.
 /// Lists and code inside block quotes keep their quote markers on new and rearranged lines.
+/// `MoveDown` and `MoveUp` use the same item context as indentation and swap it with a sibling,
+/// including its children. At a boundary, they return an unchanged edit.
 pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
     if let Some(edit) = quoted_edit(body, cursor, key) {
         return Some(edit);
     }
-    let tab = matches!(key, ListKey::Tab | ListKey::ShiftTab);
+    let structural = !matches!(key, ListKey::Enter | ListKey::ShiftEnter);
     match code_block(body, cursor) {
         Code::Outside => edit(body, cursor, key, None),
-        Code::Inside { fence, .. } if tab => edit(body, cursor, key, Some(fence)),
+        Code::Inside { fence, .. } if structural => edit(body, cursor, key, Some(fence)),
         Code::Inside { indent, .. } => code_newline(body, cursor, indent),
         // A new item or a continuation line can follow a code block in a list item.
         Code::Closed { fence } => edit(body, cursor, key, Some(fence)),
@@ -215,6 +221,9 @@ fn edit(body: &str, cursor: usize, key: ListKey, fence: Option<usize>) -> Option
     }
     match key {
         ListKey::Enter => Some(enter(body, &lines, current, owner, &item, cursor)),
+        ListKey::MoveDown | ListKey::MoveUp => {
+            Some(move_item(body, &lines, owner, &item, cursor, key == ListKey::MoveDown))
+        }
         ListKey::ShiftEnter => {
             let text = format!("\n{}", " ".repeat(item.content_column));
             Some(Edit { cursor: cursor + text.len(), range: cursor..cursor, text })
@@ -582,6 +591,49 @@ fn outdent(body: &str, lines: &[Line], owner: usize, item: &Item, cursor: usize)
     reindent(body, lines, owner, item, cursor, |line| (line.indent().min(shift), String::new()))
 }
 
+/// Swaps adjacent sibling subtrees, retaining their separator and the cursor's place in its item.
+fn move_item(
+    body: &str,
+    lines: &[Line],
+    owner: usize,
+    item: &Item,
+    cursor: usize,
+    down: bool,
+) -> Edit {
+    let last = subtree_end(lines, owner, item);
+    let last = lines
+        .iter()
+        .position(|line| line.start <= cursor && cursor <= line.end)
+        .map_or(last, |current| last.max(current));
+    let sibling = if down {
+        (last + 1..lines.len()).find(|&i| !lines[i].is_blank())
+    } else {
+        (0..owner).rev().find(|&i| lines[i].item().is_some_and(|i| i.indent <= item.indent))
+    };
+    let adjacent = sibling.and_then(|i| {
+        let other = lines[i].item()?;
+        if other.indent != item.indent {
+            return None;
+        }
+        let end = subtree_end(lines, i, &other);
+        let gap = if down { last + 1..i } else { end + 1..owner };
+        lines[gap].iter().all(Line::is_blank).then_some((i, end))
+    });
+    let Some((other, other_end)) = adjacent else {
+        return Edit { cursor, range: cursor..cursor, text: String::new() };
+    };
+    let (first, first_end, second, second_end) =
+        if down { (owner, last, other, other_end) } else { (other, other_end, owner, last) };
+    let start = lines[first].start;
+    let middle = &body[lines[first_end].end..lines[second].start];
+    let before = &body[start..lines[first_end].end];
+    let after = &body[lines[second].start..lines[second_end].end];
+    let text = format!("{after}{middle}{before}");
+    let cursor =
+        cursor - lines[owner].start + start + if down { after.len() + middle.len() } else { 0 };
+    Edit { cursor, range: start..lines[second_end].end, text }
+}
+
 /// Rewrites the item at `owner` and its children, replacing the first `n` bytes of each line with
 /// `text`, where `change` returns `(n, text)` for a line.
 fn reindent(
@@ -614,6 +666,38 @@ fn reindent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_items_swaps_sibling_subtrees_and_preserves_cursor_and_separators() {
+        for (before, after) in [
+            ("- a|\n- b", "- b\n- a|"),
+            ("- a\n  |\n- b", "- b\n- a\n  |"),
+            (
+                "- café|\n  continued\n  - child\n\n- b\n  - x",
+                "- b\n  - x\n\n- café|\n  continued\n  - child",
+            ),
+            ("- parent\n  - a|\n  - b\n- next", "- parent\n  - b\n  - a|\n- next"),
+            ("> - a|\n> - b", "> - b\n> - a|"),
+            ("```table\n- - a|\n- - b\n```", "```table\n- - b\n- - a|\n```"),
+            ("- a\n  ```\n  code|\n  ```\n- b", "- b\n- a\n  ```\n  code|\n  ```"),
+        ] {
+            assert_eq!(press(before, ListKey::MoveDown).as_deref(), Some(after), "{before}");
+            assert_eq!(press(after, ListKey::MoveUp).as_deref(), Some(before), "{after}");
+        }
+        for (before, key) in [
+            ("- a|\n- b", ListKey::MoveUp),
+            ("- a\n- b|", ListKey::MoveDown),
+            ("- a\n  - child|\n- b", ListKey::MoveDown),
+            ("- a\n  - child|\n- b", ListKey::MoveUp),
+            ("- a\n\nparagraph\n\n- b|", ListKey::MoveUp),
+        ] {
+            assert_eq!(press(before, key).as_deref(), Some(before));
+        }
+        for text in ["plain|", "```\ncode|\n```", "```table\nnot a list|\n```"] {
+            assert_eq!(press(text, ListKey::MoveDown), None);
+            assert_eq!(press(text, ListKey::MoveUp), None);
+        }
+    }
 
     /// Applies `key` at the `|` in `before`, and returns the result with `|` at the new cursor.
     fn press(before: &str, key: ListKey) -> Option<String> {

@@ -19,7 +19,7 @@ use typst_layout::PagedDocument;
 
 use crate::body::Alignment;
 use crate::markup::{self, Block, Inline, Item};
-use crate::render::{math_svg, mermaid_svg};
+use crate::render::{math_scale, math_svg, mermaid_svg};
 pub use crate::store::Page;
 use crate::{Error, Id, Result};
 
@@ -43,8 +43,6 @@ const CHECKED: &str = concat!(
 const CODE_BLOCK: &str = "#block(fill: luma(243), inset: 8pt, radius: 3pt, width: 100%, ";
 /// The body font's size, in points.
 const TEXT_SIZE: f64 = 11.0;
-/// The size the core draws math at, in SVG units, which Typst reads as points.
-const MATH_SIZE: f64 = 20.0;
 
 /// Prints the notes with `bodies` as one PDF, each note starting on a new page.
 pub fn pdf(bodies: &[String], refs: &Refs, page: &Page) -> Result<Vec<u8>> {
@@ -91,6 +89,17 @@ impl Writer<'_> {
         let _ = writeln!(self.out, "#set text(font: \"Libertinus Serif\", size: {TEXT_SIZE}pt)");
         self.out.push_str(concat!(
             "#set par(justify: true)\n",
+            // Image descent can use the paragraph's existing leading instead of adding another
+            // gap. Tall formulas still reserve the space beyond that allowance and never clip.
+            "#let inline-math(path, w, h) = context {\n",
+            "  let slack = par.leading.to-absolute() / 2\n",
+            "  let image-depth = h * 0.25\n",
+            "  let rise = calc.max(measure([H]).height, h - image-depth - slack)\n",
+            "  let depth = calc.max(0pt, image-depth - slack)\n",
+            "  box(width: w, height: rise + depth, baseline: (at: bottom, shift: depth),\n",
+            "    place(top + left, dy: rise + image-depth - h,\n",
+            "      image(path, width: w, height: h, fit: \"contain\")))\n",
+            "}\n",
             "#show raw: set text(font: \"DejaVu Sans Mono\", size: 0.9em)\n",
             "#show heading: set block(above: 1.4em, below: 0.8em)\n",
             // The colors the Linux editor gives headings on a light background.
@@ -149,15 +158,7 @@ impl Writer<'_> {
                     string(text.trim_end_matches('\n'))
                 );
             }
-            Block::Math(source) => match math_svg(source, true) {
-                Ok(svg) => {
-                    let width = svg_width(&svg) * TEXT_SIZE / MATH_SIZE;
-                    let path = self.file("svg", svg.into_bytes());
-                    let _ =
-                        write!(self.out, "#block(image({}, width: {width:.2}pt))", string(&path));
-                }
-                Err(_) => self.code_text(source),
-            },
+            Block::Math(source) => self.math(source, true),
             Block::Diagram(source) => match mermaid_svg(source) {
                 Ok(svg) => {
                     let path = self.file("svg", svg.into_bytes());
@@ -313,20 +314,28 @@ impl Writer<'_> {
     }
 
     fn math(&mut self, source: &str, display: bool) {
-        let Ok(svg) = math_svg(source, display) else {
-            let _ = write!(self.out, "#raw({})", string(source));
+        let rendered = math_svg(source, display).and_then(|svg| {
+            let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
+                .map_err(|error| Error::Render(error.to_string()))?;
+            Ok((svg, tree.size()))
+        });
+        let Ok((svg, size)) = rendered else {
+            if display {
+                self.code_text(source);
+            } else {
+                let _ = write!(self.out, "#raw({})", string(source));
+            }
             return;
         };
-        let width = svg_width(&svg) * TEXT_SIZE / MATH_SIZE;
+        let scale = math_scale(TEXT_SIZE);
+        let width = f64::from(size.width()) * scale;
+        let height = f64::from(size.height()) * scale;
         let path = self.file("svg", svg.into_bytes());
         if display {
-            let _ = write!(self.out, "#block(image({}, width: {width:.2}pt))", string(&path));
+            let _ = write!(self.out, "#block(image({}, width: {width:.4}pt))", string(&path));
         } else {
-            let _ = write!(
-                self.out,
-                "#box(baseline: 25%, image({}, width: {width:.2}pt))",
-                string(&path)
-            );
+            let _ =
+                write!(self.out, "#inline-math({}, {width:.4}pt, {height:.4}pt)", string(&path));
         }
     }
 
@@ -405,12 +414,6 @@ fn image_width(data: &[u8], media: &str) -> Option<f64> {
     Some(pixels * 0.75)
 }
 
-/// The width of an SVG image, in points. usvg measures in pixels, three quarters of a point.
-fn svg_width(svg: &str) -> f64 {
-    resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default())
-        .map_or(MATH_SIZE, |tree| f64::from(tree.size().width()) * 0.75)
-}
-
 /// The fonts that print: Typst's own, which the build bundles, and then the system's, for scripts
 /// those lack. Finding the system's takes a moment, so it happens once.
 fn font_store() -> &'static FontStore {
@@ -483,6 +486,112 @@ fn not_found(id: FileId) -> FileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use typst::layout::{Frame, FrameItem};
+
+    /// Records text baselines and image geometry from Typst's laid-out page, before PDF encoding.
+    #[derive(Default)]
+    struct Geometry {
+        baselines: Vec<f64>,
+        clipped_images: usize,
+        images: Vec<(f64, f64, f64)>,
+    }
+
+    impl Geometry {
+        fn visit(&mut self, frame: &Frame, top: f64, clipped: bool) {
+            for (point, item) in frame.items() {
+                let y = top + point.y.to_pt();
+                match item {
+                    FrameItem::Group(group) => {
+                        self.visit(
+                            &group.frame,
+                            y + group.transform.ty.to_pt(),
+                            clipped || group.clip.is_some(),
+                        );
+                    }
+                    FrameItem::Image(_, size, _) => {
+                        self.clipped_images += usize::from(clipped);
+                        self.images.push((y, size.x.to_pt(), size.y.to_pt()));
+                    }
+                    FrameItem::Text(text) if text.text.starts_with("Line") => {
+                        self.baselines.push(y)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn geometry(body: &str) -> Geometry {
+        let refs = Refs::default();
+        let mut writer = Writer { refs: &refs, files: Vec::new(), out: String::new() };
+        writer.preamble(&Page::default());
+        writer.blocks(&markup::parse(body));
+        let world = Document::new(writer.out, writer.files);
+        let document = typst::compile::<PagedDocument>(&world).output.unwrap();
+        let mut geometry = Geometry::default();
+        for page in document.pages() {
+            geometry.visit(&page.frame, 0.0, false);
+        }
+        geometry
+    }
+
+    #[test]
+    fn inline_math_keeps_normal_line_spacing_and_matches_block_and_editor_sizes() {
+        let formula = "m=a*t(h)";
+        let body = format!(
+            concat!(
+                "Line one above.  \nLine two above.  \nLine three ${formula}$ here.  \n",
+                "Line four below.  \nLine five below.\n\n$${formula}$$\n\n```math\n{formula}\n```"
+            ),
+            formula = formula
+        );
+        let geometry = geometry(&body);
+        assert_eq!(geometry.clipped_images, 0);
+        assert_eq!(geometry.baselines.len(), 5);
+        let normal = geometry.baselines[1] - geometry.baselines[0];
+        for pair in geometry.baselines.windows(2) {
+            assert!((pair[1] - pair[0] - normal).abs() < 0.01, "{:?}", geometry.baselines);
+        }
+        assert_eq!(geometry.images.len(), 3);
+        let (_, width, height) = geometry.images[0];
+        for &(_, w, h) in &geometry.images[1..] {
+            assert!((w - width).abs() < 0.01);
+            assert!((h - height).abs() < 0.01);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let renderer = crate::render::Renderer::new(root.path());
+        let screen = renderer.image(crate::render::Kind::InlineMath, formula).unwrap();
+        let screen_scale = math_scale(16.0);
+        // Raster images round to pixels; compare the same em size within one natural pixel.
+        let tolerance = math_scale(1.0);
+        assert!(
+            (width / TEXT_SIZE - f64::from(screen.width) * screen_scale / 16.0).abs() < tolerance
+        );
+        assert!(
+            (height / TEXT_SIZE - f64::from(screen.height) * screen_scale / 16.0).abs() < tolerance
+        );
+    }
+
+    #[test]
+    fn tall_inline_formulas_reserve_room_without_shrinking_or_overlapping_other_lines() {
+        let body = concat!(
+            "Line one above.  \nLine two above.  \n",
+            "Line three $\\frac{\\frac{a^2}{b^2}}{\\frac{c^2}{d^2}}$ here.  \n",
+            "Line four below.  \nLine five below."
+        );
+        let geometry = geometry(body);
+        assert_eq!(geometry.clipped_images, 0);
+        let (top, _, height) = geometry.images[0];
+        let normal = geometry.baselines[1] - geometry.baselines[0];
+        assert!(height > TEXT_SIZE);
+        assert!(geometry.baselines[3] - geometry.baselines[2] > normal);
+        assert!(top > geometry.baselines[1] + 1.0, "{top} {height} {:?}", geometry.baselines);
+        assert!(
+            top + height < geometry.baselines[3] - TEXT_SIZE * 0.65,
+            "{top} {height} {:?}",
+            geometry.baselines
+        );
+    }
 
     #[test]
     fn escapes_markup() {
