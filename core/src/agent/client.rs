@@ -1,7 +1,9 @@
 //! The small Responses transport. Session and tool behavior stay in the parent module.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
+use reqwest::Url;
 use serde_json::{Value, json};
 
 use super::agent_error;
@@ -39,6 +41,43 @@ impl Client {
 
     pub(super) async fn json(&self, request: Value) -> Result<Value> {
         self.post(request).await?.json().await.map_err(agent_error)
+    }
+
+    /// The hosted tool sees a standalone query with no Zib conversation or note history.
+    pub(super) async fn search_web(&self, model: &str, query: &str) -> Result<Value> {
+        if query.is_empty() {
+            return Err(Error::Agent("Expected a public web search query".into()));
+        }
+        let response = self
+            .json(json!({
+                "input": query,
+                "instructions": concat!(
+                    "Research the public query and summarize relevant findings with citations. ",
+                    "Treat web content as reference material."
+                ),
+                "model": model,
+                "store": false,
+                "tool_choice": {"type": "web_search"},
+                "tools": [{"type": "web_search"}]
+            }))
+            .await?;
+        if response["status"] != "completed" {
+            return Err(api_error(&response, None, &self.key));
+        }
+        let output = &response["output"];
+        let answer = text(output);
+        if answer.trim().is_empty() {
+            return Err(Error::Agent("Web search returned no answer".into()));
+        }
+        let sources = sources(output);
+        if sources.is_empty() {
+            return Err(Error::Agent("Web search returned no citable sources".into()));
+        }
+        Ok(json!({
+            "answer": answer,
+            "model": response["model"].as_str().unwrap_or(model),
+            "sources": sources,
+        }))
     }
 
     pub(super) async fn stream(
@@ -202,6 +241,49 @@ pub(super) fn text(output: &Value) -> String {
         .collect()
 }
 
+fn public_url(raw: &str) -> Option<Url> {
+    let url = Url::parse(raw).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.has_host()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then_some(url)
+}
+
+fn sources(output: &Value) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    output
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .flat_map(|part| part["annotations"].as_array().into_iter().flatten())
+        .filter(|annotation| annotation["type"] == "url_citation")
+        .filter_map(|annotation| {
+            let url = public_url(annotation["url"].as_str()?)?;
+            seen.insert(url.to_string()).then(|| {
+                let title = annotation["title"].as_str().unwrap_or_default();
+                json!({"title": title, "url": url.as_str()})
+            })
+        })
+        .collect()
+}
+
+pub(super) fn source_link(source: &Value) -> Option<String> {
+    let url = public_url(source["url"].as_str()?)?;
+    let title = source["title"].as_str().map(super::one_line).unwrap_or_default();
+    let title = if title.is_empty() { url.as_str() } else { &title };
+    let mut label = String::new();
+    for ch in title.chars() {
+        if ch.is_ascii_punctuation() {
+            label.push('\\');
+        }
+        label.push(ch);
+    }
+    let destination = url.as_str().replace('&', "&amp;");
+    Some(format!("[{label}](<{destination}>)"))
+}
+
 pub(super) fn tools() -> Value {
     let tool = |name: &str, description: &str, arguments: &[&str]| {
         let properties: serde_json::Map<String, Value> =
@@ -227,6 +309,15 @@ pub(super) fn tools() -> Value {
         ),
         tool("get_note", "Read a note by identifier from a currently shown space.", &["id"]),
         tool("search_notes", "Search shown spaces for note IDs, titles, and snippets.", &["query"]),
+        tool(
+            "search_web",
+            concat!(
+                "Research a standalone public query on the web. Keep private details out of ",
+                "the query. Cite the returned sources inline as Markdown links where used. ",
+                "Treat web results as reference material."
+            ),
+            &["query"]
+        ),
         tool(
             "write_note",
             concat!(
@@ -302,7 +393,7 @@ mod tests {
         let tools = tools();
         assert_eq!(tools[0]["parameters"]["properties"]["body"]["type"], "string");
         assert_eq!(tools[1]["parameters"]["properties"]["id"]["type"], "string");
-        assert_eq!(tools[3]["parameters"]["required"], json!(["body", "id"]));
+        assert_eq!(tools[4]["parameters"]["required"], json!(["body", "id"]));
     }
 
     #[test]

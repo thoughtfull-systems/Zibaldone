@@ -69,6 +69,25 @@ pub struct Tool {
     pub result: Option<Value>,
 }
 
+impl Tool {
+    /// Clickable citations from a completed web lookup, shared by the sidebar and transcript.
+    pub fn web_source_links(&self) -> String {
+        if self.name != "search_web" {
+            return String::new();
+        }
+        let mut links = String::new();
+        if let Some(sources) = self.result.as_ref().and_then(|result| result["sources"].as_array())
+        {
+            for source in sources {
+                if let Some(link) = client::source_link(source) {
+                    let _ = writeln!(links, "- {link}");
+                }
+            }
+        }
+        links
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Status {
@@ -164,6 +183,10 @@ impl Session {
                 {
                     let action = if tool.name == "create_note" { "Created" } else { "Updated" };
                     let _ = writeln!(text, "{action} [[{id}]]\n");
+                }
+                let links = tool.web_source_links();
+                if !links.is_empty() {
+                    let _ = writeln!(text, "{links}");
                 }
                 if let Some(result) = &tool.result {
                     // An indented block can't be closed by fences in a note's contents.
@@ -434,7 +457,7 @@ impl Agent {
     async fn respond(&self, host: &impl Host, client: &client::Client) -> Result<()> {
         // Bound a model that repeatedly calls tools without finishing a reply.
         for _ in 0..32 {
-            self.execute_pending(host).await?;
+            self.execute_pending(host, client).await?;
             self.flush_partial()?;
             let session = self.snapshot();
             let turn = session.turns.last().expect("running turn");
@@ -523,9 +546,10 @@ impl Agent {
         Err(Error::Agent("Tool limit reached; retry to continue".into()))
     }
 
-    async fn execute_pending(&self, host: &impl Host) -> Result<()> {
-        let tools = self.snapshot().turns.last().expect("running turn").tools.clone();
-        for (index, tool) in tools.iter().enumerate().filter(|(_, t)| t.result.is_none()) {
+    async fn execute_pending(&self, host: &impl Host, client: &client::Client) -> Result<()> {
+        let session = self.snapshot();
+        let turn = session.turns.last().expect("running turn");
+        for (index, tool) in turn.tools.iter().enumerate().filter(|(_, t)| t.result.is_none()) {
             if *self.cancel.borrow() {
                 return Err(Error::Agent("Stopped".into()));
             }
@@ -541,6 +565,11 @@ impl Agent {
                     }
                     None => Err(Error::Agent("Expected a search query".into())),
                 },
+                "search_web" => {
+                    let query = tool.arguments["query"].as_str().unwrap_or_default().trim();
+                    cancellable(self.cancel.subscribe(), client.search_web(&turn.model, query))
+                        .await
+                }
                 "write_note" => self.write_from_tool(host, tool).await,
                 _ => Err(Error::Agent("Unknown tool".into())),
             };
@@ -617,6 +646,12 @@ impl Agent {
             let turn = s.turns.last_mut().expect("running turn");
             let tool = &mut turn.tools[index];
             tool.result = Some(result.clone());
+            if tool.name == "search_web"
+                && let Some(model) = result["model"].as_str()
+                && !turn.reported_models.iter().any(|reported| reported == model)
+            {
+                turn.reported_models.push(model.into());
+            }
             turn.items.push(json!({
                 "type": "function_call_output", "call_id": tool.call_id,
                 "output": result.to_string()

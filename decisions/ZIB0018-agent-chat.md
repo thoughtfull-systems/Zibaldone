@@ -40,6 +40,16 @@ transcript starts with the session title and labels replies with their models. A
 identifier makes retrying an interrupted archive or tool operation safe from duplicate note
 creation.
 
+### Web search
+
+Offer web search alongside the note tools in every conversation request. The configured system
+prompt can tell the agent when to search notes and when to search the web.
+
+Use OpenAI's hosted web search in a separate request that carries the model's standalone public
+query. This keeps the chat, prompt note, and tool results out of the web research request. Instruct
+the agent to keep private details out of the generated query. Return cited findings to the
+conversation and keep clickable sources in the sidebar and in archived transcripts.
+
 ## Rejected alternatives
 
 - **A session in a space.** It would sync live conversations, which belong to one machine.
@@ -47,6 +57,8 @@ creation.
   edit and restoring the note. The owner manages created notes through ordinary note operations.
 - **Server-owned conversation state.** Local history makes recovery, archiving, and model changes
   independent of a remote conversation's lifetime.
+- **Hosted search in the main conversation request.** That request carries the conversation and
+  retrieved note text. A separate request limits the search model's input to the public query.
 
 ## Consequences
 

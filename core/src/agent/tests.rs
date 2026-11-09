@@ -6,6 +6,8 @@ use std::net::TcpListener;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
+use pulldown_cmark::{Event, Parser, Tag};
+
 use super::*;
 
 struct TestHost {
@@ -100,6 +102,13 @@ fn message(text: &str) -> Value {
     json!({"type": "message", "role": "assistant", "content": [
         {"type": "output_text", "text": text, "annotations": []}
     ]})
+}
+
+fn function_call(name: &str, call_id: &str, arguments: Value) -> Value {
+    json!({
+        "type": "function_call", "name": name, "call_id": call_id,
+        "arguments": arguments.to_string()
+    })
 }
 
 fn response(model: &str, output: Vec<Value>) -> Value {
@@ -319,6 +328,86 @@ async fn turns_pin_models_snapshot_prompt_and_replay_reasoning_with_tool_results
     assert!(transcript.contains("model-a-snapshot"));
     assert!(transcript.contains("model-b-snapshot"));
     assert!(transcript.contains("Created [["));
+}
+
+#[tokio::test]
+async fn web_search_is_always_available_and_sends_only_the_public_query() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = Agent::open(root.path()).unwrap();
+    agent.rename("Research").unwrap();
+    let host = TestHost::new();
+    let id = Id::generate();
+    host.notes.lock().unwrap().insert(id, json!({"id": id, "body": "Private note text"}));
+    let query = "Public release date";
+    let url = "https://example.com/release?channel=stable&year=2026";
+    let mut cited = message("The release was in September.");
+    cited["content"][0]["annotations"] = json!([
+        {"type": "url_citation", "title": "Release [notes]", "url": url},
+        {"type": "url_citation", "title": "Duplicate source", "url": url},
+        {"type": "url_citation", "title": "Local file", "url": "file:///private.txt"}
+    ]);
+    let (client, server) = server(vec![
+        stream(response("chat-model", vec![function_call("get_note", "read", json!({"id": id}))])),
+        stream(response("chat-model", vec![message("Note summary")])),
+        stream(response(
+            "chat-model",
+            vec![function_call("search_web", "web", json!({"query": query}))],
+        )),
+        response(
+            "research-model",
+            vec![json!({"type": "web_search_call", "status": "completed"}), cited],
+        )
+        .to_string(),
+        stream(response("chat-model", vec![message(&format!("[Release notes]({url})"))])),
+    ]);
+    let settings = Settings {
+        api_key: "test-key".into(),
+        model: "chosen-model".into(),
+        system_prompt_note: Some(Id::generate()),
+    };
+    let context = Context { id, title: "Open note".into() };
+    agent
+        .run_client(
+            &host,
+            settings.clone(),
+            Some(("Private chat question".into(), Some(context))),
+            &client,
+        )
+        .await
+        .unwrap();
+    agent.run_client(&host, settings, Some((query.into(), None)), &client).await.unwrap();
+    let requests = server.join().unwrap();
+    for request in [&requests[0], &requests[1], &requests[2], &requests[4]] {
+        assert!(
+            request["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "search_web")
+        );
+    }
+    assert_eq!(requests[2]["instructions"], format!("{INSTRUCTIONS}\n\nOriginal instructions"));
+    assert!(requests[2].to_string().contains("Private note text"));
+    let research = &requests[3];
+    assert_eq!(research["input"], query);
+    assert_eq!(research["model"], "chosen-model");
+    assert_eq!(research["tool_choice"], json!({"type": "web_search"}));
+    assert_eq!(research["tools"], json!([{"type": "web_search"}]));
+    assert_eq!(research["store"], false);
+    for private in ["Private note text", "Private chat question", "Original instructions"] {
+        assert!(!research.to_string().contains(private));
+    }
+    assert!(requests[4].to_string().contains("The release was in September."));
+    let session = Agent::open(root.path()).unwrap().snapshot();
+    let turn = &session.turns[1];
+    assert_eq!(turn.reported_models, ["chat-model", "research-model"]);
+    assert_eq!(
+        turn.tools[0].result.as_ref().unwrap()["sources"],
+        json!([
+            {"title": "Release [notes]", "url": url}
+        ])
+    );
+    let links = turn.tools[0].web_source_links();
+    assert!(Parser::new(&links).any(|event| {
+        matches!(event, Event::Start(Tag::Link { dest_url, .. }) if &*dest_url == url)
+    }));
+    assert!(session.transcript().contains(&links));
 }
 
 #[tokio::test]

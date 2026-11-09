@@ -516,6 +516,10 @@ impl Chat {
                     let _ = write!(activity, ": {error}");
                 }
                 activity.push_str("\n\n");
+                let links = tool.web_source_links();
+                if !links.is_empty() {
+                    let _ = writeln!(activity, "{links}");
+                }
             }
             if turn.status == Status::Stopped {
                 activity.push_str("Stopped.\n");

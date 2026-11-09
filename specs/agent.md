@@ -81,6 +81,22 @@ A writer reserves and saves a note identifier before creating a note. Retrying t
 returns the existing note with that identifier. It preserves subsequent edits, and never recreates a
 note deleted for good. Before finishing the operation, it saves the destination space to disk.
 
+### Web search
+
+The core offers `search_web` alongside the note tools in every conversation request. The configured
+system prompt can instruct the agent on the order of tool use.
+
+The function takes a standalone public `query` string. The core sends the query in a separate
+Responses request with the turn's model and the hosted `web_search` tool. The request carries the
+query and fixed research instructions and turns off remote response storage. The core instructs the
+agent to keep private details out of the query. OpenAI runs the search and fetches pages.
+
+Success returns an `answer` string, the reported `model` string, and a `sources` array of objects
+with `title` and `url` strings. Sources come from URL citations. The core keeps the first entry for
+each distinct web address. A missing answer or missing citable sources returns an `error`. The agent
+cites the sources inline in its answer using markdown links. Completed function results replay on
+retry like note tool results.
+
 ## Errors
 
 The agent reports the provider's error code and message for failed requests, including errors sent
@@ -109,6 +125,8 @@ a `Draft` heading. Stopped and failed turns show their status.
 A transcript is an ordinary editable note. Editing it never changes a live session. The sidebar has
 no operation to load or continue a transcript, and no switcher or recent-session limit.
 
+A web search result adds clickable source links to its tool activity in the transcript.
+
 ## Platforms
 
 Linux shows the agent in a resizable right sidebar. A button shows or hides it. Ctrl+Tab switches
@@ -119,3 +137,5 @@ starts with agent settings.
 When archiving a chat, Linux uses the only space if the machine holds one. If the machine holds more
 than one space and shows only one in the note list, Linux uses the shown space. Otherwise, the
 destination picker lists every space. A pending archive keeps its recorded destination.
+
+The sidebar displays clickable source links with web search tool activity.
