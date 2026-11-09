@@ -461,6 +461,63 @@ async fn existing_note_writes_require_known_content_and_run_through_the_tool_loo
 }
 
 #[tokio::test]
+async fn batch_note_reads_keep_order_and_supply_bodies_for_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = Agent::open(root.path()).unwrap();
+    agent.rename("Editing notes").unwrap();
+    let host = TestHost::new();
+    let first = Id::generate();
+    let missing = Id::generate();
+    let second = Id::generate();
+    let first_note = json!({"body": "First body", "id": first, "title": "First"});
+    let second_note = json!({"body": "Second body", "id": second, "title": "Second"});
+    host.notes.lock().unwrap().extend([(first, first_note.clone()), (second, second_note.clone())]);
+    let (client, server) = server(vec![
+        stream(response(
+            "model",
+            vec![function_call(
+                "get_notes",
+                "batch",
+                json!({"ids": [first, missing, second, "invalid", first]}),
+            )],
+        )),
+        stream(response(
+            "model",
+            vec![function_call("write_note", "write", json!({"body": "Updated", "id": second}))],
+        )),
+        stream(response("model", vec![message("Updated the second note.")])),
+    ]);
+    let settings =
+        Settings { api_key: "test-key".into(), model: "model".into(), ..Settings::default() };
+    agent
+        .run_client(
+            &host,
+            settings,
+            Some(("Read these notes and update the second".into(), None)),
+            &client,
+        )
+        .await
+        .unwrap();
+    let requests = server.join().unwrap();
+    let batch = requests[1]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "batch")
+        .unwrap();
+    let entries: Vec<Value> = serde_json::from_str(batch["output"].as_str().unwrap()).unwrap();
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0], first_note);
+    assert_eq!(entries[1]["id"], missing.to_string());
+    assert!(entries[1]["error"].is_string());
+    assert_eq!(entries[2], second_note);
+    assert_eq!(entries[3]["id"], "invalid");
+    assert!(entries[3]["error"].is_string());
+    assert_eq!(entries[4], first_note);
+    assert_eq!(host.get_note(second).await.unwrap()["body"], "Updated");
+}
+
+#[tokio::test]
 async fn restart_and_retry_finish_a_reserved_creation_without_duplicates() {
     let root = tempfile::tempdir().unwrap();
     let agent = Agent::open(root.path()).unwrap();

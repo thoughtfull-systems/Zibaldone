@@ -94,7 +94,7 @@ impl Host for State {
                 return Err(Error::Agent(
                     concat!(
                         "The note changed after it was read. ",
-                        "Read it again with get_note before writing it."
+                        "Read it again with get_note or get_notes before writing it."
                     )
                     .into(),
                 ));

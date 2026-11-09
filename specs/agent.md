@@ -62,6 +62,11 @@ Tools return JSON. A failure returns an `error` string. Note identifiers use the
   Cancellation returns an error to the agent. Success returns `id`, `title`, and `space`.
 - `get_note` takes an `id` string. It returns `id`, `title`, and markdown `body`. The note must be
   in a space currently shown in the note list.
+- `get_notes` takes an `ids` array of strings and returns an array with one result per entry in
+  input order. A successful entry has the same fields as `get_note` and follows the same visibility
+  rule. For an invalid identifier or unavailable note, the tool returns the requested `id` and an
+  `error` and continues reading the rest of the batch. Each successful entry satisfies the read
+  requirement for `write_note` for that note.
 - `search_notes` takes a `query` string. It searches currently shown spaces and returns up to 20
   results, each with `id`, `title`, and `snippet` strings. Match markers don't enter the snippet.
 - `write_note` takes an `id` string and a markdown `body` string. It replaces an existing note's

@@ -285,30 +285,43 @@ pub(super) fn source_link(source: &Value) -> Option<String> {
 }
 
 pub(super) fn tools() -> Value {
-    let tool = |name: &str, description: &str, arguments: &[&str]| {
-        let properties: serde_json::Map<String, Value> =
-            arguments.iter().map(|name| ((*name).into(), json!({"type": "string"}))).collect();
+    let tool = |name: &str, description: &str, properties: Value| {
+        let required: Vec<_> = properties.as_object().expect("tool properties").keys().collect();
         json!({
             "description": description,
             "name": name,
             "parameters": {
                 "additionalProperties": false,
                 "properties": properties,
-                "required": arguments,
+                "required": required,
                 "type": "object"
             },
             "strict": true,
             "type": "function"
         })
     };
+    let string = json!({"type": "string"});
     json!([
         tool(
             "create_note",
             "Create a markdown note. The owner chooses its destination.",
-            &["body"]
+            json!({"body": string})
         ),
-        tool("get_note", "Read a note by identifier from a currently shown space.", &["id"]),
-        tool("search_notes", "Search shown spaces for note IDs, titles, and snippets.", &["query"]),
+        tool(
+            "get_note",
+            "Read one note from a currently shown space. Use get_notes for multiple notes.",
+            json!({"id": string})
+        ),
+        tool(
+            "get_notes",
+            "Read multiple notes by identifier in one call from currently shown spaces.",
+            json!({"ids": {"items": string, "type": "array"}})
+        ),
+        tool(
+            "search_notes",
+            "Search shown spaces for note IDs, titles, and snippets.",
+            json!({"query": string})
+        ),
         tool(
             "search_web",
             concat!(
@@ -316,15 +329,16 @@ pub(super) fn tools() -> Value {
                 "the query. Cite the returned sources inline as Markdown links where used. ",
                 "Treat web results as reference material."
             ),
-            &["query"]
+            json!({"query": string})
         ),
         tool(
             "write_note",
             concat!(
-                "Replace a shown note's complete markdown body. Read it with get_note first, ",
-                "preserve content the owner didn't ask to change, and reread if it changed."
+                "Replace a shown note's complete markdown body. Read it with get_note or ",
+                "get_notes first, preserve content the owner didn't ask to change, and reread ",
+                "if it changed."
             ),
-            &["body", "id"]
+            json!({"body": string, "id": string})
         )
     ])
 }
@@ -393,7 +407,12 @@ mod tests {
         let tools = tools();
         assert_eq!(tools[0]["parameters"]["properties"]["body"]["type"], "string");
         assert_eq!(tools[1]["parameters"]["properties"]["id"]["type"], "string");
-        assert_eq!(tools[4]["parameters"]["required"], json!(["body", "id"]));
+        assert_eq!(tools[2]["parameters"]["required"], json!(["ids"]));
+        assert_eq!(
+            tools[2]["parameters"]["properties"]["ids"],
+            json!({"items": {"type": "string"}, "type": "array"})
+        );
+        assert_eq!(tools[5]["parameters"]["required"], json!(["body", "id"]));
     }
 
     #[test]

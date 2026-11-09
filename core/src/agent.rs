@@ -559,6 +559,9 @@ impl Agent {
                     Some(id) => cancellable(self.cancel.subscribe(), host.get_note(id)).await,
                     None => Err(Error::Agent("Expected a note identifier".into())),
                 },
+                "get_notes" => {
+                    cancellable(self.cancel.subscribe(), get_notes(host, &tool.arguments)).await
+                }
                 "search_notes" => match tool.arguments["query"].as_str() {
                     Some(query) => {
                         cancellable(self.cancel.subscribe(), host.search_notes(query.into())).await
@@ -595,6 +598,10 @@ impl Agent {
             .as_str()
             .ok_or_else(|| Error::Agent("Expected a markdown body".into()))?;
         let session = self.snapshot();
+        let matches_note = |entry: &Value| {
+            entry.get("error").is_none()
+                && entry["id"].as_str().and_then(|id| Id::parse(id).ok()) == Some(note)
+        };
         let expected = session
             .turns
             .iter()
@@ -602,18 +609,22 @@ impl Agent {
             .flat_map(|turn| turn.tools.iter().rev())
             .find_map(|earlier| {
                 let result = earlier.result.as_ref()?;
-                if result["id"].as_str().and_then(|id| Id::parse(id).ok()) != Some(note)
-                    || result.get("error").is_some()
-                {
-                    return None;
-                }
                 match earlier.name.as_str() {
-                    "get_note" => result["body"].as_str(),
-                    "create_note" | "write_note" => earlier.arguments["body"].as_str(),
+                    "get_note" if matches_note(result) => result["body"].as_str(),
+                    "get_notes" => {
+                        let entry =
+                            result.as_array()?.iter().rev().find(|item| matches_note(item))?;
+                        entry["body"].as_str()
+                    }
+                    "create_note" | "write_note" if matches_note(result) => {
+                        earlier.arguments["body"].as_str()
+                    }
                     _ => None,
                 }
             })
-            .ok_or_else(|| Error::Agent("Read the note with get_note before writing it".into()))?;
+            .ok_or_else(|| {
+                Error::Agent("Read the note with get_note or get_notes before writing it".into())
+            })?;
         // A started write finishes before Stop; the host checks the body under the space lock.
         host.write_note(note, expected.into(), text.into()).await
     }
@@ -676,6 +687,20 @@ impl Agent {
             }
         })
     }
+}
+
+async fn get_notes(host: &impl Host, arguments: &Value) -> Result<Value> {
+    let ids: Vec<String> = serde_json::from_value(arguments["ids"].clone())
+        .map_err(|_| Error::Agent("Expected a list of note identifiers".into()))?;
+    let mut notes = Vec::with_capacity(ids.len());
+    for id in ids {
+        let result = match Id::parse(&id) {
+            Ok(note) => host.get_note(note).await,
+            Err(_) => Err(Error::Agent("Expected a note identifier".into())),
+        };
+        notes.push(result.unwrap_or_else(|error| json!({"error": error.to_string(), "id": id})));
+    }
+    Ok(Value::Array(notes))
 }
 
 struct Running<'a>(&'a Agent);
