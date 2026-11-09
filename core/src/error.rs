@@ -24,6 +24,9 @@ pub enum Error {
     /// Loro refused an operation or an import.
     #[error("document: {0}")]
     Loro(String),
+    /// The note's body differs from the caller's copy.
+    #[error("note {0} changed since it was read")]
+    NoteChanged(crate::Id),
     /// No note, space, or machine has the identifier asked for.
     #[error("not found: {0}")]
     NotFound(String),

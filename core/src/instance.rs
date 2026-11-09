@@ -49,6 +49,18 @@ pub enum Request {
         #[serde(default)]
         limit: Option<u32>,
     },
+    /// Searches one space by identifier or pet name.
+    SearchSpace {
+        id: u64,
+        query: String,
+        #[serde(default)]
+        limit: Option<u32>,
+        space: String,
+    },
+    /// Reads note bodies by identifier.
+    GetNotes { id: u64, notes: Vec<Id> },
+    /// Replaces a note body if it still matches the caller's copy.
+    WriteNote { id: u64, note: Id, body: String, expected: String },
     /// Prints notes to a PDF file.
     Print {
         id: u64,
@@ -68,6 +80,9 @@ impl Request {
             | Self::Spaces { id }
             | Self::CreateSpace { id, .. }
             | Self::Search { id, .. }
+            | Self::SearchSpace { id, .. }
+            | Self::GetNotes { id, .. }
+            | Self::WriteNote { id, .. }
             | Self::Print { id, .. } => *id,
         }
     }
@@ -89,6 +104,14 @@ pub struct HitInfo {
     pub snippet: String,
 }
 
+/// One entry in the ordered result of a batch note read.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum NoteRead {
+    Found { body: String, note: Id, space: Id, title: String },
+    Unavailable { error: String, note: Id },
+}
+
 /// A reply from the instance.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -103,6 +126,8 @@ pub enum Reply {
         spaces: Vec<SpaceInfo>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hits: Vec<HitInfo>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notes: Vec<NoteRead>,
     },
     Error {
         id: u64,
@@ -114,7 +139,7 @@ pub enum Reply {
 impl Reply {
     /// An empty result for the request with `id`.
     pub fn done(id: u64) -> Self {
-        Self::Result { id, spaces: Vec::new(), hits: Vec::new() }
+        Self::Result { id, spaces: Vec::new(), hits: Vec::new(), notes: Vec::new() }
     }
 }
 
@@ -231,11 +256,10 @@ impl Client {
         frame::write(&mut self.stream, &request, MAX_FRAME).await?;
         loop {
             match frame::read::<_, Reply>(&mut self.stream, MAX_FRAME).await? {
-                Some(Reply::Result { id: got, spaces, hits }) if got == id => {
-                    return Ok(Reply::Result { id, spaces, hits });
-                }
-                Some(Reply::Error { id: got, reason, code }) if got == id => {
-                    return Ok(Reply::Error { id, reason, code });
+                Some(reply @ (Reply::Result { id: got, .. } | Reply::Error { id: got, .. }))
+                    if got == id =>
+                {
+                    return Ok(reply);
                 }
                 Some(_) => {}
                 None => return Err(Error::Protocol("the instance closed the connection".into())),
@@ -290,6 +314,7 @@ mod tests {
                                 name: "Home".into(),
                             }],
                             hits: Vec::new(),
+                            notes: Vec::new(),
                         },
                         other => Reply::Error {
                             id: other.id(),

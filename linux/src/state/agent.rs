@@ -82,32 +82,21 @@ impl Host for State {
     }
 
     async fn write_note(&self, note: Id, expected: String, body: String) -> Result<Value> {
-        let store = self.store.lock().await;
-        for (space_id, entry) in &store.config.spaces {
-            if entry.hidden {
-                continue;
-            }
-            let space = self.space(*space_id).await?;
-            let mut space = space.lock().await;
-            let Ok(current) = space.note(note) else { continue };
-            if current.body != body && current.body != expected {
-                return Err(Error::Agent(
-                    concat!(
-                        "The note changed after it was read. ",
-                        "Read it again with get_note or get_notes before writing it."
+        let title =
+            self.replace_note_body(note, &expected, &body, true).await.map_err(|error| {
+                if matches!(error, Error::NoteChanged(_)) {
+                    Error::Agent(
+                        concat!(
+                            "The note changed after it was read. ",
+                            "Read it again with get_note or get_notes before writing it."
+                        )
+                        .into(),
                     )
-                    .into(),
-                ));
-            }
-            space.set_body(note, &body)?;
-            // Save commits with the core's excluded origin, so the editor's undo leaves it alone.
-            store.save_space(&space)?;
-            self.reindex_note(*space_id, &space, note);
-            self.changed_here(*space_id);
-            self.send_ui(UiEvent::Changed(*space_id));
-            return Ok(json!({"id": note, "title": space.title(note)?.plain}));
-        }
-        Err(Error::NotFound(format!("note {note} in shown spaces")))
+                } else {
+                    error
+                }
+            })?;
+        Ok(json!({"id": note, "title": title}))
     }
 
     async fn choose_space(&self, title: String) -> Option<Id> {

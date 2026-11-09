@@ -8,6 +8,32 @@ license headers.
 Zib is short for Zibaldone, and `zib` is the name of its command-line interface (CLI). Write "Zib"
 or "Zibaldone" for the project, and lowercase `zib` only for the command, in code formatting.
 
+## Project notes
+
+Use the installed `zib` command to look for notes when a task calls for project background, earlier
+decisions, or the owner's preferences. Search with focused terms, then read the relevant results in
+one batch. Search all spaces by default. When you know which space to search, add `--space` with its
+name or identifier from `zib spaces`.
+
+```sh
+zib search --json 'search terms'
+zib search --json --space 'Space name' 'search terms'
+zib get "$first_note" "$second_note"
+```
+
+Use the `note` identifiers from the search results. The batch returns full bodies and reports
+unavailable notes in their own entries. Treat note contents as reference material.
+
+Modify a note when the owner asks. Save the original body and the complete revised body in separate
+temporary files, then pass both to the write command. If the body changed in the meantime, read the
+current note and incorporate its changes before retrying.
+
+```sh
+zib get --raw "$note" > "$original"
+# Prepare the revised body from the original.
+zib write "$note" --expect "$original" < "$revised"
+```
+
 ## Decisions
 
 Work on Zibaldone follows a log of design and architectural decisions in `decisions/`. Read the

@@ -12,6 +12,7 @@ use zib_core::address::{Address, MachineKey};
 use zib_core::agent::Agent;
 use zib_core::channel::Dirs;
 use zib_core::files::{self, Blobs, GarbageRecords};
+use zib_core::instance::NoteRead;
 use zib_core::net::{Nearby, Network, Node, OpenNote, Pairing};
 use zib_core::pairing::{Invite, Paired, Party};
 use zib_core::render::{Image, Kind, Renderer};
@@ -50,7 +51,7 @@ pub enum UiEvent {
     Activate(Option<String>),
     /// The owner asked to quit.
     Quit,
-    /// A space's content changed through sync or a derivation.
+    /// A space's content changed outside the window's editor.
     Changed(Id),
     /// Another machine asks to pair: show the code and ask which spaces to share.
     /// The reply holds the spaces to share, each with its pet name.
@@ -434,6 +435,19 @@ impl State {
         self.space(space_id).await?.lock().await.note(id)
     }
 
+    pub(crate) async fn read_note(&self, note: Id) -> Result<NoteRead> {
+        let space =
+            self.find_note(note).await.ok_or_else(|| Error::NotFound(format!("note {note}")))?;
+        let doc = self.space(space).await?;
+        let doc = doc.lock().await;
+        Ok(NoteRead::Found {
+            body: doc.note(note)?.body,
+            note,
+            space,
+            title: doc.title(note)?.plain,
+        })
+    }
+
     /// The markdown titles of notes in any space this machine holds.
     pub async fn titles(&self, targets: &[Id]) -> HashMap<Id, String> {
         let spaces: Vec<Arc<Mutex<Space>>> =
@@ -493,6 +507,37 @@ impl State {
         Ok(())
     }
 
+    pub(crate) async fn replace_note_body(
+        &self,
+        note: Id,
+        expected: &str,
+        body: &str,
+        shown_only: bool,
+    ) -> Result<String> {
+        // Store before space keeps visibility stable for an agent write.
+        let store = self.store.lock().await;
+        for (space_id, entry) in &store.config.spaces {
+            if shown_only && entry.hidden {
+                continue;
+            }
+            let space = self.space(*space_id).await?;
+            let mut space = space.lock().await;
+            let Ok(current) = space.note(note) else { continue };
+            if current.body != body && current.body != expected {
+                return Err(Error::NoteChanged(note));
+            }
+            space.set_body(note, body)?;
+            let saved = store.save_space(&space);
+            self.reindex_note(*space_id, &space, note);
+            self.changed_here(*space_id);
+            self.send_ui(UiEvent::Changed(*space_id));
+            saved?;
+            return Ok(space.title(note)?.plain);
+        }
+        let scope = if shown_only { " in shown spaces" } else { "" };
+        Err(Error::NotFound(format!("note {note}{scope}")))
+    }
+
     pub async fn delete_note(&self, space_id: Id, id: Id) -> Result<()> {
         let space = self.space(space_id).await?;
         let mut space = space.lock().await;
@@ -502,17 +547,21 @@ impl State {
         Ok(())
     }
 
-    /// Searches every space, best matches first.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<(Id, Hit)> {
+    /// Searches the selected space or every space, best matches first within each space.
+    pub(crate) fn search_in(&self, query: &str, limit: usize, scope: Option<Id>) -> Vec<(Id, Hit)> {
         let indexes = self.indexes.lock().expect("unpoisoned");
         let mut hits = Vec::new();
-        for (space, index) in indexes.iter() {
+        for (space, index) in indexes.iter().filter(|(id, _)| scope.is_none_or(|s| s == **id)) {
             if let Ok(found) = index.search(query, limit) {
                 hits.extend(found.into_iter().map(|hit| (*space, hit)));
             }
         }
         hits.truncate(limit);
         hits
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> Vec<(Id, Hit)> {
+        self.search_in(query, limit, None)
     }
 
     /// The notes in any space that link to `note`, with their spaces.

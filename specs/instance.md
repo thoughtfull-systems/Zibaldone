@@ -84,6 +84,16 @@ With no command, `zib` sends `activate`, so running `zib` alone starts Zib if ne
 window. Given a `zib:` URI and nothing else, it sends `activate` with that URI. The desktop entry
 runs `zib`, and registers `zib %u` as the handler of the `zib` scheme.
 
+`zib search --space SPACE WORDS...` sends `search-space`. `zib search --json` prints a JavaScript
+Object Notation (JSON) array of hits and removes the match markers from each `snippet`. Search
+options precede the query. A `--` ends option parsing.
+
+`zib get NOTE...` sends `get-notes` and prints the `notes` array as JSON. A failed entry carries its
+own error. `zib get --raw NOTE` prints the body of one note verbatim and exits with an error if the
+note is unavailable. `zib write NOTE --expect ORIGINAL` reads the expected body from the named file
+and the replacement from standard input, both as UTF-8. It sends `write-note` and prints nothing on
+success. Both commands accept note identifiers and `zib:note/` URIs.
+
 ## Messages
 
 Each connection carries requests from the client and replies from the instance, as frames of Concise
@@ -122,6 +132,23 @@ a request here, as the core's operations become available to it.
   nothing, and the error code is `not-found` when this machine holds none of a note.
 
 A result leaves out a list that would be empty.
+
+The note commands add these requests:
+
+- **`get-notes`,** with `notes`, a list of note identifiers as text. The result holds `notes`, with
+  one map per requested note in input order. A successful entry has `body` and `title` as text and
+  `note` and `space` as identifiers. A failed entry has `note` and a text `error`.
+- **`search-space`,** with the same `query` and `limit` as `search`, plus `space`, a space
+  identifier or exact pet name as text. An identifier that the machine holds takes precedence over
+  names. A name that matches more than one space returns an error. The result holds the same fields
+  as `search` and contains only hits from the chosen space.
+- **`write-note`,** with `note`, an identifier, and `body` and `expected`, both text. The instance
+  replaces the note's body when it matches `expected`. An already matching replacement also
+  succeeds. A different body returns the error code `conflict`. The write preserves the note's
+  identifier, type, and fields. It saves the space, updates the index, and schedules sync. A
+  successful result holds nothing.
+
+These requests access the machine's spaces regardless of which spaces show in the note list.
 
 ## Platforms
 
