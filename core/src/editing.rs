@@ -462,7 +462,7 @@ pub fn quote_newline(body: &str, cursor: usize, continues: bool) -> Option<Edit>
     let quoted = quoted_lines(body)
         .into_iter()
         .find(|quoted| quoted.line.start <= cursor && cursor <= quoted.line.end)?;
-    if in_code_block(body, cursor) || in_quoted_list(body, cursor) {
+    if in_code_block(body, cursor) || in_quoted_list_or_math(body, cursor) {
         return None;
     }
     // The `>` markers at the quote's start, with the spaces between and after them.
@@ -505,13 +505,13 @@ pub fn quote_newline(body: &str, cursor: usize, continues: bool) -> Option<Edit>
     Some(Edit { cursor: range.start + text.len(), range, text })
 }
 
-/// A list item inside the innermost quote takes Enter, including on its continuation lines. An
-/// item outside that quote doesn't: a quote within an item still takes Enter before its item.
-fn in_quoted_list(body: &str, cursor: usize) -> bool {
+/// Display math and list items inside the innermost quote handle their own line breaks.
+fn in_quoted_list_or_math(body: &str, cursor: usize) -> bool {
     let (mut quote, mut item) = (0, None);
     for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
         if range.start <= cursor && cursor <= range.end {
             match event {
+                Event::DisplayMath(_) if cursor < range.end => return true,
                 Event::Start(Tag::BlockQuote(_)) => quote = quote.max(range.start),
                 Event::Start(Tag::Item) => item = Some(item.unwrap_or(0).max(range.start)),
                 _ => {}

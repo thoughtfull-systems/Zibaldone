@@ -126,6 +126,26 @@ fn small_tables_start_at_the_left_margin() {
 }
 
 #[test]
+fn arrows_enter_rendered_tables_from_the_nearest_source_line() {
+    for (table, first, last) in [
+        ("head | other\n--- | ---\nlast | cell", "head | other", "last | cell"),
+        ("```table\n- - head\n  - cell\n```", "- - head", "```"),
+    ] {
+        let text = format!("above\n\n{table}\n\nbelow");
+        let Some((editor, _window)) = editor(&text, 600) else { return };
+        let keys = gdk::ModifierType::empty();
+        editor.key(gdk::Key::Up, keys);
+        editor.key(gdk::Key::Up, keys);
+        assert_eq!(editor.head(), text.rfind(last), "{table}");
+
+        editor.edit(|e| e.move_to(0, false));
+        editor.key(gdk::Key::Down, keys);
+        editor.key(gdk::Key::Down, keys);
+        assert_eq!(editor.head(), text.find(first), "{table}");
+    }
+}
+
+#[test]
 fn entering_and_leaving_a_table_near_the_title_does_not_extend_the_document() {
     for table in ["| header |\n|---|\n| value |", "```table\n- - header\n- - value\n```"] {
         let text = format!("# Title\n\n{table}\n\nend");

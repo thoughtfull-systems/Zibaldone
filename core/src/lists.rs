@@ -2,7 +2,9 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+
+use crate::body;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListKey {
@@ -30,24 +32,93 @@ pub struct Edit {
     pub text: String,
 }
 
+/// A list command with any changes to numbering and indentation around its primary edit.
+pub struct ListEdit {
+    adjustments: Vec<Edit>,
+    /// Adjustments already included in the moved item's replacement text, in source coordinates.
+    moved: Vec<Edit>,
+    pub primary: Edit,
+}
+
+impl ListEdit {
+    /// Changes in back-to-front order, with an existing marker replaced before inserting above it.
+    pub(crate) fn replacements(&self) -> impl Iterator<Item = (&Range<usize>, &str)> {
+        let split =
+            self.adjustments.partition_point(|edit| edit.range.start < self.primary.range.start);
+        let (before, after) = self.adjustments.split_at(split);
+        after
+            .iter()
+            .rev()
+            .chain(std::iter::once(&self.primary))
+            .chain(before.iter().rev())
+            .map(|edit| (&edit.range, edit.text.as_str()))
+    }
+
+    pub fn cursor(&self) -> usize {
+        let inserted_end = self.primary.range.start + self.primary.text.len();
+        let cursor = self.primary.cursor;
+        let original = if cursor > inserted_end {
+            // Inserting above an item leaves the caret on its existing line, whose marker
+            // can grow or shrink.
+            self.primary.range.end + cursor - inserted_end
+        } else {
+            self.primary.range.start
+        };
+        shifted_offset(cursor, original, &self.adjustments)
+    }
+
+    pub(crate) fn moved_offset(&self, from: usize, at: usize) -> usize {
+        let from = shifted_offset(from, from, &self.moved);
+        self.cursor() + shifted_offset(at, at, &self.moved) - from
+    }
+}
+
+/// Moves an offset in step with the replacements before its original source position.
+fn shifted_offset(mut offset: usize, at: usize, edits: &[Edit]) -> usize {
+    for edit in edits.iter().take_while(|edit| edit.range.start < at) {
+        let before = at.min(edit.range.end) - edit.range.start;
+        let after = if at < edit.range.end { before.min(edit.text.len()) } else { edit.text.len() };
+        offset = offset + after - before;
+    }
+    offset
+}
+
+impl From<Edit> for ListEdit {
+    fn from(primary: Edit) -> Self {
+        Self { adjustments: Vec::new(), moved: Vec::new(), primary }
+    }
+}
+
 /// Returns the edit that `key` makes with the cursor at byte `cursor`, or `None` if the cursor
 /// isn't in a list item, so the key should do what it does in ordinary text. In a list, Tab and
 /// Shift+Tab always return an edit, which may change nothing, so they never insert a tab. Lists in
 /// code blocks are code, except in a `table` block, whose content is a list table's list. In other
 /// code, Enter and Shift+Enter keep the line's indentation, and Tab and Shift+Tab move the list
 /// item that holds the block.
+/// Inserting or moving an ordered item renumbers the list from its first number.
 /// Lists and code inside block quotes keep their quote markers on new and rearranged lines.
 /// `MoveDown` and `MoveUp` use the same item context as indentation and swap it with a sibling,
 /// including its children. At a boundary, they return an unchanged edit.
-pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
+pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<ListEdit> {
     if let Some(edit) = quoted_edit(body, cursor, key) {
         return Some(edit);
     }
     let structural = !matches!(key, ListKey::Enter | ListKey::ShiftEnter);
     match code_block(body, cursor) {
         Code::Outside => edit(body, cursor, key, None),
-        Code::Inside { fence, .. } if structural => edit(body, cursor, key, Some(fence)),
-        Code::Inside { indent, .. } => code_newline(body, cursor, indent),
+        Code::Inside { fence, .. } | Code::Math { fence, .. } if structural => {
+            edit(body, cursor, key, Some(fence))
+        }
+        Code::Inside { indent, .. } => code_newline(body, cursor, indent).map(ListEdit::from),
+        Code::Math { indent, .. } => Some(
+            code_newline(body, cursor, indent)
+                .unwrap_or_else(|| Edit {
+                    cursor: cursor + 1,
+                    range: cursor..cursor,
+                    text: "\n".into(),
+                })
+                .into(),
+        ),
         // A new item or a continuation line can follow a code block in a list item.
         Code::Closed { fence } => edit(body, cursor, key, Some(fence)),
         Code::Table { content, indent } => {
@@ -57,16 +128,16 @@ pub fn list_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
             let lines = Dedented::new(&body[content.clone()], indent);
             let at = lines.dedented(cursor - content.start);
             let edit = list_edit(&lines.text, at, key)?;
-            Some(lines.project(&edit, content.start, &" ".repeat(indent)))
+            Some(lines.project_list(&edit, content.start, &" ".repeat(indent)))
         }
     }
 }
 
 /// Edits the list or code inside a quote as text of its own, then restores the quote markers.
 /// Recursion removes one quote level at a time, so nested quotes retain all their markers.
-fn quoted_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
+fn quoted_edit(body: &str, cursor: usize, key: ListKey) -> Option<ListEdit> {
     let quote =
-        Parser::new_ext(body, Options::empty()).into_offset_iter().find_map(|(event, range)| {
+        Parser::new_ext(body, body::options()).into_offset_iter().find_map(|(event, range)| {
             (matches!(event, Event::Start(Tag::BlockQuote(_)))
                 && range.start <= cursor
                 && cursor <= range.end)
@@ -85,7 +156,7 @@ fn quoted_edit(body: &str, cursor: usize, key: ListKey) -> Option<Edit> {
         return None;
     }
     let edit = list_edit(&lines.text, lines.dedented(at), key)?;
-    Some(lines.project(&edit, quote.start, &format!("{}> ", " ".repeat(indent))))
+    Some(lines.project_list(&edit, quote.start, &format!("{}> ", " ".repeat(indent))))
 }
 
 /// Text with indentation or quote markers taken from each line, and the way back to the original's
@@ -175,6 +246,18 @@ impl Dedented {
         Edit { cursor, range, text }
     }
 
+    fn project_list(&self, edit: &ListEdit, base: usize, prefix: &str) -> ListEdit {
+        ListEdit {
+            adjustments: edit
+                .adjustments
+                .iter()
+                .map(|edit| self.project(edit, base, prefix))
+                .collect(),
+            moved: edit.moved.iter().map(|edit| self.project(edit, base, prefix)).collect(),
+            primary: self.project(&edit.primary, base, prefix),
+        }
+    }
+
     fn line(&self, at: usize, original: bool) -> (usize, usize, usize) {
         let index = self.lines.partition_point(|&(dedented, from, removed)| {
             if original { from + removed <= at } else { dedented <= at }
@@ -198,7 +281,7 @@ impl Dedented {
 
 /// The edit that `key` makes outside code. In a code block or after its closing fence, `fence` is
 /// the byte offset of its opening fence, and the item is the one that holds the fence.
-fn edit(body: &str, cursor: usize, key: ListKey, fence: Option<usize>) -> Option<Edit> {
+fn edit(body: &str, cursor: usize, key: ListKey, fence: Option<usize>) -> Option<ListEdit> {
     let lines = lines(body);
     let line_at = |at: usize| lines.iter().position(|line| line.start <= at && at <= line.end);
     let current = line_at(cursor)?;
@@ -219,18 +302,19 @@ fn edit(body: &str, cursor: usize, key: ListKey, fence: Option<usize>) -> Option
     if fence.is_some_and(|fence| fence - lines[from].start < item.content_column) {
         return None;
     }
-    match key {
-        ListKey::Enter => Some(enter(body, &lines, current, owner, &item, cursor)),
+    let edit = match key {
+        ListKey::Enter => return Some(enter(body, &lines, current, owner, &item, cursor)),
         ListKey::MoveDown | ListKey::MoveUp => {
-            Some(move_item(body, &lines, owner, &item, cursor, key == ListKey::MoveDown))
+            return Some(move_item(body, &lines, owner, &item, cursor, key == ListKey::MoveDown));
         }
         ListKey::ShiftEnter => {
             let text = format!("\n{}", " ".repeat(item.content_column));
-            Some(Edit { cursor: cursor + text.len(), range: cursor..cursor, text })
+            Edit { cursor: cursor + text.len(), range: cursor..cursor, text }
         }
-        ListKey::Tab => Some(indent(body, &lines, owner, &item, cursor)),
-        ListKey::ShiftTab => Some(outdent(body, &lines, owner, &item, cursor)),
-    }
+        ListKey::Tab => indent(body, &lines, owner, &item, cursor),
+        ListKey::ShiftTab => outdent(body, &lines, owner, &item, cursor),
+    };
+    Some(edit.into())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -321,21 +405,11 @@ impl Item {
         Some(Self { checkbox, content_column, content_start, indent, marker })
     }
 
-    /// The start of a new item like this one, at `indent`, numbered after this one.
-    fn next_prefix(&self, indent: usize) -> String {
+    /// The start of a new item like this one.
+    fn prefix(&self, number: u64) -> String {
         let marker = match self.marker {
             Marker::Bullet(bullet) => bullet.to_string(),
-            Marker::Ordered { delimiter, number } => format!("{}{delimiter}", number + 1),
-        };
-        let checkbox = if self.checkbox { "[ ] " } else { "" };
-        format!("{}{marker} {checkbox}", " ".repeat(indent))
-    }
-
-    /// The start of a new item like this one, with the same number, for inserting before it.
-    fn same_prefix(&self) -> String {
-        let marker = match self.marker {
-            Marker::Bullet(bullet) => bullet.to_string(),
-            Marker::Ordered { delimiter, number } => format!("{number}{delimiter}"),
+            Marker::Ordered { delimiter, .. } => format!("{number}{delimiter}"),
         };
         let checkbox = if self.checkbox { "[ ] " } else { "" };
         format!("{}{marker} {checkbox}", " ".repeat(self.indent))
@@ -349,8 +423,15 @@ fn lines(body: &str) -> Vec<Line<'_>> {
         lines.push(Line { start, end: start + text.len(), text, code: CodeLine::Outside });
         start += text.len() + 1;
     }
-    for (event, range) in Parser::new_ext(body, Options::empty()).into_offset_iter() {
-        let Event::Start(Tag::CodeBlock(_)) = event else { continue };
+    for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+        let literal = match event {
+            Event::Start(Tag::CodeBlock(_)) => true,
+            Event::DisplayMath(_) => body[range.clone()].contains('\n'),
+            _ => false,
+        };
+        if !literal {
+            continue;
+        }
         let block = body[range.clone()].trim_end_matches(['\n', '\r']);
         let end = range.start + block.len();
         for line in lines.iter_mut().filter(|line| line.end >= range.start && line.start <= end) {
@@ -369,6 +450,11 @@ enum Code {
         fence: usize,
         indent: usize,
     },
+    /// Display math, whose source takes line breaks like code.
+    Math {
+        fence: usize,
+        indent: usize,
+    },
     /// At the end of the closing fence of a code block whose opening fence starts at byte `fence`.
     Closed {
         fence: usize,
@@ -382,8 +468,19 @@ enum Code {
 }
 
 fn code_block(body: &str, cursor: usize) -> Code {
-    for (event, range) in Parser::new_ext(body, Options::empty()).into_offset_iter() {
-        let Event::Start(Tag::CodeBlock(kind)) = event else { continue };
+    for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+        if matches!(event, Event::DisplayMath(_)) && range.contains(&cursor) {
+            let line_start = body[..range.start].rfind('\n').map_or(0, |i| i + 1);
+            let prefix = &body[line_start..range.start];
+            let indent = Item::parse(prefix).map_or_else(
+                || prefix.len() - prefix.trim_start_matches(' ').len(),
+                |item| item.content_column,
+            );
+            return Code::Math { fence: range.start, indent };
+        }
+        let Event::Start(Tag::CodeBlock(kind)) = event else {
+            continue;
+        };
         // The end of the closing fence's line is in the block too.
         let block = body[range.clone()].trim_end_matches(['\n', '\r']);
         if !(range.start <= cursor && cursor <= range.start + block.len()) {
@@ -527,42 +624,174 @@ fn enter(
     owner: usize,
     item: &Item,
     cursor: usize,
-) -> Edit {
+) -> ListEdit {
     let line = lines[current];
     let list_top = current == 0 || self::owner(lines, current - 1).is_none();
     if current == owner && list_top && cursor <= line.start + item.indent {
-        return Edit { cursor: cursor + 1, range: line.start..line.start, text: "\n".into() };
+        return Edit { cursor: cursor + 1, range: line.start..line.start, text: "\n".into() }
+            .into();
     }
     if current == owner && line.text[item.content_start..].trim().is_empty() {
         if item.indent > 0 {
             let indent = parent_indent(lines, owner, item);
             let range = line.start..line.start + item.indent;
             let cursor = line.end - item.indent + indent;
-            return Edit { cursor, range, text: " ".repeat(indent) };
+            return Edit { cursor, range, text: " ".repeat(indent) }.into();
         }
         let after_text = current > 0 && !lines[current - 1].is_blank();
         let text = if after_text { "\n" } else { "" }.to_owned();
-        return Edit { cursor: line.start + text.len(), range: line.start..line.end, text };
+        return Edit { cursor: line.start + text.len(), range: line.start..line.end, text }.into();
     }
     if current == owner && cursor <= line.start + item.content_start {
-        let text = format!("{}\n", item.same_prefix());
-        return Edit { cursor: cursor + text.len(), range: line.start..line.start, text };
+        return insert_item(body, lines, owner, item, Insertion::Before, |number| {
+            let text = format!("{}\n", item.prefix(number));
+            Edit { cursor: cursor + text.len(), range: line.start..line.start, text }
+        });
     }
     if body[cursor..line.end].trim().is_empty() {
         // From the cursor's line, which a code block's blank lines can separate from the item's.
         let last = last_continuation(lines, current);
         let at = lines[last].end;
         let child = lines.get(last + 1).and_then(Line::item);
-        let prefix = match child.filter(|child| child.indent > item.indent) {
-            Some(child) => child.same_prefix(),
-            None => item.next_prefix(item.indent),
+        let (index, template, insertion) = match child.as_ref() {
+            Some(child) if child.indent > item.indent => (last + 1, child, Insertion::Before),
+            _ => (owner, item, Insertion::After),
         };
-        let text = format!("\n{prefix}");
-        return Edit { cursor: at + text.len(), range: at..at, text };
+        return insert_item(body, lines, index, template, insertion, |number| {
+            let text = format!("\n{}", template.prefix(number));
+            Edit { cursor: at + text.len(), range: at..at, text }
+        });
     }
     let spaces = body[cursor..line.end].len() - body[cursor..line.end].trim_start().len();
-    let text = format!("\n{}", item.next_prefix(item.indent));
-    Edit { cursor: cursor + text.len(), range: cursor..cursor + spaces, text }
+    insert_item(body, lines, owner, item, Insertion::After, |number| {
+        let text = format!("\n{}", item.prefix(number));
+        Edit { cursor: cursor + text.len(), range: cursor..cursor + spaces, text }
+    })
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Insertion {
+    After,
+    Before,
+}
+
+fn insert_item(
+    body: &str,
+    lines: &[Line],
+    index: usize,
+    item: &Item,
+    insertion: Insertion,
+    make_edit: impl FnOnce(u64) -> Edit,
+) -> ListEdit {
+    let Marker::Ordered { number, .. } = item.marker else {
+        return make_edit(0).into();
+    };
+    let after = usize::from(insertion != Insertion::Before);
+    let marker = lines[index].start + item.indent;
+    let Some((list, owner)) = ordered_siblings(body, marker) else {
+        return make_edit(ordered_number(number, after)).into();
+    };
+    let position = owner + after;
+    let number = ordered_number(list.start, position);
+    let primary = make_edit(number);
+    let mut adjustments = Vec::new();
+    for (index, range) in list.items.into_iter().enumerate() {
+        let number_at = ordered_number(list.start, index + usize::from(index >= position));
+        let split = (insertion == Insertion::After && index == owner)
+            .then(|| (&primary.range, item.indent + number.to_string().len() + 2));
+        renumber_item(body, lines, range, number_at, split, &mut adjustments);
+    }
+    ListEdit { adjustments, moved: Vec::new(), primary }
+}
+
+fn ordered_number(start: u64, position: usize) -> u64 {
+    // CommonMark allows up to nine digits in a marker. Only the first marker sets the start.
+    (start + position as u64) % 1_000_000_000
+}
+
+struct OrderedList {
+    items: Vec<Range<usize>>,
+    start: u64,
+}
+
+/// Finds the list that starts an item at `marker` and the item's index among its siblings.
+fn ordered_siblings(body: &str, marker: usize) -> Option<(OrderedList, usize)> {
+    let mut lists = Vec::<Option<OrderedList>>::new();
+    for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::List(start)) => {
+                let list = start
+                    .filter(|_| range.contains(&marker))
+                    .map(|start| OrderedList { items: Vec::new(), start });
+                lists.push(list);
+            }
+            Event::Start(Tag::Item) => {
+                if let Some(Some(list)) = lists.last_mut() {
+                    list.items.push(range);
+                }
+            }
+            Event::End(TagEnd::List(_)) => {
+                if let Some(Some(list)) = lists.pop()
+                    && let Some(index) = list.items.iter().position(|range| range.start == marker)
+                {
+                    return Some((list, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Changes a marker and keeps its continuation lines and children under its content. When
+/// inserting within an item, the lines past the insertion belong to the new marker instead.
+fn renumber_item(
+    body: &str,
+    lines: &[Line],
+    range: Range<usize>,
+    number: u64,
+    split: Option<(&Range<usize>, usize)>,
+    edits: &mut Vec<Edit>,
+) {
+    let width = body[range.clone()].bytes().take_while(u8::is_ascii_digit).count();
+    let digits = range.start..range.start + width;
+    let changed = body[digits.clone()].parse::<u64>() != Ok(number);
+    if !changed && split.is_none() {
+        return;
+    }
+    let new_width = if changed {
+        let text = number.to_string();
+        let new_width = text.len();
+        edits.push(Edit { cursor: digits.start, range: digits, text });
+        new_width
+    } else {
+        width
+    };
+    let start = lines.partition_point(|line| line.start <= range.start);
+    let line = lines[start - 1];
+    let Some(item) = line.item().filter(|item| line.start + item.indent == range.start) else {
+        return;
+    };
+    let old_column = item.content_column;
+    let resized = old_column - width + new_width;
+    if resized == old_column && split.is_none() {
+        return;
+    }
+    for line in lines[start..].iter().take_while(|line| line.start < range.end) {
+        let indent = line.indent();
+        let new_column = match split {
+            Some((at, column)) if line.start > at.end => column,
+            Some((at, _)) if line.start <= at.start && at.start < line.start + indent => continue,
+            _ => resized,
+        };
+        if new_column != old_column && indent >= old_column {
+            edits.push(Edit {
+                cursor: line.start,
+                range: line.start..line.start + old_column.saturating_sub(new_column),
+                text: " ".repeat(new_column.saturating_sub(old_column)),
+            });
+        }
+    }
 }
 
 fn indent(body: &str, lines: &[Line], owner: usize, item: &Item, cursor: usize) -> Edit {
@@ -599,7 +828,7 @@ fn move_item(
     item: &Item,
     cursor: usize,
     down: bool,
-) -> Edit {
+) -> ListEdit {
     let last = subtree_end(lines, owner, item);
     let last = lines
         .iter()
@@ -620,18 +849,60 @@ fn move_item(
         lines[gap].iter().all(Line::is_blank).then_some((i, end))
     });
     let Some((other, other_end)) = adjacent else {
-        return Edit { cursor, range: cursor..cursor, text: String::new() };
+        return Edit { cursor, range: cursor..cursor, text: String::new() }.into();
     };
     let (first, first_end, second, second_end) =
         if down { (owner, last, other, other_end) } else { (other, other_end, owner, last) };
-    let start = lines[first].start;
-    let middle = &body[lines[first_end].end..lines[second].start];
-    let before = &body[start..lines[first_end].end];
-    let after = &body[lines[second].start..lines[second_end].end];
+    let first = lines[first].start..lines[first_end].end;
+    let second = lines[second].start..lines[second_end].end;
+    let range = first.start..second.end;
+    let mut adjustments = Vec::new();
+    let marker = lines[owner].start + item.indent;
+    let other_marker = lines[other].start + item.indent;
+    if matches!(item.marker, Marker::Ordered { .. })
+        && let Some((list, from)) = ordered_siblings(body, marker)
+        && let Some(to) = list.items.iter().position(|range| range.start == other_marker)
+    {
+        for (index, range) in list.items.into_iter().enumerate() {
+            let position = if index == from {
+                to
+            } else if index == to {
+                from
+            } else {
+                index
+            };
+            let number = ordered_number(list.start, position);
+            renumber_item(body, lines, range, number, None, &mut adjustments);
+        }
+    }
+    // The swap already replaces both subtrees. Include their changes there and apply the
+    // other siblings' marker changes directly to the original text.
+    let start = adjustments.partition_point(|edit| edit.range.start < range.start);
+    let end = adjustments.partition_point(|edit| edit.range.start < range.end);
+    let inside: Vec<_> = adjustments.drain(start..end).collect();
+    let in_item = |range: &Range<usize>, edit: &Edit| {
+        range.start <= edit.range.start && edit.range.end <= range.end
+    };
+    let numbered = |range: &Range<usize>| {
+        let mut text = body[range.clone()].to_owned();
+        for edit in inside.iter().rev().filter(|edit| in_item(range, edit)) {
+            text.replace_range(
+                edit.range.start - range.start..edit.range.end - range.start,
+                &edit.text,
+            );
+        }
+        text
+    };
+    let before = numbered(&first);
+    let after = numbered(&second);
+    let middle = &body[first.end..second.start];
     let text = format!("{after}{middle}{before}");
-    let cursor =
-        cursor - lines[owner].start + start + if down { after.len() + middle.len() } else { 0 };
-    Edit { cursor, range: start..lines[second_end].end, text }
+    let source = if down { first } else { second };
+    let moved: Vec<_> = inside.into_iter().filter(|edit| in_item(&source, edit)).collect();
+    let moved_start = range.start + if down { after.len() + middle.len() } else { 0 };
+    let at = moved_start + cursor - source.start;
+    let cursor = shifted_offset(at, cursor, &moved);
+    ListEdit { adjustments, moved, primary: Edit { cursor, range, text } }
 }
 
 /// Rewrites the item at `owner` and its children, replacing the first `n` bytes of each line with
@@ -705,8 +976,11 @@ mod tests {
         let body = before.replacen('|', "", 1);
         let edit = list_edit(&body, cursor, key)?;
         let mut after = body;
-        after.replace_range(edit.range, &edit.text);
-        after.insert(edit.cursor, '|');
+        let cursor = edit.cursor();
+        for (range, text) in edit.replacements() {
+            after.replace_range(range.clone(), text);
+        }
+        after.insert(cursor, '|');
         Some(after)
     }
 

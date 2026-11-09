@@ -18,10 +18,12 @@ pub enum Rendered {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Drawing {
     pub block: bool,
-    /// Clicking a block enters its second line, past quote markers and list indentation.
+    /// The click target, past quote markers and list indentation.
     pub cursor: usize,
     /// The source position that sets the drawing's left inset, before centering it.
     pub indent: usize,
+    /// The entry point on the last source line when moving up into the block.
+    pub last_line: usize,
     /// The source of the displayed result, which can precede the current source while rendering.
     pub preview: Option<Source>,
     pub range: Range<usize>,
@@ -109,26 +111,34 @@ pub(super) fn collect(
             .chain(display.quotes.iter().filter(|q| q.line.start == start).map(|q| q.start))
             .max()
             .unwrap_or(start);
-        let cursor = if drawn.block {
-            text[drawn.range.clone()].find('\n').map_or(drawn.range.start, |newline| {
-                let start = drawn.range.start + newline + 1;
-                let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
-                let mut at = start;
-                if let Some(quote) = display.quotes.iter().find(|q| q.line.start == start) {
-                    at = quote.start;
-                    for _ in 0..quote.depth {
-                        if !text[at..end].starts_with('>') {
-                            break;
-                        }
-                        at += 1;
-                        at += text[at..end].len() - text[at..end].trim_start_matches(' ').len();
+        let source = &text[drawn.range.clone()];
+        let entry = |newline| {
+            let start = drawn.range.start + newline + 1;
+            let end =
+                text[start..drawn.range.end].find('\n').map_or(drawn.range.end, |i| start + i);
+            let mut at = start;
+            if let Some(quote) = display.quotes.iter().find(|q| q.line.start == start) {
+                at = quote.start.min(end);
+                for _ in 0..quote.depth {
+                    if !text[at..end].starts_with('>') {
+                        break;
                     }
+                    at += 1;
+                    at += text[at..end].len() - text[at..end].trim_start_matches(' ').len();
                 }
-                at + text[at..end].len() - text[at..end].trim_start_matches([' ', '\t']).len()
-            })
+            }
+            at + text[at..end].len() - text[at..end].trim_start_matches([' ', '\t']).len()
+        };
+        // Skip the opening delimiter when clicking a drawing with one. A pipe table starts with
+        // its header, which is already editable content.
+        let pipe_table =
+            matches!(&drawn.drawing, Source::Table(table) if !table.alignments.is_empty());
+        let cursor = if drawn.block && !pipe_table {
+            source.find('\n').map_or(drawn.range.start, entry)
         } else {
             drawn.range.start
         };
+        let last_line = source.rfind('\n').map_or(drawn.range.start, entry);
         let usable = |result: &Rendered| match result {
             Rendered::Error(_) | Rendered::Table => true,
             Rendered::Image(size) => size.width > 0 && size.height > 0,
@@ -156,6 +166,7 @@ pub(super) fn collect(
             block: drawn.block,
             cursor,
             indent,
+            last_line,
             preview: key,
             range: drawn.range,
             rendered,

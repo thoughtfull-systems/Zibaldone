@@ -633,19 +633,22 @@ impl Editor {
             return false;
         }
         let range = self.selection.range();
-        let Some(edit) = list_edit(&self.text, range.start, key) else { return false };
+        let Some(command) = list_edit(&self.text, range.start, key) else {
+            return false;
+        };
+        let edit = &command.primary;
         if edit.range.is_empty() && edit.text.is_empty() {
             return true;
         }
         let selection = if range.is_empty() {
-            Selection::cursor(edit.cursor)
+            Selection::cursor(command.cursor())
         } else {
             if range.start < edit.range.start || range.end > edit.range.end {
                 return false;
             }
             let map = |at| {
                 if matches!(key, ListKey::MoveDown | ListKey::MoveUp) {
-                    edit.cursor + at - range.start
+                    command.moved_offset(range.start, at)
                 } else {
                     edit.range.start
                         + reindented_offset(
@@ -657,11 +660,7 @@ impl Editor {
             };
             Selection { anchor: map(self.selection.anchor), head: map(self.selection.head) }
         };
-        self.replace(edit.range, &edit.text, true);
-        self.place(Selection {
-            anchor: self.boundary(selection.anchor),
-            head: self.boundary(selection.head),
-        });
+        self.replace_many(command.replacements(), selection, true);
         true
     }
 
@@ -775,6 +774,16 @@ impl Editor {
     /// Replaces `range` with `with`, commits it, and puts the cursor after it. A `separate` edit is
     /// an undo step of its own, and doesn't merge with typing around it.
     fn replace(&mut self, range: Range<usize>, with: &str, separate: bool) {
+        let selection = Selection::cursor(range.start + with.len());
+        self.replace_many([(&range, with)], selection, separate);
+    }
+
+    fn replace_many<'a>(
+        &mut self,
+        changes: impl IntoIterator<Item = (&'a Range<usize>, &'a str)>,
+        selection: Selection,
+        separate: bool,
+    ) {
         self.goal = None;
         if separate {
             self.checkpoint();
@@ -783,11 +792,13 @@ impl Editor {
         }
         self.remember_selection();
         // A failed edit leaves the text as it was, which `refresh` then shows.
-        if !range.is_empty() {
-            let _ = self.body.delete_utf8(range.start, range.len());
-        }
-        if !with.is_empty() {
-            let _ = self.body.insert_utf8(range.start, with);
+        for (range, text) in changes {
+            if !range.is_empty() {
+                let _ = self.body.delete_utf8(range.start, range.len());
+            }
+            if !text.is_empty() {
+                let _ = self.body.insert_utf8(range.start, text);
+            }
         }
         self.doc.commit();
         if separate {
@@ -795,8 +806,10 @@ impl Editor {
         }
         self.text = self.body.to_string();
         self.refresh_previews();
-        let at = self.boundary((range.start + with.len()).min(self.text.len()));
-        self.place(Selection::cursor(at));
+        self.place(Selection {
+            anchor: self.boundary(selection.anchor),
+            head: self.boundary(selection.head),
+        });
     }
 
     /// Reconcile occurrences by their live cursor ranges, never by a nearby drawing's kind alone.

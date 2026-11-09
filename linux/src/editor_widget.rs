@@ -1122,9 +1122,32 @@ impl EditorWidget {
     /// the first or last line.
     fn vertical(&self, at: usize, goal: f64, down: bool) -> Option<usize> {
         let lines = self.imp().lines.borrow();
-        let (current_y, height) = row_extents(&lines, at)?;
+        let block_rows = || {
+            lines.iter().flat_map(|line| {
+                line.blocks.iter().filter(|block| block.collapsed).map(|block| {
+                    (line.y + f64::from(block.rect.y()), f64::from(block.rect.height()), block)
+                })
+            })
+        };
+        let (current_y, height) = block_rows()
+            .find(|(_, _, block)| block.range.contains(&at))
+            .map(|(top, height, _)| (top, height))
+            .or_else(|| row_extents(&lines, at))?;
+        let in_direction = |top, bottom| {
+            (down && top >= current_y + height - 0.01) || (!down && bottom <= current_y + 0.01)
+        };
         let mut candidates = Vec::new();
+        for (top, height, block) in block_rows() {
+            if in_direction(top, top + height) {
+                let entry = if down { block.cursor } else { block.last_line };
+                candidates.push((top, top + height / 2.0, Some(entry)));
+            }
+        }
         for line in lines.iter() {
+            // A collapsed block with no preceding text has no editable layout row.
+            if line.layout.text().is_empty() && line.blocks.iter().any(|block| block.collapsed) {
+                continue;
+            }
             let mut layouts = vec![(&line.layout, line.y)];
             for image in &line.images {
                 if let (Some(layout), Some(rect)) = (&image.source_layout, source_rect(line, image))
@@ -1138,10 +1161,8 @@ impl EditorWidget {
                     let (_, logical) = rows.line_extents();
                     let top = y + pixels(logical.y());
                     let bottom = top + pixels(logical.height());
-                    if (down && top >= current_y + height - 0.01)
-                        || (!down && bottom <= current_y + 0.01)
-                    {
-                        candidates.push((top, f64::midpoint(top, bottom)));
+                    if in_direction(top, bottom) {
+                        candidates.push((top, f64::midpoint(top, bottom), None));
                     }
                     if !rows.next_line() {
                         break;
@@ -1153,7 +1174,10 @@ impl EditorWidget {
         if !down {
             candidates.reverse();
         }
-        for (top, center) in candidates {
+        for (top, center, entry) in candidates {
+            if let Some(entry) = entry {
+                return Some(entry);
+            }
             let next = self.position_at(goal, center);
             // An image points into its source row below. Skip that non-editable row when moving
             // out of the source, rather than landing in the source again.

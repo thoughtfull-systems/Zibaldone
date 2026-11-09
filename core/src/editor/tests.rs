@@ -264,6 +264,109 @@ fn list_keys_edit_list_items() {
 }
 
 #[test]
+fn inserting_an_ordered_item_renumbers_its_list_in_one_undo_step() {
+    for (before, after) in [
+        ("1. first|\n2. second\n2. third", "1. first\n2. |\n3. second\n4. third"),
+        (
+            "1. one\n5. nthou|\n2. two\n3. three\n4. five\n6. four\n7. ",
+            "1. one\n2. nthou\n3. |\n4. two\n5. three\n6. five\n7. four\n8. ",
+        ),
+        (
+            "1. first\n29. second\n55. |third\n6. fourth",
+            "1. first\n2. second\n3. \n4. |third\n5. fourth",
+        ),
+        ("9. |first\n10. second", "9. \n10. |first\n11. second"),
+        ("999999999. first|\n0. second", "999999999. first\n0. |\n1. second"),
+        (
+            "8. first|\n\n9. second\n   - child\n10. third\n\n3) another list",
+            "8. first\n9. |\n\n10. second\n    - child\n11. third\n\n3) another list",
+        ),
+        (
+            "> - parent\n>   1) spl|it\n>   2) other\n> - sibling",
+            "> - parent\n>   1) spl\n>   2) |it\n>   3) other\n> - sibling",
+        ),
+        (
+            "```table\n- row\n  - cell\n\n    1. first|\n    2. second\n```",
+            "```table\n- row\n  - cell\n\n    1. first\n    2. |\n    3. second\n```",
+        ),
+        ("9. spl|it\n   - child\n10. second", "9. spl\n10. |it\n    - child\n11. second"),
+        (
+            "9. first|\n\n   continuation\n10. second",
+            "9. first\n10. |\n\n    continuation\n11. second",
+        ),
+        (
+            "1. first\n55. spl|it\n    - child\n9. third",
+            "1. first\n2. spl\n3. |it\n   - child\n4. third",
+        ),
+        (
+            "1. outer\n\n   3) first\n   8) second|\n   9) third\n7. other",
+            "1. outer\n\n   3) first\n   4) second\n   5) |\n   6) third\n7. other",
+        ),
+    ] {
+        let mut e = editor(before);
+        e.newline(false);
+        assert_eq!(shown(&e), after);
+        assert!(e.undo());
+        assert_eq!(shown(&e), before);
+        assert!(e.redo());
+        assert_eq!(shown(&e), after);
+    }
+}
+
+#[test]
+fn moving_an_ordered_item_renumbers_its_list_and_keeps_the_selection() {
+    for (before, key, after) in [
+        ("intro\n1. one\n5. tw|o\n8. three", ListKey::MoveUp, "intro\n1. tw|o\n2. one\n3. three"),
+        (
+            "8. first\n9. |second\n   continuation|\n99. third",
+            ListKey::MoveDown,
+            "8. first\n9. third\n10. |second\n    continuation|",
+        ),
+        (
+            "1. first\n89. second\n3. third|\n\n   4) child\n   8) child\n6. fourth",
+            ListKey::MoveDown,
+            "1. first\n2. second\n3. fourth\n4. third|\n\n   4) child\n   8) child",
+        ),
+        (
+            "> 1. first\n> 81. second\n> 7. third|\n\n3) other",
+            ListKey::MoveUp,
+            "> 1. first\n> 2. third|\n> 3. second\n\n3) other",
+        ),
+        (
+            "1. outer\n\n   3) first|\n   8) second\n   9) third\n7. other",
+            ListKey::MoveDown,
+            "1. outer\n\n   3) second\n   4) first|\n   5) third\n7. other",
+        ),
+    ] {
+        let mut e = editor(before);
+        assert!(e.list_key(key));
+        assert_eq!(shown(&e), after);
+        assert!(e.undo());
+        assert_eq!(shown(&e), before);
+        assert!(e.redo());
+        assert_eq!(shown(&e), after);
+    }
+}
+
+#[test]
+fn enter_inside_display_math_keeps_the_formula_in_its_container() {
+    for (before, after) in [
+        (
+            "- [x] Left align block math\n  $$\n  f=h(x)|\n  f=h(x)\n  $$\n- [x] Next task",
+            "- [x] Left align block math\n  $$\n  f=h(x)\n  |\n  f=h(x)\n  $$\n- [x] Next task",
+        ),
+        ("> $$\n> x|+y\n> $$", "> $$\n> x\n> |+y\n> $$"),
+        ("- a\n  $$x|+y$$", "- a\n  $$x\n  |+y$$"),
+    ] {
+        for continues in [false, true] {
+            let mut e = editor(before);
+            e.newline(continues);
+            assert_eq!(shown(&e), after);
+        }
+    }
+}
+
+#[test]
 fn toggles_tasks_with_the_selection_in_place() {
     let mut e = editor("- [ ] task|");
     assert!(e.toggle_task(2));

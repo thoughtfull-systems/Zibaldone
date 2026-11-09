@@ -36,6 +36,7 @@ pub(super) struct Block {
     pub collapsed: bool,
     pub content: Content,
     pub cursor: usize,
+    pub last_line: usize,
     pub range: Range<usize>,
     pub rect: graphene::Rect,
 }
@@ -135,6 +136,7 @@ pub(super) fn append(
         collapsed: drawing.collapsed(),
         content,
         cursor: drawing.cursor,
+        last_line: drawing.last_line,
         range: drawing.range.clone(),
         rect,
     });

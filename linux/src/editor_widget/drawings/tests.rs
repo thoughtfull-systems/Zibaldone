@@ -159,6 +159,31 @@ fn display_math_preserves_text_before_and_after_its_source() {
 }
 
 #[test]
+fn up_enters_rendered_math_and_diagrams_on_the_last_source_line() {
+    for (source, first, last) in [
+        ("```mermaid\nflowchart LR\na-->b\n```", "flowchart LR", "```"),
+        ("$$\nx+y\nz\n$$", "x+y", "$$"),
+        ("```math\nx+y\n```", "x+y", "```"),
+    ] {
+        let text = format!("above\n\n{source}\n\nbelow|");
+        let Some(widget) = widget(&text) else { return };
+        supply(&widget, ImageSize { width: 120, height: 80 });
+        let up = |widget: &EditorWidget| widget.key(gdk::Key::Up, gdk::ModifierType::empty());
+        let down = |widget: &EditorWidget| widget.key(gdk::Key::Down, gdk::ModifierType::empty());
+        up(&widget);
+        up(&widget);
+        assert_eq!(head(&widget), text.rfind(last).unwrap(), "{source}");
+        down(&widget);
+        assert_eq!(head(&widget), text.find("\n\nbelow").unwrap() + 1);
+
+        widget.edit(|e| e.move_to(0, false));
+        down(&widget);
+        down(&widget);
+        assert_eq!(head(&widget), text.find(first).unwrap(), "{source}");
+    }
+}
+
+#[test]
 fn failures_keep_source_and_block_errors_wrap_without_entering_the_body() {
     for text in ["$bad$\n|end", "```mermaid\nbad\n```\n|end"] {
         let Some(widget) = widget(text) else { return };
