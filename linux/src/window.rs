@@ -1507,9 +1507,10 @@ impl Window {
         widget.connect_paste_image(move |clipboard, target| {
             let (w, editing) = (w.clone(), editing.clone());
             glib::spawn_future_local(async move {
+                let state = w.inner().state.clone();
+                let spaces = core(async move { state.spaces().await }).await;
                 let Some(space) =
-                    crate::chat::choose_destination(&w, w.inner().state.clone(), "Pasted image")
-                        .await
+                    crate::chat::choose_destination(&w, &spaces, "Pasted image").await
                 else {
                     return;
                 };

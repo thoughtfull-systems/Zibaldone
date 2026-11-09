@@ -385,7 +385,18 @@ impl Chat {
                         // No note gets created; the core ignores the destination for an empty chat.
                         Some(Id::generate())
                     } else {
-                        choose_destination(&window, state.clone(), &session.title).await
+                        let spaces = core({
+                            let state = state.clone();
+                            async move { state.space_list().await }
+                        })
+                        .await;
+                        if let Some(space) = unambiguous_archive_space(&spaces) {
+                            Some(space)
+                        } else {
+                            let choices: Vec<_> =
+                                spaces.into_iter().map(|(id, name, _)| (id, name)).collect();
+                            choose_destination(&window, &choices, &session.title).await
+                        }
                     };
                     if let Some(space) = destination {
                         Some(core(async move { state.agent.archive(&*state, space).await }).await)
@@ -538,12 +549,20 @@ fn update_text(window: &Window, widget: &EditorWidget, text: &str) -> bool {
     true
 }
 
+fn unambiguous_archive_space(spaces: &[(Id, String, bool)]) -> Option<Id> {
+    if let [(id, _, _)] = spaces {
+        return Some(*id);
+    }
+    let mut shown = spaces.iter().filter(|(_, _, hidden)| !hidden);
+    let (id, _, _) = shown.next()?;
+    shown.next().is_none().then_some(*id)
+}
+
 pub(crate) async fn choose_destination(
     window: &Window,
-    state: Arc<State>,
+    spaces: &[(Id, String)],
     title: &str,
 ) -> Option<Id> {
-    let spaces = core(async move { state.spaces().await }).await;
     let names: Vec<&str> = spaces.iter().map(|(_, name)| name.as_str()).collect();
     let picker = gtk::DropDown::from_strings(&names);
     if let Some(index) = spaces.iter().position(|(id, _)| Some(*id) == window.current_space_id()) {
@@ -594,4 +613,28 @@ pub(crate) fn request_destination(
             .flatten();
         let _ = reply.send(space);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_destination_uses_the_only_space_or_the_only_shown_space() {
+        let first = Id::generate();
+        let second = Id::generate();
+        let mut spaces = vec![(first, "First".into(), false)];
+        assert_eq!(unambiguous_archive_space(&spaces), Some(first));
+        spaces[0].2 = true;
+        assert_eq!(unambiguous_archive_space(&spaces), Some(first));
+
+        spaces.push((second, "Second".into(), false));
+        assert_eq!(unambiguous_archive_space(&spaces), Some(second));
+        spaces[0].2 = false;
+        assert_eq!(unambiguous_archive_space(&spaces), None);
+        spaces[0].2 = true;
+        spaces[1].2 = true;
+        assert_eq!(unambiguous_archive_space(&spaces), None);
+        assert_eq!(unambiguous_archive_space(&[]), None);
+    }
 }

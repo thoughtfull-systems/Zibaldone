@@ -115,3 +115,7 @@ Linux shows the agent in a resizable right sidebar. A button shows or hides it. 
 between the note editor and composer, showing the sidebar when necessary. Ctrl+Enter and Send submit
 the draft. Enter retains the markdown editor's behavior. Stop ends generation. The Settings screen
 starts with agent settings.
+
+When archiving a chat, Linux uses the only space if the machine holds one. If the machine holds more
+than one space and shows only one in the note list, Linux uses the shown space. Otherwise, the
+destination picker lists every space. A pending archive keeps its recorded destination.
