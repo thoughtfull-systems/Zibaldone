@@ -518,6 +518,21 @@ impl State {
         space.lock().await.open_body(id)
     }
 
+    pub(crate) async fn spelling_dictionary(&self, space_id: Id, word: Option<&str>) -> Result<Id> {
+        let space = self.space(space_id).await?;
+        let mut space = space.lock().await;
+        let before = space.version();
+        let note = match word {
+            Some(word) => space.add_spelling_word(word)?,
+            None => space.spelling_dictionary()?,
+        };
+        if space.version() != before {
+            self.reindex_note(space_id, &space, note);
+            self.changed_here(space_id);
+        }
+        Ok(note)
+    }
+
     /// Records that an editor changed a note's body directly: updates its metadata and its place
     /// in the search index, and has the space saved and synced.
     pub async fn body_edited(&self, space_id: Id, id: Id) -> Result<()> {

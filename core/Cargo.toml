@@ -49,6 +49,7 @@ rusqlite = "0.41.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_json = "1.0.145"
+spellbook = "0.4.2"
 thiserror = "2.0.17"
 tokio = { version = "1.54.1", features = [
   "fs",
@@ -66,6 +67,7 @@ typst-kit = { version = "0.15.1", default-features = false, features = [
 ], optional = true }
 typst-layout = { version = "0.15.1", optional = true }
 typst-pdf = { version = "0.15.1", optional = true }
+unicode-normalization = "0.1.26"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
 url = "2.5.8"

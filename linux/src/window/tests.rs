@@ -218,6 +218,50 @@ fn default_editor_edits_the_shared_body_and_keeps_it_through_navigation_and_clos
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn space_dictionary_menu_opens_the_note_created_by_adding_a_word() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(root.path());
+    let state = runtime.block_on(State::for_test(dirs.clone())).unwrap();
+    let (space, note) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        (space, state.create_note(space, "Original note").await.unwrap())
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.DictionaryTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    window.open_note(space, note);
+    let widget = &window.inner().widget;
+    until(|| widget.text().as_deref() == Some("Original note"));
+    window.spelling_dictionary(Some("Quxley".into()));
+    until(|| !state.search("quxley", 20).is_empty());
+    assert_eq!(widget.text().as_deref(), Some("Original note"));
+    WidgetExt::activate_action(&window.inner().window, "win.edit-space-dictionary", None).unwrap();
+    until(|| widget.text().as_deref() == Some("# Spelling Dictionary\n\nQuxley"));
+    let dictionary = window.inner().editor.borrow().as_ref().unwrap().note;
+    input(widget).emit_by_name::<()>("commit", &[&"Edited "]);
+    assert_eq!(widget.text().as_deref(), Some("Edited # Spelling Dictionary\n\nQuxley"));
+    window.close_editor();
+    until(|| state.search("edited", 20).iter().any(|(_, hit)| hit.id == dictionary));
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+
+    let reopened = runtime.block_on(State::for_test(dirs)).unwrap();
+    assert_eq!(runtime.block_on(reopened.spelling_dictionary(space, None)).unwrap(), dictionary);
+    assert_eq!(
+        runtime.block_on(reopened.note(space, dictionary)).unwrap().body,
+        "Edited # Spelling Dictionary\n\nQuxley"
+    );
+    runtime.block_on(reopened.finish());
+}
+
 fn detail_values(details: &gtk::MenuButton) -> Vec<(String, gtk::Label)> {
     let scroll =
         details.popover().unwrap().child().unwrap().downcast::<gtk::ScrolledWindow>().unwrap();

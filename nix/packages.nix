@@ -15,7 +15,12 @@ let
       # keep-sorted end
     ];
     # mold links far faster than the default linker.
-    env.RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+    env = {
+      # keep-sorted start
+      RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+      ZIB_SPELL_DICTIONARY_DIR = "${pkgs.hunspellDicts.en-us}/share/hunspell";
+      # keep-sorted end
+    };
     inherit ((lib.importTOML (root + "/Cargo.toml")).workspace.package) version;
     nativeBuildInputs = [
       # keep-sorted start

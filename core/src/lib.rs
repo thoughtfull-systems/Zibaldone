@@ -28,6 +28,7 @@ pub mod render;
 pub mod schema;
 pub mod search;
 pub mod space;
+pub mod spelling;
 pub mod store;
 pub mod sync;
 pub mod time;

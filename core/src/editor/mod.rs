@@ -324,6 +324,20 @@ impl Editor {
         }
     }
 
+    /// Remembers an arbitrary range without moving the selection, as a spelling menu needs.
+    pub fn edit_target_for(&self, range: Range<usize>) -> Option<EditTarget> {
+        let expected = self.text.get(range.clone())?.to_owned();
+        let selection = Selection { anchor: range.start, head: range.end };
+        let cursors = self.cursors_at(selection);
+        // The widget measured this range in the last body it laid out.
+        (self.body.to_string() == self.text).then_some(EditTarget { cursors, selection, expected })
+    }
+
+    /// The current custom dictionary from the same document as the editor's note.
+    pub fn spelling_words(&self) -> HashSet<String> {
+        crate::spelling::accepted_words(&self.doc)
+    }
+
     /// Inserts an embed where a paste started, as one undo step. Changes within the remembered
     /// selection cancel the paste rather than replacing text that arrived since it started.
     pub fn insert_image(&mut self, target: &EditTarget, image: Id) -> bool {
@@ -894,11 +908,15 @@ impl Editor {
     /// Sets the selection, and the cursors that keep it in place.
     fn place(&mut self, selection: Selection) {
         self.selection = selection;
+        self.cursors = self.cursors_at(selection);
+    }
+
+    fn cursors_at(&self, selection: Selection) -> Option<(Cursor, Cursor)> {
         let cursor = |at: usize| {
             let chars = self.text[..at].chars().count();
             self.body.get_cursor(chars, Side::Middle)
         };
-        self.cursors = cursor(selection.anchor).zip(cursor(selection.head));
+        cursor(selection.anchor).zip(cursor(selection.head))
     }
 
     /// Where a cursor is now, in bytes.

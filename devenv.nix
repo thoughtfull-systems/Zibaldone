@@ -25,6 +25,7 @@ in
     # Compilers run at low priority, so the desktop stays responsive while they work.
     RUSTC_WRAPPER = "${pkgs.coreutils}/bin/nice";
     VALE_CONFIG_PATH = "${config.devenv.root}/.config/vale/vale.ini";
+    ZIB_SPELL_DICTIONARY_DIR = "${pkgs.hunspellDicts.en-us}/share/hunspell";
     # keep-sorted end
   };
 

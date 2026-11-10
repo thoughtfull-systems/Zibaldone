@@ -109,6 +109,7 @@ impl Window {
         let add_file = gtk::Button::from_icon_name("mail-attachment-symbolic");
         add_file.set_tooltip_text(Some("Add files"));
         let menu = gio::Menu::new();
+        menu.append(Some("Edit Space Dictionary"), Some("win.edit-space-dictionary"));
         menu.append(Some("New space…"), Some("win.new-space"));
         menu.append(Some("Rename space…"), Some("win.rename-space"));
         menu.append(Some("Share space…"), Some("win.share-space"));
@@ -263,6 +264,8 @@ impl Window {
         this.connect_files();
         let widget = &this.inner().widget;
         let w = this.clone();
+        widget.connect_add_spelling_word(move |word| w.spelling_dictionary(Some(word)));
+        let w = this.clone();
         widget.connect_edited(move || w.body_edited());
         let w = this.clone();
         widget.connect_selection_changed(move || w.cursor_moved());
@@ -361,6 +364,7 @@ impl Window {
         let actions = gio::SimpleActionGroup::new();
         for (name, handler) in [
             ("add-machine", Self::add_machine as fn(&Self)),
+            ("edit-space-dictionary", |w: &Self| w.spelling_dictionary(None)),
             ("move-note", Self::move_note),
             ("move-notes", |w: &Self| crate::sharing::move_all(w, w.inner().state.clone())),
             ("new-space", Self::new_space),
@@ -1083,9 +1087,38 @@ impl Window {
     /// Reads imported edits from the shared body without replacing the owner's editor state.
     fn refresh_open(&self) {
         self.inner().widget.refresh();
+        self.inner().widget.refresh_spelling();
         self.update_title();
         self.refresh_link_titles();
         self.refresh_images(false);
+    }
+
+    fn spelling_dictionary(&self, word: Option<String>) {
+        let open = self.inner().editor.borrow().as_ref().map(|e| e.space);
+        let Some(space) = open.or_else(|| self.current_space_id()) else {
+            self.toast("Make a space first");
+            return;
+        };
+        let opening = word.is_none().then(|| self.begin_open());
+        let state = self.inner().state.clone();
+        let w = self.clone();
+        glib::spawn_future_local(async move {
+            let result =
+                core(async move { state.spelling_dictionary(space, word.as_deref()).await }).await;
+            match result {
+                Ok(note) => {
+                    w.reload_notes();
+                    if opening == Some(w.inner().opening.get()) {
+                        w.inner().focus_body.set(true);
+                        w.open_note(space, note);
+                    } else if w.inner().editor.borrow().as_ref().is_some_and(|e| e.space == space) {
+                        w.inner().widget.refresh();
+                        w.inner().widget.refresh_spelling();
+                    }
+                }
+                Err(error) => w.toast(&format!("Couldn't update the space dictionary: {error}")),
+            }
+        });
     }
 
     /// Sends the owner's actual Loro selection to machines editing the same note.

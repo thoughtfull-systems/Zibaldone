@@ -22,7 +22,7 @@ pub const ORIGIN: &str = "zib";
 const META: &str = "meta";
 const NOTES: &str = "notes";
 const TOMBSTONES: &str = "tombstones";
-const SETTINGS: &str = "settings";
+pub(crate) const SETTINGS: &str = "settings";
 const FILES: &str = "files";
 const MACHINES: &str = "machines";
 
@@ -271,12 +271,7 @@ impl Space {
     }
 
     fn note_map(&self, id: Id) -> Result<LoroMap> {
-        match self.notes().get(&id.to_string()) {
-            Some(ValueOrContainer::Container(container)) => {
-                container.into_map().map_err(|_| Error::Space(format!("note {id} isn't a map")))
-            }
-            _ => Err(Error::NotFound(format!("note {id}"))),
-        }
+        note_map(&self.doc, id)
     }
 
     /// Creates a note of `type_name` with `body`, in one commit.
@@ -395,12 +390,7 @@ impl Space {
 
     /// The body of a note, for an editor to change directly.
     pub fn body(&self, id: Id) -> Result<LoroText> {
-        match self.note_map(id)?.get("body") {
-            Some(ValueOrContainer::Container(container)) => {
-                container.into_text().map_err(|_| Error::Space(format!("body of {id}")))
-            }
-            _ => Err(Error::Space(format!("note {id} has no body"))),
-        }
+        note_body(&self.doc, id)
     }
 
     /// A note's body for an editor to change directly, which records the note as open.
@@ -752,6 +742,24 @@ impl Space {
     /// The members that aren't marked removed.
     pub fn members(&self) -> Vec<Machine> {
         self.machines().into_iter().filter(|m| m.removed.is_none()).collect()
+    }
+}
+
+fn note_map(doc: &LoroDoc, id: Id) -> Result<LoroMap> {
+    match doc.get_map(NOTES).get(&id.to_string()) {
+        Some(ValueOrContainer::Container(container)) => {
+            container.into_map().map_err(|_| Error::Space(format!("note {id} isn't a map")))
+        }
+        _ => Err(Error::NotFound(format!("note {id}"))),
+    }
+}
+
+pub(crate) fn note_body(doc: &LoroDoc, id: Id) -> Result<LoroText> {
+    match note_map(doc, id)?.get("body") {
+        Some(ValueOrContainer::Container(container)) => {
+            container.into_text().map_err(|_| Error::Space(format!("body of {id}")))
+        }
+        _ => Err(Error::Space(format!("note {id} has no body"))),
     }
 }
 

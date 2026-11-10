@@ -8,6 +8,7 @@ use std::ops::Range;
 
 mod drawings;
 mod presence;
+mod spelling;
 mod tables;
 
 use adw::prelude::*;
@@ -173,7 +174,9 @@ mod imp {
     use gtk::subclass::prelude::*;
     use zib_core::editor::{Editor, Unit};
 
-    use super::{Drawing, HashMap, HashSet, Line, LinkTarget, PasteTarget, drawings, tables};
+    use super::{
+        Drawing, HashMap, HashSet, Line, LinkTarget, PasteTarget, drawings, spelling, tables,
+    };
 
     type Callback<T> = RefCell<Option<Box<dyn Fn(T)>>>;
 
@@ -203,6 +206,8 @@ mod imp {
         pub selection_changed: RefCell<Option<Box<dyn Fn()>>>,
         pub open_link: Callback<LinkTarget>,
         pub pick_link: Callback<Range<usize>>,
+        pub(super) add_spelling_word: Callback<String>,
+        pub(super) spelling: RefCell<spelling::Check>,
         /// The word or line a double or triple click selected, which a drag with the button still
         /// down grows from by whole words or lines.
         pub drag_origin: RefCell<Option<(Range<usize>, Unit)>>,
@@ -224,6 +229,7 @@ mod imp {
 
     impl ObjectImpl for EditorWidget {
         fn dispose(&self) {
+            self.spelling.borrow_mut().cancel();
             if let Some((adjustment, handler)) = self.scroll_adjustment.borrow_mut().take() {
                 adjustment.disconnect(handler);
             }
@@ -264,6 +270,9 @@ mod imp {
         fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
             self.obj().lay_out(width);
             tables::allocate(&self.lines.borrow());
+            if let Some(menu) = &self.spelling.borrow().menu {
+                menu.present();
+            }
             self.obj().update_im_cursor();
         }
 
@@ -304,7 +313,9 @@ impl EditorWidget {
             child.unparent();
         }
         imp.table_views.borrow_mut().clear();
+        imp.spelling.borrow_mut().menu.take();
         *imp.editor.borrow_mut() = editor;
+        self.check_spelling(true);
         self.rebuild_layout();
     }
 
@@ -532,6 +543,7 @@ impl EditorWidget {
         if changed {
             self.imp().held.borrow_mut().take();
             self.imp().drag_origin.borrow_mut().take();
+            self.check_spelling(true);
             self.rebuild_layout();
             let caret = self.head().and_then(|head| caret_rect(&self.imp().lines.borrow(), head));
             if let (Some(scrolled), Some(screen_y), Some((_, y, _))) = (scrolled, anchor, caret) {
@@ -767,6 +779,7 @@ impl EditorWidget {
             .map(|m| (m.range.clone(), m.shape))
             .collect();
         style_markers(&attributes, &pieces, &markers);
+        self.underline_misspellings(&attributes, &pieces, start..end);
         let quote = quoted.map(|q| {
             let inline = q.start > start;
             let offset =
@@ -1220,6 +1233,7 @@ impl EditorWidget {
         *self.imp().editor.borrow_mut() = Some(editor);
         // What hides depends on the selection, so a move can change the layout too.
         if changed {
+            self.check_spelling(true);
             self.rebuild_layout();
             let after = self.head().map(|head| {
                 let lines = self.imp().lines.borrow();
@@ -1481,6 +1495,10 @@ impl EditorWidget {
     }
 
     fn pressed(&self, gesture: &gtk::GestureClick, count: i32, x: f64, y: f64) {
+        if gesture.current_button() == gdk::BUTTON_SECONDARY && self.spelling_menu(x, y) {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            return;
+        }
         self.grab_focus();
         if let Some(im) = self.imp().im.borrow().as_ref() {
             im.reset();

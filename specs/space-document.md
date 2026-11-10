@@ -25,15 +25,16 @@ The [identifiers specification](identifiers.md) defines the text form of every i
 
 ## Root containers
 
-| Name         | Type | Holds                                                  |
-| ------------ | ---- | ------------------------------------------------------ |
-| `meta`       | map  | The space's own attributes                             |
-| `notes`      | map  | Every note, keyed by its identifier                    |
-| `tombstones` | map  | Notes deleted for good, keyed by their identifier      |
-| `settings`   | map  | The space's synced settings                            |
-| `schemas`    | map  | The definitions of note types, as `schemas.md` says    |
-| `files`      | map  | An entry for each blob, keyed by its hash              |
-| `machines`   | map  | The machines that share the space, keyed by identifier |
+| Name             | Type | Holds                                                  |
+| ---------------- | ---- | ------------------------------------------------------ |
+| `meta`           | map  | The space's own attributes                             |
+| `notes`          | map  | Every note, keyed by its identifier                    |
+| `tombstones`     | map  | Notes deleted for good, keyed by their identifier      |
+| `settings`       | map  | The space's synced settings                            |
+| `spelling-words` | map  | Accepted words stored before dictionary notes          |
+| `schemas`        | map  | The definitions of note types, as `schemas.md` says    |
+| `files`          | map  | An entry for each blob, keyed by its hash              |
+| `machines`       | map  | The machines that share the space, keyed by identifier |
 
 ## `meta`
 
@@ -144,6 +145,41 @@ Each key is a machine's identifier, and each value is a map:
   no two writers ever share one.
 - **Commits.** Each change in this specification that says "in one commit" happens in a single Loro
   commit, so other machines receive the whole change or none of it.
+
+## `spelling-words`
+
+The optional `spelling-words` root map holds words stored before dictionary notes. Each key is one
+word. A writer converts the right single quotation mark (U+2019) to an apostrophe (U+0027), applies
+Unicode normalization form C, converts the word to lowercase with Unicode's default mapping, and
+applies the same normalization again. The writer sets the key to the boolean `true` in one commit.
+Readers use the same conversion when looking up words and accept a word only if its key has the
+value `true`. An absent map represents an empty dictionary.
+
+Each entry syncs independently. Adding a word leaves the note body and its metadata alone. When a
+note moves between spaces, its editor uses the destination space's dictionary. When one space merges
+into another, the destination keeps its own dictionary.
+
+[Decision ZIB0021](../decisions/ZIB0021-store-accepted-words-per-space.md) describes the storage
+choice.
+
+## Spelling dictionary notes
+
+The space setting `zib.spelling-dictionary.<id>` has the boolean value `true` for a dictionary note.
+The suffix is the note's canonical identifier. The writer creates a regular `note` and its setting
+in one commit. The initial title is `# Spelling Dictionary`. The first line with text is the title.
+Each subsequent line holds one word after trimming white space. Readers ignore empty lines and lines
+that aren't a single Unicode word with a letter and without a number or underscore. Readers compare
+words using the normalization in [`spelling-words`](#spelling-words).
+
+The editor reads words from every registered note still in the space. If machines create a
+dictionary at the same time, both notes contribute words. The editor opens the registered note with
+the lowest identifier and adds new words there. It creates a note if none of the registered notes
+remain. Deleting or moving a registered note removes its words from the space's dictionary. The
+setting stays in the original space.
+
+If the space has no dictionary settings, the editor reads the `spelling-words` map. When it first
+creates a dictionary note, it copies those words into the note. Once a dictionary setting exists,
+the editor reads only the registered notes. It leaves the map intact.
 
 ## Platforms
 
