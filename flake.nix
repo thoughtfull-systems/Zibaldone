@@ -39,6 +39,7 @@
           # keep-sorted start
           zib-web-clipper
           zib-web-clipper-dev
+          zib-web-clipper-signed
           zibaldone
           zibaldone-dev
           # keep-sorted end
@@ -57,6 +58,7 @@
             # keep-sorted start
             zib-web-clipper
             zib-web-clipper-dev
+            zib-web-clipper-signed
             zibaldone
             zibaldone-dev
             # keep-sorted end

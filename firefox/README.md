@@ -64,7 +64,34 @@ Use a new package version and tag for each update. If Mozilla approves the submi
 workflow times out, download the signed package from [My Add-ons][amo-addons] and attach it to the
 release for the original tag.
 
-## Install for local use
+## Install the signed add-on on NixOS
+
+Add `github:thoughtfull-systems/Zibaldone` as a flake input named `zibaldone`. With the input
+available to your NixOS module as `inputs.zibaldone`, add:
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  nixpkgs.overlays = [ inputs.zibaldone.overlays.default ];
+
+  programs.firefox = {
+    enable = true;
+    nativeMessagingHosts.packages = [
+      inputs.zibaldone.packages.${pkgs.stdenv.hostPlatform.system}.zibaldone
+    ];
+    policies.ExtensionSettings."web-clipper@zibaldone.thoughtfull.systems" = {
+      install_url = "file://${pkgs.zib-web-clipper-signed}/zib-web-clipper.xpi";
+      installation_mode = "normal_installed";
+    };
+  };
+}
+```
+
+The overlay's `zib-web-clipper-signed` package pins a Mozilla-signed release by version and hash.
+Firefox installs the add-on when it starts. You can also build the package with
+`nix build .#zib-web-clipper-signed`.
+
+## Install an unsigned build for local use
 
 - Build `nix build .#zib-web-clipper` to get the local extension package in `result/`. Use
   `nix build .#zib-web-clipper-dev` for a build with the development host and add-on identifiers.

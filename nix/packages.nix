@@ -147,6 +147,22 @@ in
 
   zib-web-clipper-dev = clipper "dev" "zib-web-clipper-dev";
 
+  zib-web-clipper-signed =
+    let
+      asset = "zib-web-clipper.xpi";
+      releases = "https://github.com/thoughtfull-systems/Zibaldone/releases/download";
+      version = "0.1.0";
+      xpi = pkgs.fetchurl {
+        # keep-sorted start block=yes
+        hash = "sha256-G4pgXdvKh03chVG7YEbfIADdOpohpQDKRHAxaByLlrE=";
+        url = "${releases}/clipper-v${version}/${asset}";
+        # keep-sorted end
+      };
+    in
+    pkgs.runCommand "zib-web-clipper-signed-${version}" { inherit version; } ''
+      install -Dm644 ${xpi} "$out/${asset}"
+    '';
+
   zibaldone = channel {
     appId = "systems.thoughtfull.Zibaldone";
     features = "--features production";
