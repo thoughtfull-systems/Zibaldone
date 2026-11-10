@@ -8439,6 +8439,7 @@ dependencies = [
  "typst-pdf",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "uuid",
 ]
 
@@ -8447,10 +8448,13 @@ name = "zib-linux"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "base64 0.22.1",
  "gdk-pixbuf",
  "gtk4",
+ "image",
  "ksni",
  "libadwaita",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

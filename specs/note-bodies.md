@@ -201,6 +201,9 @@ label, with each line break replaced by a space and each backslash, `]`, and `|`
 
 No platform differs. Every app renders bodies from the core's parse tree.
 
+In a display editor, the backslash in a CommonMark punctuation escape hides while the selection is
+away from the escape. The escaped punctuation stays visible.
+
 [commonmark]: https://spec.commonmark.org/0.31.2/
 [gfm]: https://github.github.com/gfm/
 [katex]: https://katex.org/

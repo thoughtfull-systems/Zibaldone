@@ -26,6 +26,7 @@ use zib_core::{Channel, Error, Id, Result, Space};
 use crate::derive;
 
 mod agent;
+mod web_clip;
 
 /// The Linux app keeps every file, as decision ZIB0004 sets for it.
 pub const POLICY: Policy = Policy::All;
@@ -931,6 +932,8 @@ impl State {
         if from == to {
             return Ok(());
         }
+        // A clip retry locates its original note across spaces under this same lock.
+        let _store = self.store.lock().await;
         let (source, target) = (self.space(from).await?, self.space(to).await?);
         let (source_blobs, target_blobs) = (self.blobs(from), self.blobs(to));
         {

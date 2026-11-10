@@ -217,3 +217,62 @@ fn default_editor_edits_the_shared_body_and_keeps_it_through_navigation_and_clos
     window.inner().window.destroy();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn opening_a_clipped_article_shows_its_details_in_the_header() {
+    use zib_core::web_clip::{Clip, Part};
+
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let url = "https://example.org/article";
+    let (space, article, other) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let article = Id::generate();
+        let clip = Clip {
+            space,
+            note: article,
+            title: "Article title".into(),
+            url: url.into(),
+            captured_at: 1_700_000_000_000,
+            published_on: Some("2023-02-28".into()),
+            authors: vec!["Test Author".into()],
+            body: vec![Part::Markdown("Article body".into())],
+        };
+        state.import_web_clip(clip, Vec::new()).await.unwrap();
+        (space, article, state.create_note(space, "Other note").await.unwrap())
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.ArticleTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    window.open_note(space, article);
+    until(|| window.inner().widget.text().as_deref() == Some("# Article title\n\nArticle body"));
+
+    let details = &window.inner().article_details;
+    assert!(details.get_visible());
+    assert_eq!(details.label().as_deref(), Some("Article details"));
+    let rows = details.popover().unwrap().child().unwrap().observe_children();
+    let labels: Vec<_> = (0..rows.n_items())
+        .filter_map(|index| Some(rows.item(index)?.downcast::<gtk::Label>().ok()?.text()))
+        .collect();
+    assert!(labels.iter().any(|label| label.contains("Test Author")));
+    assert!(labels.iter().any(|label| label.starts_with("Captured")));
+    assert!(labels.iter().any(|label| label.contains("2023-02-28")));
+    let source = (0..rows.n_items())
+        .find_map(|index| rows.item(index)?.downcast::<gtk::LinkButton>().ok())
+        .unwrap();
+    assert_eq!(source.uri(), url);
+
+    window.open_note(space, other);
+    until(|| window.inner().widget.text().as_deref() == Some("Other note"));
+    assert!(!details.get_visible());
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+}

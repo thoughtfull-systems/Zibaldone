@@ -56,6 +56,7 @@ let
         "mv $out/bin/zib $out/bin/zib${suffix}"
         "mv $out/bin/zibaldone $out/bin/zibaldone${suffix}"
       ];
+      hostName = "systems.thoughtfull.zibaldone" + lib.optionalString (suffix != "") ".dev";
     in
     craneLib.buildPackage (
       common
@@ -78,6 +79,24 @@ let
           ++ [
             "install -Dm644 ${data}/${appId}.desktop -t $out/share/applications"
             "install -Dm644 ${data}/icons/${appId}.svg -t $out/share/icons/hicolor/scalable/apps"
+            ''
+              mkdir -p "$out/libexec" "$out/lib/mozilla/native-messaging-hosts"
+              host="$out/libexec/zib-firefox-host"
+              cat > "$host" <<EOF
+              #!${pkgs.runtimeShell}
+              exec "$out/bin/zib${suffix}" firefox-host
+              EOF
+              chmod +x "$host"
+              cat > "$out/lib/mozilla/native-messaging-hosts/${hostName}.json" <<EOF
+              {
+                "allowed_extensions": ["web-clipper${suffix}@zibaldone.thoughtfull.systems"],
+                "description": "Zib Web Clipper",
+                "name": "${hostName}",
+                "path": "$host",
+                "type": "stdio"
+              }
+              EOF
+            ''
           ]
         );
         # The app reads PDFs with the command-line tools from poppler.
@@ -85,6 +104,34 @@ let
         # keep-sorted end
       }
     );
+  clipper =
+    channelName: pname:
+    pkgs.buildNpmPackage {
+      # keep-sorted start block=yes
+      env.ZIB_CLIPPER_CHANNEL = channelName;
+      inherit (lib.importJSON (root + "/firefox/package.json")) version;
+      inherit pname;
+      installPhase = lib.concatLines [
+        "runHook preInstall"
+        "mkdir -p \"$out\""
+        "touch -d '1980-01-01 UTC' dist/*"
+        "zip -X -j \"$out/${pname}.xpi\" dist/*"
+        "runHook postInstall"
+      ];
+      nativeBuildInputs = [ pkgs.zip ];
+      npmDepsHash = "sha256-i9fKD83wfPbETTlQ6C1lXEuIVzz/a5foV7ONnPC3ios=";
+      sourceRoot = "source/firefox";
+      src = lib.fileset.toSource {
+        inherit root;
+        fileset = lib.fileset.unions [
+          # keep-sorted start
+          (data + "/icons")
+          (root + "/firefox")
+          # keep-sorted end
+        ];
+      };
+      # keep-sorted end
+    };
 in
 {
   # keep-sorted start block=yes newline_separated=yes
@@ -95,6 +142,10 @@ in
       cargoNextestExtraArgs = "--workspace";
     }
   );
+
+  zib-web-clipper = clipper "production" "zib-web-clipper";
+
+  zib-web-clipper-dev = clipper "dev" "zib-web-clipper-dev";
 
   zibaldone = channel {
     appId = "systems.thoughtfull.Zibaldone";

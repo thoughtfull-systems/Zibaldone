@@ -57,6 +57,7 @@ pub struct Inner {
     drawing_generation: Cell<u64>,
     title: adw::WindowTitle,
     stack: gtk::Stack,
+    article_details: gtk::MenuButton,
     backlinks: gtk::MenuButton,
     /// The notes opened before the open one, the latest last, and those to go forward to again.
     back: RefCell<Vec<(Id, Id)>>,
@@ -169,6 +170,9 @@ impl Window {
         content_header.pack_start(&back_button);
         content_header.pack_start(&forward_button);
         content_header.pack_start(&open_file);
+        let article_details = gtk::MenuButton::builder().label("Article details").build();
+        article_details.set_visible(false);
+        content_header.pack_start(&article_details);
         content_header.pack_end(&status);
         content_header.pack_end(&delete);
         let print_menu = gio::Menu::new();
@@ -237,6 +241,7 @@ impl Window {
             drawing_generation: Cell::new(0),
             title,
             stack,
+            article_details,
             backlinks,
             back: RefCell::default(),
             forward: RefCell::default(),
@@ -684,17 +689,18 @@ impl Window {
                 let state = state.clone();
                 async move {
                     let loaded = state.note(space, note).await?;
+                    let metadata = state.article_fields(space, &loaded).await;
                     let body = state.open_body(space, note).await?;
                     let targets: Vec<Id> = body::link_targets(&loaded.body).into_iter().collect();
                     let titles = state.titles(&targets).await;
-                    Ok::<_, zib_core::Error>((loaded, body, titles))
+                    Ok::<_, zib_core::Error>((loaded, body, titles, metadata))
                 }
             })
             .await;
             if w.inner().widget.session() != session {
                 return;
             }
-            let (loaded, body, titles) = match loaded {
+            let (loaded, body, titles, metadata) = match loaded {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     w.toast(&format!("Couldn't open the note: {error}"));
@@ -711,6 +717,7 @@ impl Window {
             let widget = &w.inner().widget;
             widget.set_editor(Some(zib_core::editor::Editor::new(body)));
             widget.set_titles(titles);
+            w.show_article_metadata(metadata);
             w.refresh_images(false);
             w.inner()
                 .open_file
@@ -750,6 +757,61 @@ impl Window {
                 });
             }
         });
+    }
+
+    fn show_article_metadata(&self, fields: Vec<(&str, zib_core::schema::Value)>) {
+        use zib_core::schema::Value;
+
+        let details = &self.inner().article_details;
+        if fields.is_empty() {
+            return;
+        }
+        let rows = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        rows.set_margin_start(8);
+        rows.set_margin_end(8);
+        rows.set_margin_top(8);
+        rows.set_margin_bottom(8);
+        for (name, value) in fields {
+            let (label, text) = match (name, value) {
+                ("authors", Value::List(authors)) => {
+                    let authors = authors.into_iter().filter_map(|value| match value {
+                        Value::Text(author) => Some(author),
+                        _ => None,
+                    });
+                    ("Authors", authors.collect::<Vec<_>>().join(", "))
+                }
+                ("captured-at", Value::Timestamp(when)) => {
+                    let Ok(date) = glib::DateTime::from_unix_utc(when.div_euclid(1000))
+                        .and_then(|date| date.to_local())
+                        .and_then(|date| date.format("%x %X"))
+                    else {
+                        continue;
+                    };
+                    ("Captured", date.to_string())
+                }
+                ("published-on", Value::Date(date)) => ("Published", date),
+                ("url", Value::Text(url)) if zib_core::web_clip::source_url(&url).is_some() => {
+                    let label = gtk::Label::new(Some(&format!("Source · {url}")));
+                    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    label.set_max_width_chars(48);
+                    let link = gtk::LinkButton::new(&url);
+                    link.set_child(Some(&label));
+                    link.set_halign(gtk::Align::Start);
+                    rows.append(&link);
+                    continue;
+                }
+                _ => continue,
+            };
+            let row = gtk::Label::new(Some(&format!("{label} · {text}")));
+            row.set_xalign(0.0);
+            row.set_wrap(true);
+            row.set_max_width_chars(48);
+            row.set_selectable(true);
+            rows.append(&row);
+        }
+        let popover = gtk::Popover::builder().child(&rows).build();
+        details.set_popover(Some(&popover));
+        details.set_visible(true);
     }
 
     fn update_title(&self) {
@@ -926,6 +988,9 @@ impl Window {
             });
         }
         self.inner().open_file.set_visible(false);
+        self.inner().article_details.popdown();
+        self.inner().article_details.set_visible(false);
+        self.inner().article_details.set_popover(None::<&gtk::Popover>);
     }
 
     /// Another machine's change or cursor arrived while the note is open.

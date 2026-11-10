@@ -1,0 +1,7 @@
+{
+  "allowed_extensions": ["web-clipper-dev@zibaldone.thoughtfull.systems"],
+  "description": "Zib Web Clipper Dev",
+  "name": "systems.thoughtfull.zibaldone.dev",
+  "path": "/absolute/path/to/zib-firefox-host",
+  "type": "stdio"
+}

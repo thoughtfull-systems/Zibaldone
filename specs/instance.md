@@ -150,6 +150,14 @@ The note commands add these requests:
 
 These requests access the machine's spaces regardless of which spaces show in the note list.
 
+The browser integration adds **`import-web-clip`** with `clip` and `images`, as the
+[web clipper specification](web-clipper.md#import-request) defines. The result holds `clip` with
+`note`, `space`, and `images`, in the same order as the request's images.
+
+The browser integration also adds **`import-web-pdf`** with `pdf`, as the
+[web clipper specification](web-clipper.md#import-request-for-pdfs) defines. The result holds `clip`
+with the file note's `note` and `space` identifiers and an empty `images` list.
+
 ## Platforms
 
 - **Linux.** This specification applies to the Linux app and the `zib` command, on sway with a

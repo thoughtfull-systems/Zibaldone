@@ -22,6 +22,8 @@ pub enum Style {
     /// The text of a task item that's checked.
     Completed,
     Emphasis,
+    /// The backslash in a `CommonMark` punctuation escape.
+    Escape,
     /// A heading of level 1 to 6.
     Heading(u8),
     Highlight,
@@ -74,7 +76,16 @@ pub fn spans(body: &str) -> Vec<Span> {
 
     let mut spans = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
-    for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+    let mut previous_text_end = 0;
+    let links = body::wikilinks(body);
+    for (event, mut range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+        if matches!(event, Event::Text(_)) {
+            if let Some(escape) = text_escape(body, range.start, previous_text_end, &links) {
+                range.start = escape.range.start;
+                spans.push(escape);
+            }
+            previous_text_end = range.end;
+        }
         if !matches!(event, Event::End(_))
             && let Some(parent) = stack.last_mut()
         {
@@ -137,7 +148,7 @@ pub fn spans(body: &str) -> Vec<Span> {
     marks(body, &mut spans);
     spans.extend(list_markers(body));
     spans.extend(list_prefixes(body));
-    for link in body::wikilinks(body) {
+    for link in links {
         let Range { start, end } = link.range;
         let open = start + if link.embed { 3 } else { 2 };
         let separator = label_separator(&body[open..end - 2]).map(|i| open + i);
@@ -161,6 +172,25 @@ pub fn spans(body: &str) -> Vec<Span> {
     }
     spans.sort_by_key(|span| span.range.start);
     spans
+}
+
+/// pulldown-cmark leaves a gap in the source immediately before escaped text.
+fn text_escape(
+    body: &str,
+    at: usize,
+    previous_text_end: usize,
+    links: &[body::WikiLink],
+) -> Option<Span> {
+    let bytes = body.as_bytes();
+    if at <= previous_text_end || bytes[at - 1] != b'\\' || !bytes.get(at)?.is_ascii_punctuation() {
+        return None;
+    }
+    let start = at - 1;
+    let next = links.partition_point(|link| link.range.end <= start);
+    if links.get(next).is_some_and(|link| link.range.contains(&start)) {
+        return None;
+    }
+    Some(span(body, start..at + 1, Style::Escape, std::iter::once(start..at).collect()))
 }
 
 /// What an editor draws in place of an element's source while the cursor is away from it.

@@ -15,6 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::channel::Dirs;
 use crate::frame::{self, MAX_FRAME};
 use crate::store::create_private_dir;
+use crate::web_clip::{Asset, Clip, Imported, Pdf};
 use crate::{Error, Id, Result};
 
 const LOCK: &str = "instance.lock";
@@ -61,6 +62,10 @@ pub enum Request {
     GetNotes { id: u64, notes: Vec<Id> },
     /// Replaces a note body if it still matches the caller's copy.
     WriteNote { id: u64, note: Id, body: String, expected: String },
+    /// Saves an article and its images together.
+    ImportWebClip { id: u64, clip: Clip, images: Vec<Asset> },
+    /// Saves an original PDF from the browser as a file note.
+    ImportWebPdf { id: u64, pdf: Pdf },
     /// Prints notes to a PDF file.
     Print {
         id: u64,
@@ -83,6 +88,8 @@ impl Request {
             | Self::SearchSpace { id, .. }
             | Self::GetNotes { id, .. }
             | Self::WriteNote { id, .. }
+            | Self::ImportWebClip { id, .. }
+            | Self::ImportWebPdf { id, .. }
             | Self::Print { id, .. } => *id,
         }
     }
@@ -122,6 +129,8 @@ pub enum Reply {
     },
     Result {
         id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clip: Option<Imported>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spaces: Vec<SpaceInfo>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -139,7 +148,7 @@ pub enum Reply {
 impl Reply {
     /// An empty result for the request with `id`.
     pub fn done(id: u64) -> Self {
-        Self::Result { id, spaces: Vec::new(), hits: Vec::new(), notes: Vec::new() }
+        Self::Result { id, clip: None, spaces: Vec::new(), hits: Vec::new(), notes: Vec::new() }
     }
 }
 
@@ -309,6 +318,7 @@ mod tests {
                     match request {
                         Request::Spaces { id } => Reply::Result {
                             id,
+                            clip: None,
                             spaces: vec![SpaceInfo {
                                 id: Id::from_bytes([0; 16]),
                                 name: "Home".into(),

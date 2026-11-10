@@ -1,0 +1,17 @@
+{
+  "dependencies": {
+    "defuddle": "0.19.2"
+  },
+  "devDependencies": {
+    "@types/firefox-webext-browser": "143.0.1",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  },
+  "name": "zib-web-clipper",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit && node build.mjs"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}

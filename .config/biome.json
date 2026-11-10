@@ -1,0 +1,17 @@
+{
+  "files": {
+    "includes": ["**", "!**/dist", "!**/node_modules", "!**/package-lock.json"]
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "lineWidth": 100
+  },
+  "html": {
+    "experimentalFullSupportEnabled": true
+  },
+  "linter": {
+    "rules": {
+      "recommended": true
+    }
+  }
+}

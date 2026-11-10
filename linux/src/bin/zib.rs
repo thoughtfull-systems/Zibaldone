@@ -11,6 +11,9 @@ use zib_core::instance::{Client, NoteRead, Reply, Request};
 use zib_core::search::{MATCH_END, MATCH_START};
 use zib_linux::CHANNEL;
 
+#[path = "../firefox_host.rs"]
+mod firefox_host;
+
 const USAGE: &str = "\
 Usage:
   zib                     Open the window, starting Zib if it isn't running
@@ -43,7 +46,12 @@ fn main() -> ExitCode {
     }
     let runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
-    match runtime.block_on(run(args)) {
+    let result = if args.first().is_some_and(|arg| arg == "firefox-host") {
+        runtime.block_on(firefox_host::run(start)).map(|()| ExitCode::SUCCESS)
+    } else {
+        runtime.block_on(run(args))
+    };
+    match result {
         Ok(code) => code,
         Err(message) => {
             eprintln!("{command}: {message}");

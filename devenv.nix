@@ -30,6 +30,13 @@ in
 
   git-hooks.hooks = {
     # keep-sorted start block=yes
+    biome = {
+      enable = true;
+      entry = "${lib.getExe pkgs.biome} check --config-path=.config/biome.json";
+      files = "^firefox/.*\\.(html|json|mjs|ts)$";
+      name = "biome";
+      types = [ "text" ];
+    };
     check-added-large-files.enable = true;
     check-case-conflicts.enable = true;
     check-executables-have-shebangs.enable = true;
@@ -226,6 +233,7 @@ in
     pkgs.gtk4
     pkgs.libadwaita
     pkgs.mold
+    pkgs.nodejs
     pkgs.pkg-config
     pkgs.poppler-utils
     pkgs.sqlite

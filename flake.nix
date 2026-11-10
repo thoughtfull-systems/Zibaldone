@@ -35,7 +35,14 @@
       });
 
       overlays.default = final: _: {
-        inherit (packagesFor final) zibaldone zibaldone-dev;
+        inherit (packagesFor final)
+          # keep-sorted start
+          zib-web-clipper
+          zib-web-clipper-dev
+          zibaldone
+          zibaldone-dev
+          # keep-sorted end
+          ;
       };
 
       packages = forAllSystems (
@@ -46,7 +53,14 @@
         {
           # keep-sorted start
           default = self.packages.${system}.zibaldone;
-          inherit (packages) zibaldone zibaldone-dev;
+          inherit (packages)
+            # keep-sorted start
+            zib-web-clipper
+            zib-web-clipper-dev
+            zibaldone
+            zibaldone-dev
+            # keep-sorted end
+            ;
           # keep-sorted end
         }
       );

@@ -31,6 +31,7 @@ pub mod space;
 pub mod store;
 pub mod sync;
 pub mod time;
+pub mod web_clip;
 
 pub use channel::Channel;
 pub use error::{Error, Result};

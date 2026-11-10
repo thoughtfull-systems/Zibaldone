@@ -77,6 +77,18 @@ An archived agent conversation, as the [agent specification](agent.md#transcript
 has no fields and no preview. Its title comes from its body's first line, as for every note. The
 owner can edit, move, and delete it like an ordinary note. It can't become a live agent session.
 
+## `article`
+
+An article captured from the web. The body holds the title and content as markdown, and can embed
+the captured pictures. The app can show articles as curios, which are works by other people.
+
+- **`authors`:** a list of text in source order, with search mode `text`.
+- **`captured-at`:** a timestamp for the capture action, with search mode `filter`.
+- **`published-on`:** the publication date as given by the source, with search mode `filter`.
+- **`url`:** the captured tab's web address as text, with search mode `filter`.
+
+An import sets `captured-at` and `url` and sets `authors` and `published-on` when it has values.
+
 ## Platforms
 
 No platform differs in the types it defines. Which derivations each platform runs is in the

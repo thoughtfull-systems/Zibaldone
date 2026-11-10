@@ -1,6 +1,8 @@
 .devenv*
 .pre-commit-config.yaml
 devenv.local.nix
+firefox/dist
+firefox/node_modules
 result
 result-*
 target

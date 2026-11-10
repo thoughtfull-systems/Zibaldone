@@ -81,12 +81,13 @@ async fn answer(state: &State, request: Request) -> Result<Reply> {
         Request::Spaces { id } => {
             let spaces =
                 state.spaces().await.into_iter().map(|(id, name)| SpaceInfo { id, name }).collect();
-            Reply::Result { id, spaces, hits: Vec::new(), notes: Vec::new() }
+            Reply::Result { id, clip: None, spaces, hits: Vec::new(), notes: Vec::new() }
         }
         Request::CreateSpace { id, name } => {
             let space = state.create_space(&name).await?;
             Reply::Result {
                 id,
+                clip: None,
                 spaces: vec![SpaceInfo { id: space, name }],
                 hits: Vec::new(),
                 notes: Vec::new(),
@@ -104,12 +105,26 @@ async fn answer(state: &State, request: Request) -> Result<Reply> {
                     NoteRead::Unavailable { error: error.to_string(), note }
                 }));
             }
-            Reply::Result { id, spaces: Vec::new(), hits: Vec::new(), notes: entries }
+            Reply::Result { id, clip: None, spaces: Vec::new(), hits: Vec::new(), notes: entries }
         }
         Request::WriteNote { id, note, body, expected } => {
             state.replace_note_body(note, &expected, &body, false).await?;
             Reply::done(id)
         }
+        Request::ImportWebClip { id, clip, images } => Reply::Result {
+            id,
+            clip: Some(state.import_web_clip(clip, images).await?),
+            spaces: Vec::new(),
+            hits: Vec::new(),
+            notes: Vec::new(),
+        },
+        Request::ImportWebPdf { id, pdf } => Reply::Result {
+            id,
+            clip: Some(state.import_web_pdf(pdf).await?),
+            spaces: Vec::new(),
+            hits: Vec::new(),
+            notes: Vec::new(),
+        },
         Request::Print { id, notes, linked, path } => {
             let pdf = state.print(&notes, linked).await?;
             std::fs::write(&path, pdf).map_err(|e| Error::io(path, e))?;
@@ -130,7 +145,7 @@ fn search_reply(
         .into_iter()
         .map(|(space, hit)| HitInfo { space, note: hit.id, title: hit.title, snippet: hit.snippet })
         .collect();
-    Reply::Result { id, spaces: Vec::new(), hits, notes: Vec::new() }
+    Reply::Result { id, clip: None, spaces: Vec::new(), hits, notes: Vec::new() }
 }
 
 async fn resolve_space(state: &State, name: &str) -> Result<Id> {

@@ -151,6 +151,7 @@ pub struct TypeDef {
 
 /// The names of the built-in types.
 pub const AGENT_TRANSCRIPT: &str = "agent-transcript";
+pub const ARTICLE: &str = "article";
 pub const FILE: &str = "file";
 pub const IMAGE: &str = "image";
 pub const NOTE: &str = "note";
@@ -162,6 +163,21 @@ pub fn built_in() -> Vec<TypeDef> {
     };
     vec![
         TypeDef { name: AGENT_TRANSCRIPT.into(), fields: BTreeMap::new() },
+        TypeDef {
+            name: ARTICLE.into(),
+            fields: fields(vec![
+                (
+                    "authors",
+                    FieldDef {
+                        item: Some(Kind::Text),
+                        ..FieldDef::new(Kind::List, SearchMode::Text)
+                    },
+                ),
+                ("captured-at", FieldDef::new(Kind::Timestamp, SearchMode::Filter)),
+                ("published-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
+                ("url", FieldDef::new(Kind::Text, SearchMode::Filter)),
+            ]),
+        },
         TypeDef {
             name: FILE.into(),
             fields: fields(vec![
@@ -452,8 +468,9 @@ mod tests {
         assert!(read_type(&doc, NOTE).is_some());
 
         let mut newer = built_in();
-        newer[1].fields.get_mut("text").unwrap().deprecated = true;
-        newer[1].fields.insert("pages".into(), FieldDef::new(Kind::Integer, SearchMode::Filter));
+        let file = newer.iter_mut().find(|ty| ty.name == FILE).unwrap();
+        file.fields.get_mut("text").unwrap().deprecated = true;
+        file.fields.insert("pages".into(), FieldDef::new(Kind::Integer, SearchMode::Filter));
         assert!(write_schemas(&doc, &newer).unwrap());
         let file = read_type(&doc, FILE).unwrap();
         assert!(file.fields["text"].deprecated);

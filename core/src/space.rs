@@ -158,6 +158,8 @@ pub struct Space {
     machine: Id,
     /// The identifier of a space this machine is joining, before its first sync brings `meta.id`.
     joining: Option<Id>,
+    /// The separate writer that stages local imports before saving them.
+    import_peer: Option<u64>,
     /// The notes an editor has open, with when this process last set each one's `updated`.
     open: HashMap<Id, OpenNote>,
 }
@@ -199,7 +201,7 @@ impl Space {
     fn empty(machine: Id) -> Self {
         let doc = LoroDoc::new();
         doc.set_record_timestamp(false);
-        Self { doc, machine, joining: None, open: HashMap::new() }
+        Self { doc, machine, joining: None, import_peer: None, open: HashMap::new() }
     }
 
     /// The space's Loro document, for the parts of the core that read it directly.
@@ -296,6 +298,19 @@ impl Space {
     }
 
     fn create_note_with_id(&mut self, id: Id, type_name: &str, body: &str) -> Result<()> {
+        self.insert_note(id, type_name, body, &[])?;
+        commit(&self.doc);
+        Ok(())
+    }
+
+    /// Inserts a new note and its initial fields as part of the caller's commit.
+    pub(crate) fn insert_note(
+        &self,
+        id: Id,
+        type_name: &str,
+        body: &str,
+        fields: &[(&str, schema::Value)],
+    ) -> Result<()> {
         if !schema::is_name(type_name) {
             return Err(Error::invalid("type name", type_name));
         }
@@ -303,7 +318,10 @@ impl Space {
         note.insert("type", type_name)?;
         let text = note.insert_container("body", LoroText::new())?;
         text.insert(0, body)?;
-        note.insert_container("fields", LoroMap::new())?;
+        let field_map = note.insert_container("fields", LoroMap::new())?;
+        for (name, value) in fields {
+            field_map.insert(name, value.to_loro())?;
+        }
         let meta = note.insert_container("meta", LoroMap::new())?;
         let now = time::now();
         let machine = self.machine.to_string();
@@ -312,8 +330,21 @@ impl Space {
         meta.insert("updated", now)?;
         meta.insert("updated-by", machine.as_str())?;
         note.insert_container("settings", LoroMap::new())?;
-        commit(&self.doc);
         Ok(())
+    }
+
+    /// Stages a local import with a peer separate from the editors that hold the live document.
+    /// The caller holds the space lock until it saves and applies the fork's changes.
+    pub(crate) fn stage_import(&mut self) -> Result<Self> {
+        let doc = self.doc.fork();
+        doc.set_peer_id(*self.import_peer.get_or_insert_with(|| doc.peer_id()))?;
+        Ok(Self {
+            doc,
+            machine: self.machine,
+            joining: self.joining,
+            import_peer: None,
+            open: HashMap::new(),
+        })
     }
 
     /// The identifiers of every note in the space.

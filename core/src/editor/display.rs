@@ -189,6 +189,7 @@ pub(super) fn with_previews(
             }
             Style::Completed => vec![Look::Completed],
             Style::Emphasis => vec![Look::Emphasis],
+            Style::Escape => Vec::new(),
             Style::Heading(level) => vec![Look::Heading(level)],
             Style::Highlight => vec![Look::Highlight],
             Style::Link => vec![Look::Link],
@@ -459,6 +460,20 @@ mod tests {
         // Anywhere in a pipe table shows all of its syntax.
         let table = text.find("| b").unwrap();
         assert_eq!(hidden(table), ["# ", "**", "**", "[", "](http://x)"]);
+    }
+
+    #[test]
+    fn hides_punctuation_escapes_away_from_the_selection() {
+        let text = r"\*Deals cost \$329. C:\tools and `\*` stay literal. \\*";
+        let hidden = |at| display(text, &(at..at)).hidden;
+        let price = text.find(r"\$").unwrap();
+        let last = text.rfind(r"\\").unwrap();
+        let code = text.find('`').unwrap();
+        assert_eq!(
+            hidden(text.len()),
+            [0..1, price..price + 1, code..code + 1, code + 3..code + 4, last..last + 1],
+        );
+        assert_eq!(hidden(1)[0], price..price + 1);
     }
 
     #[test]
