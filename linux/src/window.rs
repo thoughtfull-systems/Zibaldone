@@ -12,6 +12,7 @@ use gtk::{gdk, gio, glib};
 use zib_core::body;
 use zib_core::editing::{Drawing, LinkTarget};
 use zib_core::render::Kind;
+use zib_core::schema::Value;
 use zib_core::search::{MATCH_END, MATCH_START};
 use zib_core::sync::{LiveEvent, Selection, SyncState};
 use zib_core::{Channel, Id};
@@ -57,7 +58,7 @@ pub struct Inner {
     drawing_generation: Cell<u64>,
     title: adw::WindowTitle,
     stack: gtk::Stack,
-    article_details: gtk::MenuButton,
+    note_metadata: gtk::MenuButton,
     backlinks: gtk::MenuButton,
     /// The notes opened before the open one, the latest last, and those to go forward to again.
     back: RefCell<Vec<(Id, Id)>>,
@@ -80,6 +81,7 @@ struct Editor {
     space: Id,
     note: Id,
     type_name: String,
+    fields: Vec<(String, Value)>,
     titles: HashMap<Id, String>,
     cursors: Option<tokio::sync::broadcast::Sender<(Id, Vec<Selection>)>>,
 }
@@ -170,9 +172,9 @@ impl Window {
         content_header.pack_start(&back_button);
         content_header.pack_start(&forward_button);
         content_header.pack_start(&open_file);
-        let article_details = gtk::MenuButton::builder().label("Article details").build();
-        article_details.set_visible(false);
-        content_header.pack_start(&article_details);
+        let note_metadata = gtk::MenuButton::builder().label("Note metadata").build();
+        note_metadata.set_visible(false);
+        content_header.pack_start(&note_metadata);
         content_header.pack_end(&status);
         content_header.pack_end(&delete);
         let print_menu = gio::Menu::new();
@@ -241,7 +243,7 @@ impl Window {
             drawing_generation: Cell::new(0),
             title,
             stack,
-            article_details,
+            note_metadata,
             backlinks,
             back: RefCell::default(),
             forward: RefCell::default(),
@@ -591,6 +593,7 @@ impl Window {
         let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
         if open.is_some_and(|(s, _)| s == space) {
             self.refresh_open();
+            self.refresh_note_metadata();
         }
     }
 
@@ -688,19 +691,18 @@ impl Window {
             let loaded = core({
                 let state = state.clone();
                 async move {
-                    let loaded = state.note(space, note).await?;
-                    let metadata = state.article_fields(space, &loaded).await;
+                    let (loaded, fields) = state.note_with_fields(space, note).await?;
                     let body = state.open_body(space, note).await?;
                     let targets: Vec<Id> = body::link_targets(&loaded.body).into_iter().collect();
                     let titles = state.titles(&targets).await;
-                    Ok::<_, zib_core::Error>((loaded, body, titles, metadata))
+                    Ok::<_, zib_core::Error>((loaded, body, titles, fields))
                 }
             })
             .await;
             if w.inner().widget.session() != session {
                 return;
             }
-            let (loaded, body, titles, metadata) = match loaded {
+            let (loaded, body, titles, fields) = match loaded {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     w.toast(&format!("Couldn't open the note: {error}"));
@@ -711,13 +713,14 @@ impl Window {
                 space,
                 note,
                 type_name: loaded.type_name.clone(),
+                fields: Vec::new(),
                 titles: titles.clone(),
                 cursors: None,
             });
             let widget = &w.inner().widget;
             widget.set_editor(Some(zib_core::editor::Editor::new(body)));
             widget.set_titles(titles);
-            w.show_article_metadata(metadata);
+            w.show_note_metadata(fields);
             w.refresh_images(false);
             w.inner()
                 .open_file
@@ -759,58 +762,98 @@ impl Window {
         });
     }
 
-    fn show_article_metadata(&self, fields: Vec<(&str, zib_core::schema::Value)>) {
-        use zib_core::schema::Value;
+    fn refresh_note_metadata(&self) {
+        let Some((space, note)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
+        else {
+            return;
+        };
+        let session = self.inner().widget.session();
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            if let Ok((_, fields)) =
+                core(async move { state.note_with_fields(space, note).await }).await
+                && w.inner().widget.session() == session
+            {
+                w.show_note_metadata(fields);
+            }
+        });
+    }
 
-        let details = &self.inner().article_details;
-        if fields.is_empty() {
+    fn show_note_metadata(&self, fields: Vec<(String, Value)>) {
+        let details = &self.inner().note_metadata;
+        let mut editor = self.inner().editor.borrow_mut();
+        let Some(editor) = editor.as_mut() else { return };
+        if editor.fields == fields && details.popover().is_some() {
             return;
         }
-        let rows = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        rows.set_margin_start(8);
-        rows.set_margin_end(8);
-        rows.set_margin_top(8);
-        rows.set_margin_bottom(8);
-        for (name, value) in fields {
-            let (label, text) = match (name, value) {
-                ("authors", Value::List(authors)) => {
-                    let authors = authors.into_iter().filter_map(|value| match value {
-                        Value::Text(author) => Some(author),
-                        _ => None,
-                    });
-                    ("Authors", authors.collect::<Vec<_>>().join(", "))
-                }
-                ("captured-at", Value::Timestamp(when)) => {
-                    let Ok(date) = glib::DateTime::from_unix_utc(when.div_euclid(1000))
-                        .and_then(|date| date.to_local())
-                        .and_then(|date| date.format("%x %X"))
-                    else {
-                        continue;
-                    };
-                    ("Captured", date.to_string())
-                }
-                ("published-on", Value::Date(date)) => ("Published", date),
-                ("url", Value::Text(url)) if zib_core::web_clip::source_url(&url).is_some() => {
-                    let label = gtk::Label::new(Some(&format!("Source · {url}")));
-                    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                    label.set_max_width_chars(48);
-                    let link = gtk::LinkButton::new(&url);
-                    link.set_child(Some(&label));
-                    link.set_halign(gtk::Align::Start);
-                    rows.append(&link);
-                    continue;
-                }
-                _ => continue,
-            };
-            let row = gtk::Label::new(Some(&format!("{label} · {text}")));
-            row.set_xalign(0.0);
-            row.set_wrap(true);
-            row.set_max_width_chars(48);
-            row.set_selectable(true);
-            rows.append(&row);
+        editor.fields = fields;
+        let fields = &editor.fields;
+        let note_id = Value::Text(editor.note.to_string());
+        let mut entries: Vec<_> =
+            fields.iter().map(|(name, value)| (name.as_str(), value)).collect();
+        entries.push(("note-id", &note_id));
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        let rows = gtk::Grid::builder()
+            .column_spacing(16)
+            .row_spacing(8)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(12)
+            .margin_bottom(12)
+            .build();
+        let mut labels = Vec::with_capacity(entries.len());
+        for (row, (name, value)) in (0..).zip(entries) {
+            let key = gtk::Label::builder()
+                .label(name)
+                .max_width_chars(24)
+                .valign(gtk::Align::Start)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .xalign(0.0)
+                .build();
+            key.add_css_class("heading");
+            rows.attach(&key, 0, row, 1, 1);
+            let label = gtk::Label::builder()
+                .hexpand(true)
+                .label(field_text(value))
+                .max_width_chars(64)
+                .selectable(true)
+                .valign(gtk::Align::Start)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .xalign(0.0)
+                .build();
+            if let Value::Text(url) = value
+                && zib_core::web_clip::source_url(url).is_some()
+            {
+                let url = escape(url);
+                label.set_markup(&format!("<a href=\"{url}\">{url}</a>"));
+            }
+            rows.attach(&label, 1, row, 1, 1);
+            labels.push(label);
         }
-        let popover = gtk::Popover::builder().child(&rows).build();
-        details.set_popover(Some(&popover));
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&rows)
+            .focusable(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .max_content_height(360)
+            .propagate_natural_height(true)
+            .propagate_natural_width(true)
+            .width_request(420)
+            .build();
+        scroll.connect_map(move |scroll| {
+            // Keep the popover's initial focus off the selectable text.
+            scroll.grab_focus();
+            for label in &labels {
+                label.select_region(0, 0);
+            }
+        });
+        if let Some(popover) = details.popover() {
+            popover.set_child(Some(&scroll));
+        } else {
+            details.set_popover(Some(&gtk::Popover::builder().child(&scroll).build()));
+        }
         details.set_visible(true);
     }
 
@@ -988,9 +1031,9 @@ impl Window {
             });
         }
         self.inner().open_file.set_visible(false);
-        self.inner().article_details.popdown();
-        self.inner().article_details.set_visible(false);
-        self.inner().article_details.set_popover(None::<&gtk::Popover>);
+        self.inner().note_metadata.popdown();
+        self.inner().note_metadata.set_visible(false);
+        self.inner().note_metadata.set_popover(None::<&gtk::Popover>);
     }
 
     /// Another machine's change or cursor arrived while the note is open.
@@ -1740,6 +1783,27 @@ pub async fn ask(
 }
 
 /// Escapes text for Pango markup.
+fn field_text(value: &Value) -> String {
+    match value {
+        Value::Text(text) if text.is_empty() => "(empty)".to_owned(),
+        Value::Text(text)
+        | Value::Decimal(text)
+        | Value::Date(text)
+        | Value::Time(text)
+        | Value::Choice(text) => text.clone(),
+        Value::Integer(number) => number.to_string(),
+        Value::Boolean(value) => value.to_string(),
+        Value::Timestamp(when) => glib::DateTime::from_unix_utc(when.div_euclid(1000))
+            .and_then(|date| date.to_local())
+            .and_then(|date| date.format("%x %X"))
+            .map_or_else(|_| when.to_string(), |date| date.to_string()),
+        Value::Link(id) => id.to_string(),
+        Value::File(hash) => hash.to_string(),
+        Value::List(items) if items.is_empty() => "[]".to_owned(),
+        Value::List(items) => items.iter().map(field_text).collect::<Vec<_>>().join("\n"),
+    }
+}
+
 fn escape(text: &str) -> String {
     glib::markup_escape_text(text).to_string()
 }

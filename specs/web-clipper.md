@@ -36,6 +36,19 @@ an image identifier already in use for a new import returns an error.
 
 The extension escapes literal dollar signs in article text so they don't start or end math spans.
 
+### Import request for videos
+
+The importer also accepts YouTube video pages in the same request. It creates a `video` note for
+`youtube.com` or its subdomains with a `/watch?v=ID` or `/shorts/ID` address, or a `youtu.be/ID`
+address. The identifier contains one or more letters from `A` to `Z` or `a` to `z`, digits, hyphens,
+or underscores. The short and share paths allow a trailing slash. The same rules for metadata,
+images, and retries apply. A retry can also return an existing `article` note if the identifier and
+source URL match a previous import of the video.
+
+Firefox tries to include a timestamped transcript as markdown in the body. When it can't read a
+transcript, it saves the available video details and reports the missing transcript on the toolbar
+badge. When the body would be empty, Firefox uses a link to the video.
+
 ## Import request for PDFs
 
 The instance request `import-web-pdf` has an `id` and a `pdf` map. The map contains:
@@ -50,6 +63,15 @@ The instance stores the bytes as an `application/pdf` blob and creates a `file` 
 blob in its `file` field. The note's first line holds the filename, followed by a source link in a
 separate paragraph. The instance saves the space before returning its identifiers. A retry returns
 the same file note in its current space. A deleted note or a note of another type returns an error.
+
+### Source fields for PDFs
+
+The importer writes the request's `url` into the note's `url` field and reads `captured-at` from the
+millisecond timestamp in the note's version 7 identifier. Firefox sets that timestamp when the
+capture starts. The importer fills `authors` from the embedded author names and `published-on` from
+an embedded publication date when it can read those values. PDF creation and modification timestamps
+leave `published-on` empty. When the importer writes the URL to the field, the new note's body holds
+only the filename and a blank line. A retry leaves the existing note's body and fields intact.
 
 ## Firefox native messaging
 

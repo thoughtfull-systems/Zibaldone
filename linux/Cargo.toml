@@ -19,13 +19,12 @@ gdk-pixbuf = "0.22.0"
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_16"] }
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 ksni = "0.3.7"
+roxmltree = "0.21.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 zib-core = { path = "../core", features = ["print"] }
-
-[dev-dependencies]
-tempfile = "3.27.0"
 
 [lints]
 workspace = true

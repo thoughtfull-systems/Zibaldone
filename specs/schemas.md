@@ -76,6 +76,13 @@ A key that doesn't apply to a field's kind is absent.
 - A release that doesn't know a type shows its notes as generic notes, with each field shown and
   edited by its kind, and doesn't create notes of that type.
 
+## Note metadata
+
+An open note shows a **Note metadata** control. It lists `note-id` and the note's populated fields
+in name order, including derived fields once they have values. The identifier uses the canonical
+text form that the [identifiers specification](identifiers.md) defines. The app lets the owner
+select and copy values and opens the control with no text selected.
+
 ## Derivations
 
 A derivation turns the blob in one `file` field into a new blob for a derived field. The machine

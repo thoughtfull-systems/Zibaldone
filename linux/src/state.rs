@@ -16,9 +16,9 @@ use zib_core::instance::NoteRead;
 use zib_core::net::{Nearby, Network, Node, OpenNote, Pairing};
 use zib_core::pairing::{Invite, Paired, Party};
 use zib_core::render::{Image, Kind, Renderer};
-use zib_core::schema::Value;
+use zib_core::schema::{self, Value};
 use zib_core::search::{Hit, Index};
-use zib_core::space::{FileHash, Machine, Policy};
+use zib_core::space::{FileHash, Machine, Note, Policy};
 use zib_core::store::Store;
 use zib_core::sync::{Exchanged, SyncState};
 use zib_core::{Channel, Error, Id, Result, Space};
@@ -434,6 +434,27 @@ impl State {
 
     pub async fn note(&self, space_id: Id, id: Id) -> Result<zib_core::space::Note> {
         self.space(space_id).await?.lock().await.note(id)
+    }
+
+    /// Reads a note and its populated, schema-validated fields from the same space snapshot.
+    pub(crate) async fn note_with_fields(
+        &self,
+        space_id: Id,
+        id: Id,
+    ) -> Result<(Note, Vec<(String, Value)>)> {
+        let space = self.space(space_id).await?;
+        let space = space.lock().await;
+        let note = space.note(id)?;
+        let mut fields = Vec::new();
+        if !note.fields.is_empty()
+            && let Some(schema) = schema::read_type(space.doc(), &note.type_name)
+        {
+            fields.extend(schema.fields.into_iter().filter_map(|(name, def)| {
+                let value = Value::from_loro(&def, note.fields.get(&name)?)?;
+                Some((name, value))
+            }));
+        }
+        Ok((note, fields))
     }
 
     pub(crate) async fn read_note(&self, note: Id) -> Result<NoteRead> {

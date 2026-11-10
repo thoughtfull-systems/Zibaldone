@@ -8454,6 +8454,7 @@ dependencies = [
  "image",
  "ksni",
  "libadwaita",
+ "roxmltree 0.21.2",
  "serde",
  "serde_json",
  "tempfile",

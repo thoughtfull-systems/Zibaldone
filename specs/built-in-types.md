@@ -89,6 +89,19 @@ the captured pictures. The app can show articles as curios, which are works by o
 
 An import sets `captured-at` and `url` and sets `authors` and `published-on` when it has values.
 
+## Source fields for files and images
+
+The `file` and `image` types also define the optional `authors`, `captured-at`, `published-on`, and
+`url` fields with the same kinds and search modes as `article`. A web PDF import fills these fields
+as the [web clipper specification](web-clipper.md#source-fields-for-pdfs) describes.
+
+## `video`
+
+A video captured from the web. Its body holds the title, description, and timestamped transcript
+when available. It defines the same fields as `article`. The author's name is the channel name when
+the source provides it. The [web clipper specification](web-clipper.md#import-request-for-videos)
+describes video imports.
+
 ## Platforms
 
 No platform differs in the types it defines. Which derivations each platform runs is in the

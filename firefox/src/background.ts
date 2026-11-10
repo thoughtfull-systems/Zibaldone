@@ -1,14 +1,14 @@
 import { type DownloadedAsset, fetchAsset } from "./assets";
 import type { Capture, ImageReference } from "./content";
-import { send } from "./host";
+import { saveClip } from "./host";
 import { downloadPdf } from "./pdf";
 
+const active = new Set<number>();
 const maxImageBytes = 8 * 1024 * 1024;
 const maxImagePixels = 16 * 1024 * 1024;
 const maxImages = 64;
 const maxTotalBytes = 32 * 1024 * 1024;
 const resizedJpegEdge = 2048;
-const active = new Set<number>();
 
 interface Asset {
   data: string;
@@ -146,7 +146,7 @@ async function collect(tabId: number, capture: Capture, when: number) {
   return { body, images, missed };
 }
 
-async function status(
+async function setStatus(
   tabId: number,
   badge: string,
   title: string,
@@ -166,7 +166,7 @@ browser.action.onClicked.addListener(async (tab) => {
   const when = Date.now();
   active.add(tabId);
   try {
-    await status(tabId, "…", "Saving to Zib…", "#666666");
+    await setStatus(tabId, "…", "Saving to Zib…", "#666666");
     const { space } = await browser.storage.local.get("space");
     if (typeof space !== "string" || !space) {
       throw new Error("Choose a destination space in the add-on settings.");
@@ -176,9 +176,11 @@ browser.action.onClicked.addListener(async (tab) => {
       .catch(() => []);
     const note = noteId(when);
     let missed = 0;
+    let transcriptMissing = false;
     let request: object;
     if (injected?.result) {
       const capture = injected.result;
+      transcriptMissing = capture.transcriptMissing ?? false;
       const article = await collect(tabId, capture, when);
       missed = article.missed;
       request = {
@@ -206,17 +208,16 @@ browser.action.onClicked.addListener(async (tab) => {
         url: pdf.url,
       };
     }
-    // Retry a disconnected host once using exactly the same note and image identifiers.
-    const reply = await send(request).catch(() => send(request));
-    if (!reply.ok) throw new Error(reply.error);
-    if (!("clip" in reply)) throw new Error("Zib returned an unexpected reply.");
-    if (missed) {
-      await status(tabId, "!", `Saved to Zib with ${missed} image(s) unavailable.`);
+    await saveClip(request);
+    if (transcriptMissing) {
+      await setStatus(tabId, "!", "Saved to Zib without a transcript.");
+    } else if (missed) {
+      await setStatus(tabId, "!", `Saved to Zib with ${missed} image(s) unavailable.`);
     } else {
-      await status(tabId, "✓", "Saved to Zib.", "#217a39");
+      await setStatus(tabId, "✓", "Saved to Zib.", "#217a39");
     }
   } catch (error) {
-    await status(tabId, "×", `Couldn't save to Zib. ${error}`);
+    await setStatus(tabId, "×", `Couldn't save to Zib. ${error}`);
   } finally {
     active.delete(tabId);
   }

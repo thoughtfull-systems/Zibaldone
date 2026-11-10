@@ -1,4 +1,4 @@
-//! Browser captures and their representation as article, file, and image notes.
+//! Browser captures and their representation as article, file, image, and video notes.
 
 use std::collections::HashSet;
 
@@ -90,20 +90,38 @@ impl Pdf {
         Ok(())
     }
 
-    /// Stages an ordinary file note with a link back to the source.
-    pub fn stage(&self, space: &mut Space, hash: FileHash) -> Result<Space> {
-        let url = source_url(&self.url).ok_or_else(|| invalid("invalid PDF source URL"))?;
-        let url = url.as_str().replace('<', "%3C").replace('>', "%3E");
-        let body = format!("{}\n\n[Source](<{url}>)\n", self.name.trim());
+    /// Stages an ordinary file note with the source details in its fields.
+    pub fn stage(
+        &self,
+        space: &mut Space,
+        hash: FileHash,
+        authors: &[String],
+        published_on: Option<&str>,
+    ) -> Result<Space> {
+        // Firefox encodes the capture time in the first 48 bits of the version 7 identifier.
+        let mut timestamp = [0; 8];
+        timestamp[2..].copy_from_slice(&self.note.as_bytes()[..6]);
+        let captured_at = i64::from_be_bytes(timestamp);
+        let mut fields = source_fields(captured_at, &self.url, authors, published_on);
+        fields.push(("file", Value::File(hash)));
+        let body = format!("{}\n\n", self.name.trim());
         let mut staged = space.stage_import()?;
         staged.add_file(hash, self.bytes.len() as u64, "application/pdf")?;
-        staged.insert_note(self.note, schema::FILE, &body, &[("file", Value::File(hash))])?;
+        staged.insert_note(self.note, schema::FILE, &body, &fields)?;
         staged.commit();
         Ok(staged)
     }
 }
 
 impl Clip {
+    pub fn note_type(&self) -> &'static str {
+        if source_url(&self.url).is_some_and(|url| is_youtube_video(&url)) {
+            schema::VIDEO
+        } else {
+            schema::ARTICLE
+        }
+    }
+
     pub fn validate(&self, images: &[Asset]) -> Result<()> {
         let metadata_ok = !self.title.trim().is_empty()
             && self.title.len() <= 4096
@@ -114,7 +132,7 @@ impl Clip {
             && self.authors.len() <= 64
             && self.authors.iter().all(|author| !author.trim().is_empty() && author.len() <= 1024);
         if !metadata_ok {
-            return Err(invalid("invalid article metadata"));
+            return Err(invalid("invalid clip metadata"));
         }
         let mut ids = HashSet::from([self.note]);
         if images.len() > MAX_IMAGES
@@ -151,7 +169,7 @@ impl Clip {
             || used.len() != images.len()
             || (!content && used.is_empty())
         {
-            return Err(invalid("invalid article body"));
+            return Err(invalid("invalid clip body"));
         }
         Ok(())
     }
@@ -176,19 +194,8 @@ impl Clip {
             }
         }
 
-        let mut fields = vec![
-            ("captured-at", Value::Timestamp(self.captured_at)),
-            ("url", Value::Text(self.url.clone())),
-        ];
-        if !self.authors.is_empty() {
-            fields.push((
-                "authors",
-                Value::List(self.authors.iter().cloned().map(Value::Text).collect()),
-            ));
-        }
-        if let Some(date) = &self.published_on {
-            fields.push(("published-on", Value::Date(date.clone())));
-        }
+        let fields =
+            source_fields(self.captured_at, &self.url, &self.authors, self.published_on.as_deref());
         for (index, (note, hash, size, media_type)) in images.iter().enumerate() {
             let image_title = format!("Image {} from {title}\n", index + 1);
             staged.add_file(*hash, *size, media_type)?;
@@ -199,10 +206,48 @@ impl Clip {
                 &[("image", Value::File(*hash))],
             )?;
         }
-        staged.insert_note(self.note, schema::ARTICLE, &text, &fields)?;
+        staged.insert_note(self.note, self.note_type(), &text, &fields)?;
         staged.commit();
         Ok(staged)
     }
+}
+
+/// Matches the video pages that the Firefox clipper parses asynchronously.
+fn is_youtube_video(url: &url::Url) -> bool {
+    let valid_id = |id: &str| {
+        !id.is_empty()
+            && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+    };
+    let path = url.path();
+    let without_trailing_slash = path.strip_suffix('/').unwrap_or(path);
+    match url.host_str() {
+        Some("youtu.be") => without_trailing_slash.strip_prefix('/').is_some_and(valid_id),
+        Some(host) if host == "youtube.com" || host.ends_with(".youtube.com") => {
+            if path == "/watch" {
+                url.query_pairs().find(|(name, _)| name == "v").is_some_and(|(_, id)| valid_id(&id))
+            } else {
+                without_trailing_slash.strip_prefix("/shorts/").is_some_and(valid_id)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn source_fields(
+    captured_at: i64,
+    url: &str,
+    authors: &[String],
+    published_on: Option<&str>,
+) -> Vec<(&'static str, Value)> {
+    let mut fields =
+        vec![("captured-at", Value::Timestamp(captured_at)), ("url", Value::Text(url.to_owned()))];
+    if !authors.is_empty() {
+        fields.push(("authors", Value::List(authors.iter().cloned().map(Value::Text).collect())));
+    }
+    if let Some(date) = published_on {
+        fields.push(("published-on", Value::Date(date.to_owned())));
+    }
+    fields
 }
 
 fn is_v7(id: Id) -> bool {

@@ -155,32 +155,28 @@ pub const ARTICLE: &str = "article";
 pub const FILE: &str = "file";
 pub const IMAGE: &str = "image";
 pub const NOTE: &str = "note";
+pub const VIDEO: &str = "video";
 
 /// The types this release defines, as the built-in types specification lists them.
 pub fn built_in() -> Vec<TypeDef> {
-    let fields = |list: Vec<(&str, FieldDef)>| -> BTreeMap<String, FieldDef> {
-        list.into_iter().map(|(name, def)| (name.to_owned(), def)).collect()
+    let source = [
+        (
+            "authors",
+            FieldDef { item: Some(Kind::Text), ..FieldDef::new(Kind::List, SearchMode::Text) },
+        ),
+        ("captured-at", FieldDef::new(Kind::Timestamp, SearchMode::Filter)),
+        ("published-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
+        ("url", FieldDef::new(Kind::Text, SearchMode::Filter)),
+    ];
+    let fields = |extra: &[(&str, FieldDef)]| {
+        source.iter().chain(extra).map(|(name, def)| ((*name).to_owned(), def.clone())).collect()
     };
     vec![
         TypeDef { name: AGENT_TRANSCRIPT.into(), fields: BTreeMap::new() },
-        TypeDef {
-            name: ARTICLE.into(),
-            fields: fields(vec![
-                (
-                    "authors",
-                    FieldDef {
-                        item: Some(Kind::Text),
-                        ..FieldDef::new(Kind::List, SearchMode::Text)
-                    },
-                ),
-                ("captured-at", FieldDef::new(Kind::Timestamp, SearchMode::Filter)),
-                ("published-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
-                ("url", FieldDef::new(Kind::Text, SearchMode::Filter)),
-            ]),
-        },
+        TypeDef { name: ARTICLE.into(), fields: fields(&[]) },
         TypeDef {
             name: FILE.into(),
-            fields: fields(vec![
+            fields: fields(&[
                 ("file", FieldDef::new(Kind::File, SearchMode::None)),
                 ("text", FieldDef::derived("text", "file", SearchMode::Text)),
                 ("thumbnail", FieldDef::derived("thumbnail", "file", SearchMode::None).preview()),
@@ -188,12 +184,13 @@ pub fn built_in() -> Vec<TypeDef> {
         },
         TypeDef {
             name: IMAGE.into(),
-            fields: fields(vec![
+            fields: fields(&[
                 ("image", FieldDef::new(Kind::File, SearchMode::None).accepting("image/*")),
                 ("thumbnail", FieldDef::derived("thumbnail", "image", SearchMode::None).preview()),
             ]),
         },
         TypeDef { name: NOTE.into(), fields: BTreeMap::new() },
+        TypeDef { name: VIDEO.into(), fields: fields(&[]) },
     ]
 }
 

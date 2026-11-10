@@ -218,8 +218,24 @@ fn default_editor_edits_the_shared_body_and_keeps_it_through_navigation_and_clos
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn detail_values(details: &gtk::MenuButton) -> Vec<(String, gtk::Label)> {
+    let scroll =
+        details.popover().unwrap().child().unwrap().downcast::<gtk::ScrolledWindow>().unwrap();
+    assert!(scroll.measure(gtk::Orientation::Horizontal, -1).0 >= 420);
+    let viewport = scroll.child().unwrap().downcast::<gtk::Viewport>().unwrap();
+    let rows = viewport.child().unwrap().downcast::<gtk::Grid>().unwrap();
+    (0..)
+        .map_while(|row| {
+            let key = rows.child_at(0, row)?.downcast::<gtk::Label>().unwrap();
+            let value = rows.child_at(1, row).unwrap().downcast::<gtk::Label>().unwrap();
+            Some((key.text().to_string(), value))
+        })
+        .collect()
+}
+
 #[test]
-fn opening_a_clipped_article_shows_its_details_in_the_header() {
+fn note_metadata_shows_the_note_id_and_populated_fields_without_selecting_them() {
+    use zib_core::space::FileHash;
     use zib_core::web_clip::{Clip, Part};
 
     if adw::init().is_err() {
@@ -228,8 +244,9 @@ fn opening_a_clipped_article_shows_its_details_in_the_header() {
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
-    let url = "https://example.org/article";
-    let (space, article, other) = runtime.block_on(async {
+    let url = "https://example.org/article?a=1&b=2";
+    let bytes = b"file contents";
+    let (space, article, file, other) = runtime.block_on(async {
         let space = state.spaces().await[0].0;
         let article = Id::generate();
         let clip = Clip {
@@ -243,7 +260,16 @@ fn opening_a_clipped_article_shows_its_details_in_the_header() {
             body: vec![Part::Markdown("Article body".into())],
         };
         state.import_web_clip(clip, Vec::new()).await.unwrap();
-        (space, article, state.create_note(space, "Other note").await.unwrap())
+        let file = state
+            .add_bytes(
+                space,
+                bytes.to_vec(),
+                "Example file".into(),
+                "application/octet-stream".into(),
+            )
+            .await
+            .unwrap();
+        (space, article, file, state.create_note(space, "Other note").await.unwrap())
     });
     let app = adw::Application::builder()
         .application_id("systems.thoughtfull.Zibaldone.ArticleTest")
@@ -254,24 +280,59 @@ fn opening_a_clipped_article_shows_its_details_in_the_header() {
     window.open_note(space, article);
     until(|| window.inner().widget.text().as_deref() == Some("# Article title\n\nArticle body"));
 
-    let details = &window.inner().article_details;
+    let details = &window.inner().note_metadata;
     assert!(details.get_visible());
-    assert_eq!(details.label().as_deref(), Some("Article details"));
-    let rows = details.popover().unwrap().child().unwrap().observe_children();
-    let labels: Vec<_> = (0..rows.n_items())
-        .filter_map(|index| Some(rows.item(index)?.downcast::<gtk::Label>().ok()?.text()))
-        .collect();
-    assert!(labels.iter().any(|label| label.contains("Test Author")));
-    assert!(labels.iter().any(|label| label.starts_with("Captured")));
-    assert!(labels.iter().any(|label| label.contains("2023-02-28")));
-    let source = (0..rows.n_items())
-        .find_map(|index| rows.item(index)?.downcast::<gtk::LinkButton>().ok())
-        .unwrap();
-    assert_eq!(source.uri(), url);
+    assert_eq!(details.label().as_deref(), Some("Note metadata"));
+    let values = detail_values(details);
+    assert_eq!(
+        values.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+        ["authors", "captured-at", "note-id", "published-on", "url"],
+    );
+    assert_eq!(values[0].1.text(), "Test Author");
+    assert!(!values[1].1.text().is_empty());
+    assert_eq!(values[2].1.text(), article.to_string());
+    assert_eq!(values[3].1.text(), "2023-02-28");
+    let source = &values[4].1;
+    assert_eq!(source.text(), url);
+    assert!(source.label().starts_with("<a href=\"https://example.org/article?a=1&amp;b=2\">"));
+    assert_eq!(source.xalign().to_bits(), values[0].1.xalign().to_bits());
+
+    window.present();
+    until(|| window.inner().window.is_mapped());
+    details.popup();
+    let popover = details.popover().unwrap();
+    until(|| popover.is_mapped());
+    assert!(values.iter().all(|(_, label)| label.selection_bounds().is_none()));
+    let authors = &values[0].1;
+    assert!(authors.grab_focus());
+    authors.select_region(0, 4);
+    assert_eq!(authors.selection_bounds(), Some((0, 4)));
+    details.popdown();
+    until(|| !popover.is_mapped());
+    details.popup();
+    until(|| popover.is_mapped());
+    assert!(values.iter().all(|(_, label)| label.selection_bounds().is_none()));
+    details.popdown();
+
+    window.open_note(space, file);
+    until(|| window.inner().widget.text().is_some_and(|body| body.starts_with("Example file")));
+    assert!(details.get_visible());
+    let values = detail_values(details);
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].0, "file");
+    assert_eq!(values[1].0, "note-id");
+    assert_eq!(values[1].1.text(), file.to_string());
+    let hash = values[0].1.text();
+    assert_eq!(hash, FileHash::of(bytes).to_string());
 
     window.open_note(space, other);
     until(|| window.inner().widget.text().as_deref() == Some("Other note"));
-    assert!(!details.get_visible());
+    assert!(details.get_visible());
+    let values = detail_values(details);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].0, "note-id");
+    assert_eq!(values[0].1.text(), other.to_string());
+    assert!(values[0].1.is_selectable());
     window.close_editor();
     runtime.block_on(state.finish());
     window.inner().window.destroy();

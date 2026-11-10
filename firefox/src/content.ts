@@ -10,6 +10,7 @@ export interface Capture {
   parts: (string | ImageReference)[];
   publishedOn?: string;
   title: string;
+  transcriptMissing?: boolean;
   url: string;
 }
 
@@ -61,7 +62,80 @@ function sourceOf(image: HTMLImageElement): string {
   return lazy || image.getAttribute("src") || responsive?.split(/[ ,]/, 1)[0] || "";
 }
 
-export function capture(): Capture {
+function isYouTubeVideo(url: URL): boolean {
+  const { hostname, pathname, searchParams } = url;
+  if (hostname === "youtu.be") return /^\/[\w-]+\/?$/.test(pathname);
+  return (
+    (hostname === "youtube.com" || hostname.endsWith(".youtube.com")) &&
+    ((pathname === "/watch" && /^[\w-]+$/.test(searchParams.get("v") ?? "")) ||
+      /^\/shorts\/[\w-]+\/?$/.test(pathname))
+  );
+}
+
+const expandedPanel =
+  'ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"]';
+const openTranscriptPanel =
+  `${expandedPanel}[target-id="engagement-panel-searchable-transcript"], ` +
+  `${expandedPanel} [data-target-id="PAmodern_transcript_view"]`;
+
+function readTranscriptPanel(): HTMLElement | undefined {
+  const transcript = document.createElement("section");
+  const rows = document.querySelectorAll(
+    "transcript-segment-view-model, ytd-transcript-segment-renderer",
+  );
+  for (const row of rows) {
+    if (!row.closest(expandedPanel)) continue;
+    const time = row
+      .querySelector(".segment-timestamp, .ytwTranscriptSegmentViewModelTimestamp")
+      ?.textContent?.trim();
+    const text = row
+      .querySelector(".segment-text, .ytAttributedStringHost, .yt-core-attributed-string")
+      ?.textContent?.trim();
+    if (!time || !text) continue;
+    const line = document.createElement("p");
+    const timestamp = document.createElement("strong");
+    timestamp.textContent = time;
+    line.append(timestamp, ` · ${text}`);
+    transcript.append(line);
+  }
+  if (!transcript.childElementCount) return;
+  const heading = document.createElement("h2");
+  heading.textContent = "Transcript";
+  transcript.prepend(heading);
+  return transcript;
+}
+
+async function waitFor<T>(find: () => T | null | undefined): Promise<T | undefined> {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const found = find();
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function openTranscript(): Promise<HTMLElement | undefined> {
+  const loaded = readTranscriptPanel();
+  if (loaded) return loaded;
+  if (document.querySelector(openTranscriptPanel)) return waitFor(readTranscriptPanel);
+
+  // Some desktop layouts load the transcript button only after expanding the description.
+  const findButton = () =>
+    document.querySelector<HTMLButtonElement>(
+      "ytd-video-description-transcript-section-renderer button",
+    );
+  let button = findButton();
+  if (!button) {
+    const expand = document.querySelector<HTMLElement>("#description-inline-expander #expand");
+    if (!expand) return;
+    expand.click();
+    button = (await waitFor(findButton)) ?? null;
+  }
+  if (!button) return;
+  button.click();
+  return waitFor(readTranscriptPanel);
+}
+
+export async function capture(): Promise<Capture> {
   const url = httpUrl(location.href, location.href);
   if (!url) throw new Error("Open an HTTP or HTTPS page to clip it.");
   const base = document.baseURI;
@@ -77,13 +151,23 @@ export function capture(): Capture {
     }
   }
 
-  const article = new Defuddle(document, {
+  const video = isYouTubeVideo(new URL(url));
+  const defuddle = new Defuddle(document, {
     url,
-    useAsync: false,
+    useAsync: video,
     includeReplies: false,
-  }).parse();
+  });
+  const article = video ? await defuddle.parseAsync() : defuddle.parse();
   const fragment = document.createElement("template");
   fragment.innerHTML = article.content;
+  let hasTranscript = Boolean(article.variables?.transcript);
+  if (video && !hasTranscript) {
+    const transcript = await openTranscript();
+    if (transcript) {
+      fragment.content.append(transcript);
+      hasTranscript = true;
+    }
+  }
   for (const node of fragment.content.querySelectorAll("script, style, iframe, object, embed")) {
     node.remove();
   }
@@ -121,7 +205,11 @@ export function capture(): Capture {
     }
   }
 
-  const markdown = createMarkdownContent(fragment.innerHTML, url).replaceAll(dollar, () => "\\$");
+  let markdown = createMarkdownContent(fragment.innerHTML, url).replaceAll(dollar, () => "\\$");
+  if (video && !markdown.trim()) {
+    const link = url.replaceAll("<", "%3C").replaceAll(">", "%3E");
+    markdown = `[Watch on YouTube](<${link}>)`;
+  }
   const parts: Capture["parts"] = [];
   let offset = 0;
   for (const match of markdown.matchAll(new RegExp(`${marker}(\\d+)END`, "g"))) {
@@ -130,7 +218,7 @@ export function capture(): Capture {
     offset = match.index + match[0].length;
   }
   if (offset < markdown.length) parts.push(markdown.slice(offset));
-  if (!parts.length || !markdown.trim()) throw new Error("No article content was found.");
+  if (!markdown.trim()) throw new Error("No article content was found.");
   return {
     authors: authorsFromPage(article.author ?? ""),
     parts,
@@ -138,6 +226,7 @@ export function capture(): Capture {
     title: [...(article.title?.trim() || tabTitle || new URL(url).hostname)]
       .slice(0, 1024)
       .join(""),
+    transcriptMissing: video && !hasTranscript,
     url,
   };
 }

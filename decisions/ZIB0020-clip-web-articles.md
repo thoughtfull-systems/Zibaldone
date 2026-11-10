@@ -26,6 +26,13 @@ Firefox's built-in Portable Document Format (PDF) viewer restricts page extracti
 the extension downloads the original bytes and imports them as a `file` note with a source link. Zib
 uses its existing file storage, text extraction, and thumbnails.
 
+For new PDF imports, store the source URL in a field and use the filename as the body. Use the same
+source fields for file notes, image notes, and articles. Record the PDF's capture time and read the
+author names and publication date from its embedded metadata when available.
+
+Capture a YouTube video as a `video` note with the same source fields as an article. Firefox tries
+to retrieve the captions on the toolbar click and includes the transcript in the note body.
+
 Nix builds a local extension package and registers the native host. Development uses its own host
 and add-on identifiers and requires an isolated development root.
 

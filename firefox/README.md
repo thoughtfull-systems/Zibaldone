@@ -1,6 +1,7 @@
 # Zib web clipper
 
-The private Firefox extension saves web articles with their images and web PDFs to a space in Zib.
+The private Firefox extension saves web articles with their images, web PDFs, and YouTube videos to
+a space in Zib.
 
 ## Try a development build
 
@@ -23,7 +24,10 @@ Start a separate Firefox profile with `ZIB_DEV_ROOT` set to an absolute scratch 
 `dist/manifest.json`.
 
 Open the extension's preferences from `about:addons`. Choose a space. Select **Allow web downloads**
-to save web PDFs and images hosted on other sites. Pin the button and click it on an article or PDF.
+to save web PDFs and images hosted on other sites. Pin the button and click it on a page to save.
+
+On a YouTube video, the clipper tries to retrieve the captions and saves them as a timestamped
+transcript in a `video` note. The badge reports when a video saves without a transcript.
 
 ## Install for local use
 
@@ -37,4 +41,4 @@ to save web PDFs and images hosted on other sites. Pin the button and click it o
 
 The green check stays on the clipped tab until you navigate away or close it. If an image download
 fails, Zib keeps its web address as a link when available. Open the saved article in Zib and choose
-**Article details** in the header to see its source metadata.
+**Note metadata** in the header to see its source metadata.

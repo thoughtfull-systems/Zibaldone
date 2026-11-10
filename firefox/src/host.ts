@@ -20,3 +20,10 @@ export async function send(request: object): Promise<HostReply> {
 }
 
 export const downloadOrigins = { origins: ["http://*/*", "https://*/*"] };
+
+export async function saveClip(request: object): Promise<void> {
+  // Retry a disconnected host once using exactly the same note and image identifiers.
+  const reply = await send(request).catch(() => send(request));
+  if (!reply.ok) throw new Error(reply.error);
+  if (!("clip" in reply)) throw new Error("Zib returned an unexpected reply.");
+}
