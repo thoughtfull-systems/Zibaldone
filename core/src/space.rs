@@ -396,7 +396,7 @@ impl Space {
     /// A note's body for an editor to change directly, which records the note as open.
     pub fn open_body(&mut self, id: Id) -> Result<crate::editor::Body> {
         self.open_note(id);
-        Ok(crate::editor::Body { doc: self.doc.clone(), text: self.body(id)? })
+        Ok(crate::editor::Body { doc: self.doc.clone(), note: Some(id), text: self.body(id)? })
     }
 
     /// Inserts `text` at a position in Unicode characters, without committing.
@@ -555,10 +555,15 @@ impl Space {
     /// tombstone, as decision ZIB0005 describes moving a note. Files go with it separately.
     pub fn move_note_to(&mut self, id: Id, target: &mut Self) -> Result<()> {
         let note = self.note(id)?;
-        target.create_note_with_id(id, &note.type_name, &note.body)?;
-        let fields = child_map(&target.note_map(id)?, "fields")?;
+        target.insert_note(id, &note.type_name, &note.body, &[])?;
+        let destination = target.note_map(id)?;
+        let fields = child_map(&destination, "fields")?;
         for (name, value) in &note.fields {
             fields.insert(name, value.clone())?;
+        }
+        let settings = child_map(&destination, "settings")?;
+        for word in crate::spelling::ignored_words(&self.doc, id) {
+            settings.insert(&crate::spelling::ignore_setting(&word), true)?;
         }
         commit(&target.doc);
         self.notes().delete(&id.to_string())?;
@@ -745,7 +750,7 @@ impl Space {
     }
 }
 
-fn note_map(doc: &LoroDoc, id: Id) -> Result<LoroMap> {
+pub(crate) fn note_map(doc: &LoroDoc, id: Id) -> Result<LoroMap> {
     match doc.get_map(NOTES).get(&id.to_string()) {
         Some(ValueOrContainer::Container(container)) => {
             container.into_map().map_err(|_| Error::Space(format!("note {id} isn't a map")))

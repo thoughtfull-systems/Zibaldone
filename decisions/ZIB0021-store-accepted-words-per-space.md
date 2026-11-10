@@ -23,6 +23,10 @@ replacements locally with the `spellbook` library, which reads dictionaries in t
 Linux ships an American English dictionary with the app. The editor checks the note's source and
 applies each replacement through its existing undo history.
 
+When the owner ignores a word in one note, save that choice in the note's settings. Each word has
+its own setting so two machines can ignore different words at the same time. The setting follows the
+note when it moves.
+
 ## Rejected alternatives
 
 - **A list in a space setting.** A write replaces the whole list, so concurrent additions can lose a

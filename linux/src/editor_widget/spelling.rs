@@ -14,6 +14,12 @@ use super::{Content, EditorWidget, PasteTarget, Piece, units};
 
 const CHECK_PAUSE: Duration = Duration::from_millis(150);
 
+#[derive(Clone, Copy)]
+pub(crate) enum SpellingAction {
+    AddToSpace,
+    IgnoreInNote,
+}
+
 #[derive(Default)]
 pub(super) struct Check {
     generation: u64,
@@ -44,9 +50,10 @@ fn base_dictionary() -> Option<&'static Dictionary> {
 }
 
 impl EditorWidget {
-    /// Enables spelling for note editors and calls `add` to save a word in the open note's space.
-    pub(crate) fn connect_add_spelling_word(&self, add: impl Fn(String) + 'static) {
-        *self.imp().add_spelling_word.borrow_mut() = Some(Box::new(add));
+    /// Enables spelling and connects the actions that accept a word.
+    pub(crate) fn connect_spelling_word(&self, f: impl Fn(SpellingAction, String) + 'static) {
+        *self.imp().spelling_word.borrow_mut() =
+            Some(Box::new(move |(action, word)| f(action, word)));
     }
 
     /// Schedules a check after changes to the source or its space's dictionary.
@@ -57,7 +64,7 @@ impl EditorWidget {
         if text_changed {
             check.misspellings.clear();
         }
-        if imp.add_spelling_word.borrow().is_none() || imp.editor.borrow().is_none() {
+        if imp.spelling_word.borrow().is_none() || imp.editor.borrow().is_none() {
             return;
         }
         let generation = check.generation;
@@ -174,6 +181,7 @@ impl EditorWidget {
         let model = gio::Menu::new();
         model.append_section(None, &suggestions);
         model.append(Some("Add to Space Dictionary"), Some("spelling.add"));
+        model.append(Some("Ignore in This Note"), Some("spelling.ignore"));
         let menu = gtk::PopoverMenu::from_model(Some(&model));
         #[allow(clippy::cast_possible_truncation)]
         menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -189,18 +197,23 @@ impl EditorWidget {
             }
         });
         actions.add_action(&replace);
-        let add = gio::SimpleAction::new("add", None);
-        let widget = self.downgrade();
         let session = self.session();
-        add.connect_activate(move |_, _| {
-            if let Some(widget) = widget.upgrade()
-                && widget.session() == session
-                && let Some(add) = widget.imp().add_spelling_word.borrow().as_ref()
-            {
-                add(word.clone());
-            }
-        });
-        actions.add_action(&add);
+        for (name, choice) in
+            [("add", SpellingAction::AddToSpace), ("ignore", SpellingAction::IgnoreInNote)]
+        {
+            let action = gio::SimpleAction::new(name, None);
+            let widget = self.downgrade();
+            let word = word.clone();
+            action.connect_activate(move |_, _| {
+                if let Some(widget) = widget.upgrade()
+                    && widget.session() == session
+                    && let Some(accept) = widget.imp().spelling_word.borrow().as_ref()
+                {
+                    accept((choice, word.clone()));
+                }
+            });
+            actions.add_action(&action);
+        }
         menu.insert_action_group("spelling", Some(&actions));
         let widget = self.downgrade();
         menu.connect_closed(move |menu| {
@@ -261,24 +274,30 @@ mod tests {
     }
 
     #[test]
-    fn spelling_menu_replaces_undoes_and_accepts_a_word_without_editing_the_note() {
+    fn spelling_menu_replaces_ignores_in_one_note_and_adds_to_the_space() {
         if adw::init().is_err() || base_dictionary().is_none() {
             return;
         }
         let space = Rc::new(RefCell::new(Space::create(Id::generate()).unwrap()));
-        let source = format!("A **{MISSPELLED}** test");
+        let source = format!("A **{MISSPELLED}** test with {MISSPELLED}");
         let note = space.borrow_mut().create_note("note", &source).unwrap();
         let widget = EditorWidget::default();
         let dictionary_space = space.clone();
         let editor = widget.downgrade();
-        widget.connect_add_spelling_word(move |word| {
-            dictionary_space.borrow_mut().add_spelling_word(&word).unwrap();
+        widget.connect_spelling_word(move |action, word| {
+            let mut space = dictionary_space.borrow_mut();
+            match action {
+                SpellingAction::AddToSpace => {
+                    space.add_spelling_word(&word).unwrap();
+                }
+                SpellingAction::IgnoreInNote => space.ignore_spelling_word(note, &word).unwrap(),
+            }
             editor.upgrade().unwrap().refresh_spelling();
         });
         widget.set_editor(Some(Editor::new(space.borrow_mut().open_body(note).unwrap())));
         let window = gtk::Window::builder().child(&widget).default_width(400).build();
         window.present();
-        wait_until(|| !widget.imp().spelling.borrow().misspellings.is_empty());
+        wait_until(|| widget.imp().spelling.borrow().misspellings.len() == 2);
 
         let point = || {
             let lines = widget.imp().lines.borrow();
@@ -301,11 +320,22 @@ mod tests {
         let menu = widget.imp().spelling.borrow().menu.clone().unwrap();
         menu.activate_action("spelling.replace", Some(&"spelling".to_variant())).unwrap();
         menu.popdown();
-        assert_eq!(widget.text().as_deref(), Some("A **spelling** test"));
+        assert_eq!(widget.text().unwrap(), format!("A **spelling** test with {MISSPELLED}"));
         widget.edit(|editor| assert!(editor.undo()));
         assert_eq!(widget.text().as_deref(), Some(source.as_str()));
 
-        wait_until(|| !widget.imp().spelling.borrow().misspellings.is_empty());
+        wait_until(|| widget.imp().spelling.borrow().misspellings.len() == 2);
+        let (x, y) = point();
+        assert!(widget.spelling_menu(x, y));
+        let menu = widget.imp().spelling.borrow().menu.clone().unwrap();
+        menu.activate_action("spelling.ignore", None).unwrap();
+        menu.popdown();
+        wait_until(|| widget.imp().spelling.borrow().misspellings.is_empty());
+        assert_eq!(widget.text().as_deref(), Some(source.as_str()));
+
+        let other = space.borrow_mut().create_note("note", &source).unwrap();
+        widget.set_editor(Some(Editor::new(space.borrow_mut().open_body(other).unwrap())));
+        wait_until(|| widget.imp().spelling.borrow().misspellings.len() == 2);
         let (x, y) = point();
         assert!(widget.spelling_menu(x, y));
         let menu = widget.imp().spelling.borrow().menu.clone().unwrap();

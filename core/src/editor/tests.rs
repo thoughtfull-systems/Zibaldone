@@ -10,7 +10,7 @@ fn editor(text: &str) -> Editor {
     let plain = text.replace('|', "");
     body.insert(0, &plain).unwrap();
     doc.commit_with(CommitOptions::new().origin(ORIGIN));
-    let mut editor = Editor::new(Body { doc, text: body });
+    let mut editor = Editor::new(Body { doc, note: None, text: body });
     let marks: Vec<usize> = text.match_indices('|').map(|(i, _)| i).collect();
     match marks[..] {
         [at] => editor.select(at, at),
@@ -1002,7 +1002,7 @@ fn remote_selections_follow_local_and_imported_edits_without_affecting_undo_or_s
     let mut e = editor("é **bold**\n|end");
     let other = LoroDoc::new();
     other.import(&e.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
-    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other });
+    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other, note: None });
     peer.select(9, 5);
     let machine = Id::generate();
     e.presence().started(machine);
@@ -1038,7 +1038,7 @@ fn live_cursors_wait_for_their_operations_and_ignore_other_bodies_and_invalid_by
     let mut e = editor("one\n|end");
     let other = LoroDoc::new();
     other.import(&e.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
-    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other });
+    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other, note: None });
     peer.move_to(0, false);
     peer.insert("café ");
     peer.select(0, 5);
@@ -1067,7 +1067,7 @@ fn concurrent_edits_keep_a_backward_selection_and_undo_only_local_typing() {
     e.select(11, 6);
     let other = LoroDoc::new();
     other.import(&e.doc.export(ExportMode::Snapshot).unwrap()).unwrap();
-    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other });
+    let mut peer = Editor::new(Body { text: other.get_text("body"), doc: other, note: None });
     peer.move_to(0, false);
     peer.insert("before ");
     e.doc.import(&peer.doc.export(ExportMode::Snapshot).unwrap()).unwrap();

@@ -181,6 +181,16 @@ If the space has no dictionary settings, the editor reads the `spelling-words` m
 creates a dictionary note, it copies those words into the note. Once a dictionary setting exists,
 the editor reads only the registered notes. It leaves the map intact.
 
+## Ignored spelling words
+
+The note setting `zib.spelling-ignore.<word>` holds the boolean `true` for a word the owner ignores
+in that note. The suffix uses the normalization in [`spelling-words`](#spelling-words). Readers
+suppress spelling errors for every occurrence of that word in the note. A setting with any other
+value has no effect.
+
+Each word syncs independently. Moving the note copies its ignored words to the destination with the
+note.
+
 ## Platforms
 
 No platform differs.

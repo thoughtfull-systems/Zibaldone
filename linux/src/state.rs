@@ -533,6 +533,12 @@ impl State {
         Ok(note)
     }
 
+    pub(crate) async fn ignore_spelling_word(&self, space: Id, note: Id, word: &str) -> Result<()> {
+        self.space(space).await?.lock().await.ignore_spelling_word(note, word)?;
+        self.changed_here(space);
+        Ok(())
+    }
+
     /// Records that an editor changed a note's body directly: updates its metadata and its place
     /// in the search index, and has the space saved and synced.
     pub async fn body_edited(&self, space_id: Id, id: Id) -> Result<()> {

@@ -10,11 +10,12 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::editing::{Style, spans};
-use crate::space::{SETTINGS, Space, note_body};
+use crate::space::{SETTINGS, Space, note_body, note_map};
 use crate::{Error, Id, Result, body, schema, space};
 
 const DICTIONARY_SETTING: &str = "zib.spelling-dictionary.";
 const DICTIONARY_TITLE: &str = "# Spelling Dictionary";
+const IGNORE_SETTING: &str = "zib.spelling-ignore.";
 const LEGACY_WORDS: &str = "spelling-words";
 
 impl Space {
@@ -26,6 +27,12 @@ impl Space {
     /// Accepts a word by adding it to the space's dictionary note.
     pub fn add_spelling_word(&mut self, word: &str) -> Result<Id> {
         edit_dictionary(self, Some(word))
+    }
+
+    /// Ignores a spelling in one note, without changing its body or metadata.
+    pub fn ignore_spelling_word(&mut self, note: Id, word: &str) -> Result<()> {
+        let word = word_key(word).ok_or_else(|| Error::invalid("spelling word", word))?;
+        self.set_setting(Some(note), &ignore_setting(&word), true)
     }
 }
 
@@ -68,6 +75,27 @@ fn key(word: &str) -> String {
 
 pub(crate) fn accepted_words(doc: &LoroDoc) -> HashSet<String> {
     words_in_dictionaries(doc, &dictionary_notes(doc))
+}
+
+pub(crate) fn ignore_setting(word: &str) -> String {
+    format!("{IGNORE_SETTING}{word}")
+}
+
+pub(crate) fn ignored_words(doc: &LoroDoc, note: Id) -> HashSet<String> {
+    let mut words = HashSet::new();
+    if let Ok(note) = note_map(doc, note)
+        && let Some(ValueOrContainer::Container(settings)) = note.get("settings")
+        && let Ok(settings) = settings.into_map()
+    {
+        settings.for_each(|name, value| {
+            if matches!(value, ValueOrContainer::Value(LoroValue::Bool(true)))
+                && let Some(word) = name.strip_prefix(IGNORE_SETTING)
+            {
+                words.insert(word.to_owned());
+            }
+        });
+    }
+    words
 }
 
 fn dictionary_notes(doc: &LoroDoc) -> Vec<Id> {
@@ -300,5 +328,37 @@ mod tests {
         space.delete_note(dictionary).unwrap();
         assert_ne!(space.spelling_dictionary().unwrap(), dictionary);
         assert!(accepted_words(space.doc()).is_empty());
+    }
+
+    #[test]
+    fn ignored_spellings_sync_independently_and_follow_the_note_on_move() {
+        let mut space = Space::create(Id::generate()).unwrap();
+        let note = space.create_note("note", "Café’s and Quxley").unwrap();
+        let original = space.note(note).unwrap();
+        let other = space.create_note("note", &original.body).unwrap();
+        space.add_spelling_word("Zibaldone").unwrap();
+        let editor = Editor::new(space.open_body(note).unwrap());
+        let mut peer = Space::open(&space.snapshot().unwrap(), Id::generate()).unwrap();
+
+        space.ignore_spelling_word(note, "CAFE\u{301}’S").unwrap();
+        peer.ignore_spelling_word(note, "Quxley").unwrap();
+        space.import_checked(&peer.snapshot().unwrap()).unwrap();
+        let expected = HashSet::from(["café's".into(), "quxley".into(), "zibaldone".into()]);
+        assert_eq!(editor.spelling_words(), expected);
+        assert_eq!(space.note(note).unwrap(), original);
+        assert!(!editor.can_undo());
+        assert_eq!(
+            Editor::new(space.open_body(other).unwrap()).spelling_words(),
+            HashSet::from(["zibaldone".into()])
+        );
+
+        let mut reopened = Space::open(&space.snapshot().unwrap(), Id::generate()).unwrap();
+        assert_eq!(Editor::new(reopened.open_body(note).unwrap()).spelling_words(), expected);
+        let mut target = Space::create(Id::generate()).unwrap();
+        reopened.move_note_to(note, &mut target).unwrap();
+        assert_eq!(
+            Editor::new(target.open_body(note).unwrap()).spelling_words(),
+            HashSet::from(["café's".into(), "quxley".into()])
+        );
     }
 }

@@ -94,6 +94,7 @@ impl Selection {
 /// space, so the editor's edits are the space's.
 pub struct Body {
     pub(crate) doc: LoroDoc,
+    pub(crate) note: Option<Id>,
     pub(crate) text: LoroText,
 }
 
@@ -106,7 +107,7 @@ impl Body {
         // A new document's text takes any insertion.
         let _ = body.insert(0, text);
         crate::space::commit(&doc);
-        Self { doc, text: body }
+        Self { doc, note: None, text: body }
     }
 }
 
@@ -138,6 +139,7 @@ pub struct Editor {
     images: HashMap<Id, display::ImageSize>,
     titles: HashMap<Id, String>,
     doc: LoroDoc,
+    note: Option<Id>,
     body: LoroText,
     undo: UndoManager,
     /// The body as the editor last read it.
@@ -158,7 +160,7 @@ pub struct Editor {
 
 impl Editor {
     /// Opens a note's body, with the cursor at the start.
-    pub fn new(Body { doc, text: body }: Body) -> Self {
+    pub fn new(Body { doc, note, text: body }: Body) -> Self {
         let mut undo = UndoManager::new(&doc);
         undo.add_exclude_origin_prefix(ORIGIN);
         let before: Arc<Mutex<Vec<CursorWithPos>>> = Arc::default();
@@ -186,6 +188,7 @@ impl Editor {
             images: HashMap::new(),
             titles: HashMap::new(),
             doc,
+            note,
             body,
             undo,
             text,
@@ -333,9 +336,13 @@ impl Editor {
         (self.body.to_string() == self.text).then_some(EditTarget { cursors, selection, expected })
     }
 
-    /// The current custom dictionary from the same document as the editor's note.
+    /// The space's accepted words and the words ignored in this note.
     pub fn spelling_words(&self) -> HashSet<String> {
-        crate::spelling::accepted_words(&self.doc)
+        let mut words = crate::spelling::accepted_words(&self.doc);
+        if let Some(note) = self.note {
+            words.extend(crate::spelling::ignored_words(&self.doc, note));
+        }
+        words
     }
 
     /// Inserts an embed where a paste started, as one undo step. Changes within the remembered

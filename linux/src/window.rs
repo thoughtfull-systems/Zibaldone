@@ -18,7 +18,7 @@ use zib_core::sync::{LiveEvent, Selection, SyncState};
 use zib_core::{Channel, Id};
 
 use crate::app::core;
-use crate::editor_widget::{EditorWidget, PasteTarget};
+use crate::editor_widget::{EditorWidget, PasteTarget, SpellingAction};
 use crate::state::State;
 use crate::tables;
 
@@ -264,7 +264,10 @@ impl Window {
         this.connect_files();
         let widget = &this.inner().widget;
         let w = this.clone();
-        widget.connect_add_spelling_word(move |word| w.spelling_dictionary(Some(word)));
+        widget.connect_spelling_word(move |action, word| match action {
+            SpellingAction::AddToSpace => w.spelling_dictionary(Some(word)),
+            SpellingAction::IgnoreInNote => w.ignore_spelling_word(word),
+        });
         let w = this.clone();
         widget.connect_edited(move || w.body_edited());
         let w = this.clone();
@@ -1117,6 +1120,30 @@ impl Window {
                     }
                 }
                 Err(error) => w.toast(&format!("Couldn't update the space dictionary: {error}")),
+            }
+        });
+    }
+
+    fn ignore_spelling_word(&self, word: String) {
+        let Some((space, note)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
+        else {
+            return;
+        };
+        let state = self.inner().state.clone();
+        let w = self.clone();
+        glib::spawn_future_local(async move {
+            match core(async move { state.ignore_spelling_word(space, note, &word).await }).await {
+                Ok(()) => {
+                    if w.inner()
+                        .editor
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|e| e.space == space && e.note == note)
+                    {
+                        w.inner().widget.refresh_spelling();
+                    }
+                }
+                Err(error) => w.toast(&format!("Couldn't ignore the word: {error}")),
             }
         });
     }

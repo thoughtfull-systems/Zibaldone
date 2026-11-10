@@ -11,6 +11,8 @@ mod presence;
 mod spelling;
 mod tables;
 
+pub(crate) use spelling::SpellingAction;
+
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, pango};
@@ -206,7 +208,7 @@ mod imp {
         pub selection_changed: RefCell<Option<Box<dyn Fn()>>>,
         pub open_link: Callback<LinkTarget>,
         pub pick_link: Callback<Range<usize>>,
-        pub(super) add_spelling_word: Callback<String>,
+        pub(super) spelling_word: Callback<(spelling::SpellingAction, String)>,
         pub(super) spelling: RefCell<spelling::Check>,
         /// The word or line a double or triple click selected, which a drag with the button still
         /// down grows from by whole words or lines.
