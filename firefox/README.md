@@ -1,7 +1,7 @@
 # Zib web clipper
 
-The private Firefox extension saves web articles with their images, web PDFs, and YouTube videos to
-a space in Zib.
+The Firefox extension saves web articles with their images, web PDFs, and YouTube videos to a space
+in Zib.
 
 ## Try a development build
 
@@ -44,15 +44,15 @@ The resulting extension is in `firefox/dist` relative to the archive root. It ta
 and later. When you click the toolbar button, the add-on sends the selected page's address and
 captured content to the local Zib native host. Firefox stores your destination space choice.
 
-## Publish a private signed build
+## Publish a signed build
 
 Create [Mozilla Add-ons signing credentials][amo-credentials] and add the issuer and secret to the
-private GitHub repository's Actions secrets as `AMO_JWT_ISSUER` and `AMO_JWT_SECRET`.
+GitHub repository's Actions secrets as `AMO_JWT_ISSUER` and `AMO_JWT_SECRET`.
 
 Push a tag that matches the version in `firefox/package.json`, such as `clipper-v0.1.0`. The
 workflow builds the production add-on and submits it and its source to Mozilla for
 [unlisted signing][signing]. After approval, the workflow attaches `zib-web-clipper.xpi` to the
-GitHub Release for that tag. Get the signed package with authenticated repository access:
+GitHub Release for that tag. Download the signed package:
 
 ```sh
 gh release download clipper-v0.1.0 \

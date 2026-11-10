@@ -36,6 +36,9 @@ to retrieve the captions on the toolbar click and includes the transcript in the
 Nix builds a local extension package and registers the native host. Development uses its own host
 and add-on identifiers and requires an isolated development root.
 
+Distribute the signed production build as a GitHub Release asset. Use Mozilla's unlisted signing
+channel for self-distribution.
+
 ## Consequences
 
 - Firefox owns page extraction and image downloads. The native host receives the content and bytes.

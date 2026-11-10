@@ -27,10 +27,6 @@ jobs:
             echo "The tag must be clipper-v$version."
             exit 1
           fi
-          if [[ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" != true ]]; then
-            echo "The clipper release requires a private repository."
-            exit 1
-          fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "A release already exists for $GITHUB_REF_NAME."
             exit 1
