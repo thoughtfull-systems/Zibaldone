@@ -30,6 +30,7 @@ in
 
   git-hooks.hooks = {
     # keep-sorted start block=yes
+    actionlint.enable = true;
     biome = {
       enable = true;
       entry = "${lib.getExe pkgs.biome} check --config-path=.config/biome.json";

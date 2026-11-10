@@ -29,6 +29,41 @@ to save web PDFs and images hosted on other sites. Pin the button and click it o
 On a YouTube video, the clipper tries to retrieve the captions and saves them as a timestamped
 transcript in a `video` note. The badge reports when a video saves without a transcript.
 
+## Build the production add-on from source
+
+The release workflow runs on Ubuntu 24.04 with [Node.js 24.14.0][node]. From the source archive's
+root, run:
+
+```sh
+cd firefox
+npm ci
+ZIB_CLIPPER_CHANNEL=production npm run build
+```
+
+The resulting extension is in `firefox/dist` relative to the archive root. It targets Firefox 140
+and later. When you click the toolbar button, the add-on sends the selected page's address and
+captured content to the local Zib native host. Firefox stores your destination space choice.
+
+## Publish a private signed build
+
+Create [Mozilla Add-ons signing credentials][amo-credentials] and add the issuer and secret to the
+private GitHub repository's Actions secrets as `AMO_JWT_ISSUER` and `AMO_JWT_SECRET`.
+
+Push a tag that matches the version in `firefox/package.json`, such as `clipper-v0.1.0`. The
+workflow builds the production add-on and submits it and its source to Mozilla for
+[unlisted signing][signing]. After approval, the workflow attaches `zib-web-clipper.xpi` to the
+GitHub Release for that tag. Get the signed package with authenticated repository access:
+
+```sh
+gh release download clipper-v0.1.0 \
+  --repo thoughtfull-systems/Zibaldone \
+  --pattern zib-web-clipper.xpi
+```
+
+Use a new package version and tag for each update. If Mozilla approves the submission after the
+workflow times out, download the signed package from [My Add-ons][amo-addons] and attach it to the
+release for the original tag.
+
 ## Install for local use
 
 - Build `nix build .#zib-web-clipper` to get the local extension package in `result/`. Use
@@ -42,3 +77,8 @@ transcript in a `video` note. The badge reports when a video saves without a tra
 The green check stays on the clipped tab until you navigate away or close it. If an image download
 fails, Zib keeps its web address as a link when available. Open the saved article in Zib and choose
 **Note metadata** in the header to see its source metadata.
+
+[amo-addons]: https://addons.mozilla.org/developers/addons
+[amo-credentials]: https://addons.mozilla.org/developers/addon/api/key/
+[node]: https://nodejs.org/en/download
+[signing]: https://extensionworkshop.com/documentation/publish/signing-and-distribution-overview/

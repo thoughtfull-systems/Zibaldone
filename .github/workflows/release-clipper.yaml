@@ -1,0 +1,79 @@
+---
+concurrency:
+  group: clipper-${{ github.ref }}
+jobs:
+  release:
+    defaults:
+      run:
+        working-directory: firefox
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24.14.0'
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        name: Check the release destination
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          if [[ "$GITHUB_REF_NAME" != "clipper-v$version" ]]; then
+            echo "The tag must be clipper-v$version."
+            exit 1
+          fi
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" != true ]]; then
+            echo "The clipper release requires a private repository."
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release already exists for $GITHUB_REF_NAME."
+            exit 1
+          fi
+      - env:
+          ZIB_CLIPPER_CHANNEL: production
+        name: Build the extension
+        run: |
+          npm ci
+          npm run build
+      - name: Prepare the source archive and validate the manifest
+        run: |
+          git -C "$GITHUB_WORKSPACE" archive --format=zip \
+            -o "$RUNNER_TEMP/clipper-source.zip" HEAD -- \
+            firefox linux/data/icons/systems.thoughtfull.Zibaldone.svg
+          npx --yes web-ext@10.8.0 lint --source-dir=dist
+      - env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        name: Sign with Mozilla
+        run: |
+          : "${WEB_EXT_API_KEY:?Set the AMO_JWT_ISSUER repository secret}"
+          : "${WEB_EXT_API_SECRET:?Set the AMO_JWT_SECRET repository secret}"
+          npx --offline --yes web-ext@10.8.0 sign --channel=unlisted --source-dir=dist \
+            --artifacts-dir="$RUNNER_TEMP/signed" \
+            --upload-source-code="$RUNNER_TEMP/clipper-source.zip"
+          shopt -s nullglob
+          packages=("$RUNNER_TEMP"/signed/*.xpi)
+          if [[ "${#packages[@]}" != 1 ]]; then
+            echo "Expected one signed XPI from Mozilla."
+            exit 1
+          fi
+          cp -- "${packages[0]}" "$RUNNER_TEMP/zib-web-clipper.xpi"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        name: Publish the release asset
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/zib-web-clipper.xpi" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Zib Web Clipper ${GITHUB_REF_NAME#clipper-v}" \
+            --notes "Mozilla-signed Firefox extension for the production Zib native host."
+    timeout-minutes: 30
+name: Release the Firefox clipper
+"on":
+  push:
+    tags: ['clipper-v*']

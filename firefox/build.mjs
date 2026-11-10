@@ -1,4 +1,4 @@
-import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { build } from "esbuild";
 
 const channel = process.env.ZIB_CLIPPER_CHANNEL ?? "dev";
@@ -11,20 +11,25 @@ const name = dev ? "Zib Web Clipper Dev" : "Zib Web Clipper";
 const host = dev ? "systems.thoughtfull.zibaldone.dev" : "systems.thoughtfull.zibaldone";
 const iconName = `systems.thoughtfull.Zibaldone${dev ? ".Devel" : ""}.svg`;
 const iconSource = new URL(`../linux/data/icons/${iconName}`, import.meta.url);
+const { version } = JSON.parse(await readFile(new URL("package.json", import.meta.url), "utf8"));
 const manifest = {
   action: { default_icon: "icon.svg", default_title: name },
   background: { scripts: ["background.js"] },
   browser_specific_settings: {
-    gecko: { id: `web-clipper${suffix}@zibaldone.thoughtfull.systems` },
+    gecko: {
+      data_collection_permissions: { required: ["browsingActivity", "websiteContent"] },
+      id: `web-clipper${suffix}@zibaldone.thoughtfull.systems`,
+      strict_min_version: "140.0",
+    },
   },
-  description: "Save the current article or PDF to Zibaldone.",
+  description: "Save articles, PDFs, and YouTube transcripts to your local Zibaldone notebook.",
   icons: { 48: "icon.svg" },
   manifest_version: 3,
   name,
   optional_host_permissions: ["http://*/*", "https://*/*"],
   options_ui: { open_in_tab: true, page: "options.html" },
   permissions: ["activeTab", "nativeMessaging", "scripting", "storage"],
-  version: "0.1.0",
+  version,
 };
 const options = {
   bundle: true,
