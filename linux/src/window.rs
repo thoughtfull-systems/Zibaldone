@@ -28,6 +28,8 @@ mod tests;
 /// How long metadata and search updates wait after typing stops, or while editing live.
 const REPORT_LIVE: Duration = Duration::from_millis(50);
 const REPORT_PAUSE: Duration = Duration::from_secs(3);
+/// How long the chat's width waits after the divider stops moving before the machine saves it.
+const CHAT_WIDTH_PAUSE: Duration = Duration::from_millis(500);
 
 /// The window, which the instance opens on `activate`.
 #[derive(Clone)]
@@ -35,6 +37,13 @@ pub struct Window(Rc<Inner>);
 
 pub struct Inner {
     chat: crate::chat::Chat,
+    /// The note's side and the chat's, with the divider between them.
+    panes: gtk::Paned,
+    /// The chat's width on this machine, once loaded, which it takes each time it shows.
+    chat_width: Cell<Option<i32>>,
+    /// Whether the shown chat has taken its width, so moving the divider now changes it.
+    chat_width_restored: Cell<bool>,
+    chat_width_timer: RefCell<Option<glib::SourceId>>,
     state: Arc<State>,
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
@@ -235,6 +244,10 @@ impl Window {
 
         let this = Self(Rc::new(Inner {
             chat,
+            panes,
+            chat_width: Cell::new(None),
+            chat_width_restored: Cell::new(false),
+            chat_width_timer: RefCell::default(),
             state,
             window,
             toasts,
@@ -268,6 +281,7 @@ impl Window {
         this.inner().chat.connect(this.clone());
         let w = this.clone();
         chat_toggle.connect_clicked(move |_| w.inner().chat.toggle());
+        this.connect_chat_width();
         this.connect_files();
         let widget = &this.inner().widget;
         let w = this.clone();
@@ -322,6 +336,79 @@ impl Window {
             {
                 w.open_note(space, note);
             }
+        });
+    }
+
+    /// Gives the chat the width that the owner last chose on this machine each time it shows, or a
+    /// third of the window before they choose one, and saves the width when the owner moves the
+    /// divider. The chat keeps its width as the window resizes, so only moving the divider changes
+    /// it.
+    fn connect_chat_width(&self) {
+        let chat = self.inner().chat.widget();
+        let w = self.clone();
+        chat.connect_visible_notify(move |chat| {
+            w.inner().chat_width_restored.set(false);
+            if chat.is_visible() {
+                w.restore_chat_width();
+            }
+        });
+        let w = self.clone();
+        self.inner().panes.connect_position_notify(move |_| {
+            if !w.inner().chat_width_restored.get() {
+                return;
+            }
+            if let Some(timer) = w.inner().chat_width_timer.take() {
+                timer.remove();
+            }
+            let saving = w.clone();
+            let timer = glib::timeout_add_local_once(CHAT_WIDTH_PAUSE, move || {
+                saving.inner().chat_width_timer.take();
+                saving.save_chat_width();
+            });
+            *w.inner().chat_width_timer.borrow_mut() = Some(timer);
+        });
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            let width = core(async move { state.chat_width().await }).await;
+            w.inner().chat_width.set(width.and_then(|width| i32::try_from(width).ok()));
+            if w.inner().chat.widget().is_visible() {
+                w.restore_chat_width();
+            }
+        });
+    }
+
+    /// Moves the divider once the shown chat has a width, so the chat takes its saved width.
+    fn restore_chat_width(&self) {
+        let w = self.clone();
+        self.inner().chat.widget().add_tick_callback(move |chat, _| {
+            if !chat.is_visible() || w.inner().chat_width_restored.get() {
+                return glib::ControlFlow::Break;
+            }
+            let actual = chat.width();
+            if actual == 0 {
+                return glib::ControlFlow::Continue;
+            }
+            // Until the owner chooses a width here, the chat takes a third of the window.
+            let panes = &w.inner().panes;
+            let width = w.inner().chat_width.get().unwrap_or(panes.width() / 3);
+            panes.set_position(panes.position() + actual - width);
+            w.inner().chat_width_restored.set(true);
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn save_chat_width(&self) {
+        let chat = self.inner().chat.widget();
+        let width = chat.width();
+        if !chat.is_visible() || width == 0 || self.inner().chat_width.get() == Some(width) {
+            return;
+        }
+        self.inner().chat_width.set(Some(width));
+        let state = self.inner().state.clone();
+        let Ok(width) = u32::try_from(width) else { return };
+        glib::spawn_future_local(async move {
+            let _ = core(async move { state.set_chat_width(width).await }).await;
         });
     }
 
@@ -411,8 +498,10 @@ impl Window {
         let w = self.clone();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
             let modifiers = modifiers & gtk::accelerator_get_default_mod_mask();
+            // Ctrl+Tab shows the chat and moves into it, or hides it and returns to the note.
             if modifiers == gdk::ModifierType::CONTROL_MASK && key == gdk::Key::Tab {
                 if w.inner().chat.has_focus() {
+                    w.inner().chat.hide();
                     w.inner().widget.grab_focus();
                 } else {
                     w.inner().chat.focus();

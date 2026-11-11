@@ -365,6 +365,15 @@ impl State {
         self.store.lock().await.set_hidden(space, hidden)
     }
 
+    /// The width of the window's AI chat that the owner last chose on this machine.
+    pub async fn chat_width(&self) -> Option<u32> {
+        self.store.lock().await.config.chat_width
+    }
+
+    pub async fn set_chat_width(&self, width: u32) -> Result<()> {
+        self.store.lock().await.set_chat_width(width)
+    }
+
     /// The space the owner last put a note into.
     pub async fn last_space(&self) -> Option<Id> {
         self.store.lock().await.config.last_space

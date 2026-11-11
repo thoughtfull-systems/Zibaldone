@@ -28,6 +28,10 @@ pub struct MachineConfig {
     /// Agent preferences and credentials belong to this machine alone.
     #[serde(default)]
     pub agent: crate::agent::Settings,
+    /// The width of the window's AI chat beside the note, in pixels, once the owner moves the
+    /// divider between them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_width: Option<u32>,
     pub id: Id,
     /// The machine's own name, which it gives itself when it joins a space.
     pub name: String,
@@ -170,6 +174,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = MachineConfig {
                     agent: crate::agent::Settings::default(),
+                    chat_width: None,
                     id: Id::generate(),
                     name: default_name(),
                     relay: None,
@@ -299,6 +304,15 @@ impl Store {
             return Ok(());
         }
         self.config.last_space = Some(space);
+        self.save()
+    }
+
+    /// Records the width of the window's AI chat.
+    pub fn set_chat_width(&mut self, width: u32) -> Result<()> {
+        if self.config.chat_width == Some(width) {
+            return Ok(());
+        }
+        self.config.chat_width = Some(width);
         self.save()
     }
 

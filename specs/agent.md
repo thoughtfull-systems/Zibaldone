@@ -134,10 +134,13 @@ A web search result adds clickable source links to its tool activity in the tran
 
 ## Platforms
 
-Linux shows the agent in a resizable right sidebar. A button shows or hides it. Ctrl+Tab switches
-between the note editor and composer, showing the sidebar when necessary. Ctrl+Enter and Send submit
-the draft. Enter retains the markdown editor's behavior. Stop ends generation. The Settings screen
-starts with agent settings.
+Linux shows the agent in a resizable right sidebar. A button shows or hides it. From the note
+editor, Ctrl+Tab shows the sidebar and moves to the composer. From the sidebar, Ctrl+Tab hides it
+and returns to the note editor. The machine's `machine.json` configuration can hold `chat-width`,
+the sidebar's width in pixels, which Linux records after the owner moves the divider and restores
+each time the sidebar shows. Without it, the sidebar takes a third of the window. The sidebar keeps
+its width as the window resizes. Ctrl+Enter and Send submit the draft. Enter retains the markdown
+editor's behavior. Stop ends generation. The Settings screen starts with agent settings.
 
 When archiving a chat, Linux uses the only space if the machine holds one. If the machine holds more
 than one space and shows only one in the note list, Linux uses the shown space. Otherwise, the

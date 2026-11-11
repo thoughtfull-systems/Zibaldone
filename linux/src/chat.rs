@@ -154,10 +154,14 @@ impl Chat {
 
     pub fn toggle(&self) {
         if self.0.root.is_visible() {
-            self.0.root.set_visible(false);
+            self.hide();
         } else {
             self.focus();
         }
+    }
+
+    pub fn hide(&self) {
+        self.0.root.set_visible(false);
     }
 
     pub fn focus(&self) {
