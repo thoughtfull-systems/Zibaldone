@@ -86,6 +86,13 @@ struct Editor {
     cursors: Option<tokio::sync::broadcast::Sender<(Id, Vec<Selection>)>>,
 }
 
+/// A link target that already exists, or a note to create before inserting its link.
+#[derive(Clone)]
+enum LinkPick {
+    Create { space: Id, title: String },
+    Note(Id),
+}
+
 impl Window {
     // The window's widgets read best built in one place.
     #[allow(clippy::too_many_lines)]
@@ -274,8 +281,7 @@ impl Window {
         widget.connect_selection_changed(move || w.cursor_moved());
         let w = this.clone();
         widget.connect_open_link(move |target| w.open_link(target));
-        let w = this.clone();
-        widget.connect_pick_link(move |range| w.open_link_picker(range));
+        this.connect_link_picker(widget);
         let w = this.clone();
         widget.connect_paste_image(move |clipboard, target| {
             w.paste_image(clipboard, target);
@@ -1396,20 +1402,23 @@ impl Window {
         });
     }
 
-    fn open_link_picker(&self, range: std::ops::Range<usize>) {
-        let widget = self.inner().widget.clone();
+    fn connect_link_picker(&self, widget: &EditorWidget) {
+        let (w, editing) = (self.clone(), widget.clone());
+        widget.connect_pick_link(move |range| w.open_link_picker(&editing, range));
+    }
+
+    fn open_link_picker(&self, widget: &EditorWidget, range: std::ops::Range<usize>) {
         let Some(text) = widget.text() else { return };
         let Some(expected) = text.get(range.clone()).map(str::to_owned) else { return };
-        let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
-        let w = self.clone();
+        let session = widget.session();
         let editing = widget.clone();
         let pick = move |target| {
-            if w.inner().editor.borrow().as_ref().map(|e| (e.space, e.note)) == open {
+            if editing.session() == session {
                 editing.insert_link(range.clone(), &expected, target);
             }
         };
         let editing = widget.clone();
-        self.show_link_picker(&widget, &widget.cursor_rectangle(), pick, move || {
+        self.show_link_picker(widget, &widget.cursor_rectangle(), pick, move || {
             editing.grab_focus();
         });
     }
@@ -1441,11 +1450,13 @@ impl Window {
         content.append(&entry);
         content.append(&scroll);
         popover.set_child(Some(&content));
-        let found: Rc<RefCell<Vec<Id>>> = Rc::default();
+        let found: Rc<RefCell<Vec<LinkPick>>> = Rc::default();
         let generation = Rc::new(Cell::new(0u64));
         let fill = {
             let (w, list, found) = (self.clone(), list.clone(), found.clone());
             move |query: String| {
+                list.remove_all();
+                found.borrow_mut().clear();
                 generation.set(generation.get() + 1);
                 let (w, list, found, generation, mine) =
                     (w.clone(), list.clone(), found.clone(), generation.clone(), generation.get());
@@ -1454,7 +1465,6 @@ impl Window {
                     if generation.get() != mine {
                         return;
                     }
-                    list.remove_all();
                     for (_, title, subtitle) in &notes {
                         let row = adw::ActionRow::builder()
                             .title(escape(title))
@@ -1463,10 +1473,13 @@ impl Window {
                             .build();
                         list.append(&row);
                     }
-                    if let Some(first) = list.row_at_index(0) {
-                        list.select_row(Some(&first));
+                    // Keep creation visible at the top, but prefer an existing match for Enter.
+                    let default =
+                        i32::from(notes.len() > 1 && matches!(notes[0].0, LinkPick::Create { .. }));
+                    if let Some(row) = list.row_at_index(default) {
+                        list.select_row(Some(&row));
                     }
-                    *found.borrow_mut() = notes.into_iter().map(|(id, _, _)| id).collect();
+                    *found.borrow_mut() = notes.into_iter().map(|(pick, _, _)| pick).collect();
                 });
             }
         };
@@ -1476,22 +1489,22 @@ impl Window {
             let (popover, found) = (popover.clone(), found.clone());
             let chosen = chosen.clone();
             let on_pick = Rc::new(on_pick);
+            let w = self.clone();
             move |index: i32| {
                 let target =
-                    usize::try_from(index).ok().and_then(|i| found.borrow().get(i).copied());
-                if let Some(target) = target
-                    && !chosen.replace(true)
-                {
-                    on_pick(target);
+                    usize::try_from(index).ok().and_then(|i| found.borrow().get(i).cloned());
+                let Some(target) = target else { return };
+                if !chosen.replace(true) {
+                    w.pick_link(target, on_pick.clone());
+                    popover.popdown();
                 }
-                popover.popdown();
             }
         };
         let picked = pick.clone();
         list.connect_row_activated(move |_, row| picked(row.index()));
         let selected = list.clone();
         entry.connect_activate(move |_| pick(selected.selected_row().map_or(0, |r| r.index())));
-        entry.connect_search_changed(move |entry| fill(entry.text().to_string()));
+        entry.connect_changed(move |entry| fill(entry.text().to_string()));
         entry.add_controller(arrow_keys(&list));
         let closing = popover.clone();
         entry.connect_stop_search(move |_| closing.popdown());
@@ -1504,14 +1517,44 @@ impl Window {
         entry.grab_focus();
     }
 
-    /// The notes the picker offers for `query`, from every space: the newest notes of the spaces
-    /// that show when it's empty, or else search results. Each comes with its title and its space.
-    async fn link_candidates(&self, query: String) -> Vec<(Id, String, String)> {
+    /// Inserts an existing target, or creates the requested note without leaving the editor.
+    fn pick_link(&self, target: LinkPick, on_pick: Rc<impl Fn(Id) + 'static>) {
+        let (space, title) = match target {
+            LinkPick::Create { space, title } => (space, title),
+            LinkPick::Note(note) => {
+                on_pick(note);
+                return;
+            }
+        };
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        let body = format!("# {title}");
+        glib::spawn_future_local(async move {
+            match core(async move { state.create_note(space, &body).await }).await {
+                Ok(note) => {
+                    w.use_space(space);
+                    w.reload_notes();
+                    on_pick(note);
+                }
+                Err(error) => w.toast(&format!("Couldn't make the note: {error}")),
+            }
+        });
+    }
+
+    /// Offers recent notes or search results and creation with a nonblank query as the title.
+    /// Each choice comes with its title and destination space.
+    async fn link_candidates(&self, query: String) -> Vec<(LinkPick, String, String)> {
         let state = self.inner().state.clone();
         let names: HashMap<Id, String> =
             self.inner().spaces.borrow().iter().map(|(id, name, _)| (*id, name.clone())).collect();
         let shown: Vec<Id> = self.shown_spaces().into_iter().map(|(id, _)| id).collect();
         let open = self.inner().editor.borrow().as_ref().map(|e| e.note);
+        let creation = self.current_space_id().filter(|_| !query.trim().is_empty()).map(|space| {
+            let title = query.trim().to_owned();
+            let label = format!("Create note “{title}”");
+            let subtitle = names.get(&space).cloned().unwrap_or_default();
+            (LinkPick::Create { space, title }, label, subtitle)
+        });
         let found: Vec<(Id, Id, String)> = core(async move {
             if query.trim().is_empty() {
                 let mut all = Vec::new();
@@ -1527,14 +1570,12 @@ impl Window {
             }
         })
         .await;
-        found
-            .into_iter()
-            .filter(|(_, id, _)| Some(*id) != open)
-            .map(|(space, id, title)| {
+        let matches =
+            found.into_iter().filter(|(_, id, _)| Some(*id) != open).map(|(space, id, title)| {
                 let title = if title.trim().is_empty() { "Untitled".to_owned() } else { title };
-                (id, title, names.get(&space).cloned().unwrap_or_default())
-            })
-            .collect()
+                (LinkPick::Note(id), title, names.get(&space).cloned().unwrap_or_default())
+            });
+        creation.into_iter().chain(matches).collect()
     }
 
     /// Fills the popover of notes that link to the open note.
@@ -1654,23 +1695,7 @@ impl Window {
         if !editable {
             return;
         }
-        let (w, editing) = (self.clone(), widget.clone());
-        widget.connect_pick_link(move |range| {
-            let Some(text) = editing.text() else { return };
-            let Some(expected) = text.get(range.clone()).map(str::to_owned) else { return };
-            let (target, closed) = (editing.clone(), editing.clone());
-            let (range, expected) = (range.clone(), expected.clone());
-            w.show_link_picker(
-                &editing,
-                &editing.cursor_rectangle(),
-                move |id| {
-                    target.insert_link(range.clone(), &expected, id);
-                },
-                move || {
-                    closed.grab_focus();
-                },
-            );
-        });
+        self.connect_link_picker(widget);
         let (w, editing) = (self.clone(), widget.clone());
         widget.connect_paste_image(move |clipboard, target| {
             let (w, editing) = (w.clone(), editing.clone());

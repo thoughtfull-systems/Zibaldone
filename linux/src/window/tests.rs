@@ -219,6 +219,62 @@ fn default_editor_edits_the_shared_body_and_keeps_it_through_navigation_and_clos
 }
 
 #[test]
+fn link_picker_creates_a_note_from_the_search_and_links_to_it() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, source) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        state.create_note(space, "Existing topic").await.unwrap();
+        (space, state.create_note(space, "See [[").await.unwrap())
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.LinkPickerTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    window.inner().window.present();
+    window.open_note(space, source);
+    let widget = &window.inner().widget;
+    until(|| {
+        window.current_space_id() == Some(space) && widget.text().as_deref() == Some("See [[")
+    });
+    window.open_link_picker(widget, 4..6);
+    let popover = widget.last_child().unwrap().downcast::<gtk::Popover>().unwrap();
+    let content = popover.child().unwrap();
+    let search = content.first_child().unwrap().downcast::<gtk::SearchEntry>().unwrap();
+    let scroll = content.last_child().unwrap().downcast::<gtk::ScrolledWindow>().unwrap();
+    let viewport = scroll.child().unwrap().downcast::<gtk::Viewport>().unwrap();
+    let list = viewport.child().unwrap().downcast::<gtk::ListBox>().unwrap();
+
+    search.set_text("Existing topic");
+    until(|| list.selected_row().is_some_and(|row| row.index() == 1));
+    search.set_text("  New topic & details  ");
+    until(|| list.selected_row().is_some_and(|row| row.index() == 0));
+    search.emit_by_name::<()>("activate", &[]);
+    until(|| widget.text().is_some_and(|text| text.ends_with("]]")));
+
+    let created = runtime
+        .block_on(state.notes(space))
+        .unwrap()
+        .into_iter()
+        .find(|note| note.plain == "New topic & details")
+        .expect("the note created by the link picker");
+    assert_eq!(
+        runtime.block_on(state.note(space, created.id)).unwrap().body,
+        "# New topic & details"
+    );
+    assert_eq!(widget.text().unwrap(), format!("See [[{}]]", created.id));
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+}
+
+#[test]
 fn space_dictionary_menu_opens_the_note_created_by_adding_a_word() {
     if adw::init().is_err() {
         return;
