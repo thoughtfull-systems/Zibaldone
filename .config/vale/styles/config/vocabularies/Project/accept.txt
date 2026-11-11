@@ -7,6 +7,7 @@
 Adwaita
 Android
 Automerge
+Btrfs
 Cairo
 Clippy('s)?
 CommonMark

@@ -18,6 +18,47 @@ let
     esac
     exec ${pkgs.coreutils}/bin/nice "$@"
   '';
+  # A new worktree starts from reflinked copies of the main checkout's compiled dependencies.
+  seedTarget = pkgs.writeShellApplication {
+    name = "zib-seed-target";
+    runtimeInputs = [
+      # keep-sorted start
+      pkgs.coreutils
+      pkgs.findutils
+      pkgs.git
+      pkgs.jq
+      pkgs.util-linux
+      # keep-sorted end
+    ];
+    text = ''
+      root=${config.devenv.root}
+      common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+        exit 0
+      source=$(dirname "$common")/target
+      if [ -e "$root/target" ] || [ "$source" = "$root/target" ] || [ ! -d "$source/debug" ]; then
+        exit 0
+      fi
+      echo "Seeding target/ from $source"
+      mkdir -p "$root/target/debug"
+      # Cargo holds this lock while it builds, so the copy never catches a half-written file.
+      # Incremental caches belong to Zib's own crates, which rebuild anyway.
+      if ! flock --shared "$source/debug/.cargo-build-lock" \
+        find "$source/debug" -mindepth 1 -maxdepth 1 ! -name incremental ! -name '.cargo-*' \
+        -exec cp -a --reflink=always -t "$root/target/debug" {} +; then
+        echo "Couldn't seed target/ with reflinks, so Cargo builds it from scratch"
+        rm -rf "$root/target"
+        exit 0
+      fi
+      cp -a "$source/CACHEDIR.TAG" "$root/target/" 2>/dev/null || true
+      # The copies' timestamps could make the main checkout's build of a workspace crate look
+      # fresh here, so drop their fingerprints and let Cargo rebuild them from this worktree.
+      cargo metadata --no-deps --offline --format-version 1 --manifest-path "$root/Cargo.toml" |
+        jq -r '.packages[].name' |
+        while read -r member; do
+          rm -rf "$root/target/debug/.fingerprint/$member"-*
+        done
+    '';
+  };
   vendored = "^\\.config/vale/styles/(Google|write-good)/";
 in
 {
@@ -25,7 +66,10 @@ in
   cachix.enable = false;
 
   # Nix builds wrap GTK apps to find GSettings schemas; apps run from the shell need them here.
-  enterShell = "export XDG_DATA_DIRS=${gtkSchemas}:$XDG_DATA_DIRS";
+  enterShell = lib.concatLines [
+    "export XDG_DATA_DIRS=${gtkSchemas}:$XDG_DATA_DIRS"
+    (lib.getExe seedTarget)
+  ];
 
   env = {
     # keep-sorted start block=yes
