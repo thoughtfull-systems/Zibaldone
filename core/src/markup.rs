@@ -468,6 +468,25 @@ pub fn inline_markdown(text: &str) -> Vec<Inline> {
 /// Splits text at bare web addresses, following GFM's extended autolinks in their simple forms.
 fn autolinks(text: &str) -> Vec<Inline> {
     let mut out = Vec::new();
+    let mut at = 0;
+    for (range, url) in bare_links(text) {
+        if range.start > at {
+            out.push(Inline::Text(text[at..range.start].to_owned()));
+        }
+        out.push(Inline::Link { url, content: vec![Inline::Text(text[range.clone()].to_owned())] });
+        at = range.end;
+    }
+    if at < text.len() {
+        out.push(Inline::Text(text[at..].to_owned()));
+    }
+    out
+}
+
+/// The bare web addresses in text, by byte range, each with the address it links to, following
+/// GFM's extended autolinks in their simple forms.
+pub(crate) fn bare_links(text: &str) -> Vec<(Range<usize>, String)> {
+    let mut out = Vec::new();
+    let mut offset = 0;
     let mut rest = text;
     loop {
         let found = ["https://", "http://", "www."]
@@ -480,20 +499,15 @@ fn autolinks(text: &str) -> Vec<Inline> {
             rest[at..].find(|c: char| c.is_whitespace() || c == '<').map_or(rest.len(), |e| at + e);
         let mut url = &rest[at..end];
         url = url.trim_end_matches(['.', ',', ':', ';', '!', '?', '"', '\'', '*', '_', '~', ')']);
-        if url.len() <= prefix.len() {
-            out.push(Inline::Text(rest[..at + prefix.len()].to_owned()));
-            rest = &rest[at + prefix.len()..];
-            continue;
-        }
-        if at > 0 {
-            out.push(Inline::Text(rest[..at].to_owned()));
-        }
-        let href = if prefix == "www." { format!("http://{url}") } else { url.to_owned() };
-        out.push(Inline::Link { url: href, content: vec![Inline::Text(url.to_owned())] });
-        rest = &rest[at + url.len()..];
-    }
-    if !rest.is_empty() {
-        out.push(Inline::Text(rest.to_owned()));
+        let skip = if url.len() <= prefix.len() {
+            prefix.len()
+        } else {
+            let href = if prefix == "www." { format!("http://{url}") } else { url.to_owned() };
+            out.push((offset + at..offset + at + url.len(), href));
+            url.len()
+        };
+        offset += at + skip;
+        rest = &rest[at + skip..];
     }
     out
 }

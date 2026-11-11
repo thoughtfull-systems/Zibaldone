@@ -27,7 +27,7 @@ pub enum Style {
     /// A heading of level 1 to 6.
     Heading(u8),
     Highlight,
-    /// A markdown link, wikilink, or embed.
+    /// A markdown link, wikilink, embed, or bare web address.
     Link,
     /// The indentation, marker, and box that start a list item's line, or the indentation of a
     /// line that continues one. Editors draw these in a monospace font, so that continuation lines
@@ -148,30 +148,79 @@ pub fn spans(body: &str) -> Vec<Span> {
     marks(body, &mut spans);
     spans.extend(list_markers(body));
     spans.extend(list_prefixes(body));
-    for link in links {
-        let Range { start, end } = link.range;
-        let open = start + if link.embed { 3 } else { 2 };
-        let separator = label_separator(&body[open..end - 2]).map(|i| open + i);
-        let label_start = separator.map_or(open, |i| i + 1);
-        // A wikilink ends at the first unescaped `]]`, so every backslash inside starts an escape.
-        let mut escapes = Vec::new();
-        let mut i = label_start;
-        while i < end - 2 {
-            if body.as_bytes()[i] == b'\\' {
-                escapes.push(i..i + 1);
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        let syntax: Vec<Range<usize>> = std::iter::once(start..label_start)
-            .chain(escapes)
-            .chain(std::iter::once(end - 2..end))
-            .collect();
-        spans.push(span(body, start..end, Style::Link, syntax));
+    spans.extend(links.iter().map(|link| wikilink(body, link)));
+    for (range, _) in bare_links(body) {
+        spans.push(span(body, range, Style::Link, Vec::new()));
     }
     spans.sort_by_key(|span| span.range.start);
     spans
+}
+
+/// A wikilink or embed, whose syntax is everything but its label, and the escapes in that.
+fn wikilink(body: &str, link: &body::WikiLink) -> Span {
+    let Range { start, end } = link.range;
+    let open = start + if link.embed { 3 } else { 2 };
+    let separator = label_separator(&body[open..end - 2]).map(|i| open + i);
+    let label_start = separator.map_or(open, |i| i + 1);
+    // A wikilink ends at the first unescaped `]]`, so every backslash inside starts an escape.
+    let mut escapes = Vec::new();
+    let mut i = label_start;
+    while i < end - 2 {
+        if body.as_bytes()[i] == b'\\' {
+            escapes.push(i..i + 1);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let syntax: Vec<Range<usize>> = std::iter::once(start..label_start)
+        .chain(escapes)
+        .chain(std::iter::once(end - 2..end))
+        .collect();
+    span(body, start..end, Style::Link, syntax)
+}
+
+/// The bare web addresses in `body`'s text, outside links, images, and code, each with the address
+/// it links to, as the note bodies specification's extended autolinks.
+fn bare_links(body: &str) -> Vec<(Range<usize>, String)> {
+    fn flush(body: &str, run: &mut Option<Range<usize>>, out: &mut Vec<(Range<usize>, String)>) {
+        if let Some(run) = run.take() {
+            let found = crate::markup::bare_links(&body[run.clone()]);
+            out.extend(
+                found.into_iter().map(|(r, url)| (run.start + r.start..run.start + r.end, url)),
+            );
+        }
+    }
+
+    let mut out = Vec::new();
+    // pulldown-cmark can split one run of text into several events, as it does at an unmatched `_`.
+    let mut run: Option<Range<usize>> = None;
+    let mut literal = 0_usize;
+    for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
+        match event {
+            Event::Text(_) if literal == 0 => match &mut run {
+                Some(run) if run.end == range.start => run.end = range.end,
+                _ => {
+                    flush(body, &mut run, &mut out);
+                    run = Some(range);
+                }
+            },
+            Event::Start(Tag::CodeBlock(_) | Tag::Image { .. } | Tag::Link { .. }) => {
+                flush(body, &mut run, &mut out);
+                literal += 1;
+            }
+            Event::End(TagEnd::CodeBlock | TagEnd::Image | TagEnd::Link) => {
+                literal = literal.saturating_sub(1);
+            }
+            _ => flush(body, &mut run, &mut out),
+        }
+    }
+    flush(body, &mut run, &mut out);
+    let links = body::wikilinks(body);
+    out.retain(|(range, _)| {
+        !links.iter().any(|l| l.range.start < range.end && range.start < l.range.end)
+    });
+    out
 }
 
 /// pulldown-cmark leaves a gap in the source immediately before escaped text.
@@ -335,17 +384,26 @@ pub enum LinkTarget {
     Web(String),
 }
 
-/// The target of the wikilink, embed, or markdown link that byte `offset` of `body` falls in.
+/// The target of the wikilink, embed, markdown link, or bare web address that byte `offset` of
+/// `body` falls in.
 pub fn link_at(body: &str, offset: usize) -> Option<LinkTarget> {
     if let Some(link) = body::wikilinks(body).into_iter().find(|l| l.range.contains(&offset)) {
         return Some(LinkTarget::Note(link.target));
     }
-    Parser::new_ext(body, body::options()).into_offset_iter().find_map(|(event, range)| match event
-    {
-        Event::Start(Tag::Link { dest_url, .. }) if range.contains(&offset) => {
-            Some(LinkTarget::Web(dest_url.into_string()))
-        }
-        _ => None,
+    let link =
+        Parser::new_ext(body, body::options()).into_offset_iter().find_map(|(event, range)| {
+            match event {
+                Event::Start(Tag::Link { dest_url, .. }) if range.contains(&offset) => {
+                    Some(LinkTarget::Web(dest_url.into_string()))
+                }
+                _ => None,
+            }
+        });
+    link.or_else(|| {
+        bare_links(body)
+            .into_iter()
+            .find(|(range, _)| range.contains(&offset))
+            .map(|(_, url)| LinkTarget::Web(url))
     })
 }
 
@@ -959,6 +1017,25 @@ mod tests {
                 (Style::Link, vec!["[", "](https://x.example)"]),
             ]
         );
+    }
+
+    #[test]
+    fn links_bare_web_addresses() {
+        let body = "See https://x.example/a_b, www.y.example. and [z](https://z.example) \
+                    `https://code.example` <https://angle.example>\n\n\
+                    ```\nhttps://block.example\n```";
+        let links: Vec<&str> = spans(body)
+            .into_iter()
+            .filter(|span| span.style == Style::Link && span.syntax.is_empty())
+            .map(|span| &body[span.range])
+            .collect();
+        assert_eq!(links, ["https://x.example/a_b", "www.y.example"]);
+        let at = |needle: &str| link_at(body, body.find(needle).unwrap() + 1);
+        assert_eq!(at("https://x"), Some(LinkTarget::Web("https://x.example/a_b".into())));
+        assert_eq!(at("www.y"), Some(LinkTarget::Web("http://www.y.example".into())));
+        assert_eq!(at("https://code"), None);
+        assert_eq!(at("https://block"), None);
+        assert_eq!(at("See"), None);
     }
 
     #[test]
