@@ -124,7 +124,7 @@ let
         "runHook postInstall"
       ];
       nativeBuildInputs = [ pkgs.zip ];
-      npmDepsHash = "sha256-i9fKD83wfPbETTlQ6C1lXEuIVzz/a5foV7ONnPC3ios=";
+      npmDepsHash = "sha256-eEJhLT3guyfl8fk434CVoRyX5ZFY/QSC8B4eRD3AZfI=";
       sourceRoot = "source/firefox";
       src = lib.fileset.toSource {
         inherit root;
