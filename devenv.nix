@@ -7,6 +7,17 @@
 
 let
   gtkSchemas = "${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}";
+  rustcWrapper = pkgs.writeShellScript "zib-rustc" ''
+    cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+    cargo_home="''${cargo_home%/}"
+    case "''${CARGO_MANIFEST_DIR:-}" in
+      "$cargo_home"/git/checkouts/* | "$cargo_home"/registry/src/*)
+        export SCCACHE_IGNORE_SERVER_IO_ERROR=1
+        exec ${pkgs.coreutils}/bin/nice ${lib.getExe pkgs.sccache} "$@"
+        ;;
+    esac
+    exec ${pkgs.coreutils}/bin/nice "$@"
+  '';
   vendored = "^\\.config/vale/styles/(Google|write-good)/";
 in
 {
@@ -22,8 +33,8 @@ in
     CARGO_BUILD_JOBS = "4";
     # mold links far faster than the default linker, which dominates incremental builds and tests.
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
-    # Compilers run at low priority, so the desktop stays responsive while they work.
-    RUSTC_WRAPPER = "${pkgs.coreutils}/bin/nice";
+    # Share compiled dependencies across worktrees and keep local builds incremental.
+    RUSTC_WRAPPER = "${rustcWrapper}";
     VALE_CONFIG_PATH = "${config.devenv.root}/.config/vale/vale.ini";
     ZIB_SPELL_DICTIONARY_DIR = "${pkgs.hunspellDicts.en-us}/share/hunspell";
     # keep-sorted end
@@ -238,6 +249,7 @@ in
     pkgs.nodejs
     pkgs.pkg-config
     pkgs.poppler-utils
+    pkgs.sccache
     pkgs.sqlite
     pkgs.vale
     # keep-sorted end
@@ -246,8 +258,11 @@ in
   # `cargo run --bin zib` builds only `zib`, which starts the `zibaldone` beside it, so it would
   # start a stale instance. This builds both first.
   scripts.zib-dev.exec = ''
-    cargo build --quiet --manifest-path ${config.devenv.root}/Cargo.toml --package zib-linux
-    exec ${config.devenv.root}/target/debug/zib "$@"
+    set -e
+    root=${lib.escapeShellArg config.devenv.root}
+    cargo build --quiet --manifest-path "$root/Cargo.toml" --package zib-linux \
+      --target-dir "$root/target"
+    exec "$root/target/debug/zib" "$@"
   '';
   # keep-sorted end
 }
