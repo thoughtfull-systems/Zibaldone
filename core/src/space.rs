@@ -562,9 +562,15 @@ impl Space {
             fields.insert(name, value.clone())?;
         }
         let settings = child_map(&destination, "settings")?;
-        for word in crate::spelling::ignored_words(&self.doc, id) {
-            settings.insert(&crate::spelling::ignore_setting(&word), true)?;
-        }
+        let mut copied = Ok(());
+        child_map(&self.note_map(id)?, "settings")?.for_each(|key, value| {
+            if let ValueOrContainer::Value(value) = value
+                && copied.is_ok()
+            {
+                copied = settings.insert(key, value);
+            }
+        });
+        copied?;
         commit(&target.doc);
         self.notes().delete(&id.to_string())?;
         commit(&self.doc);
@@ -617,6 +623,17 @@ impl Space {
             None => self.doc.get_map(SETTINGS),
         };
         map.insert(key, value.into())?;
+        commit(&self.doc);
+        Ok(())
+    }
+
+    /// Removes a synced setting, in one commit, so it takes its default again.
+    pub fn remove_setting(&mut self, note: Option<Id>, key: &str) -> Result<()> {
+        let map = match note {
+            Some(id) => child_map(&self.note_map(id)?, "settings")?,
+            None => self.doc.get_map(SETTINGS),
+        };
+        map.delete(key)?;
         commit(&self.doc);
         Ok(())
     }
@@ -875,6 +892,22 @@ mod tests {
         space.move_note_to(other, &mut target).unwrap();
         assert!(space.tombstone(other).is_none());
         assert_eq!(target.note(other).unwrap().body, "*Other*");
+    }
+
+    #[test]
+    fn note_settings_leave_the_note_alone_and_move_with_it() {
+        let mut space = space();
+        let id = space.create_note(schema::NOTE, "Note").unwrap();
+        let before = space.note(id).unwrap();
+        space.set_setting(Some(id), "linux.example", 120).unwrap();
+        space.set_setting(Some(id), "zib.example", true).unwrap();
+        space.remove_setting(Some(id), "zib.example").unwrap();
+        assert_eq!(space.note(id).unwrap(), before);
+        assert_eq!(space.setting(Some(id), "zib.example").unwrap(), None);
+
+        let mut target = Space::create(space.machine()).unwrap();
+        space.move_note_to(id, &mut target).unwrap();
+        assert_eq!(target.setting(Some(id), "linux.example").unwrap(), Some(120.into()));
     }
 
     #[test]
