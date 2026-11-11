@@ -156,10 +156,10 @@ in
     let
       asset = "zib-web-clipper.xpi";
       releases = "https://github.com/thoughtfull-systems/Zibaldone/releases/download";
-      version = "0.1.0";
+      version = "0.1.1";
       xpi = pkgs.fetchurl {
         # keep-sorted start block=yes
-        hash = "sha256-G4pgXdvKh03chVG7YEbfIADdOpohpQDKRHAxaByLlrE=";
+        hash = "sha256-9gXsZ6tMzJnxk/OvtCqqa3FXky6cjFnImdcIWy+dhCY=";
         url = "${releases}/clipper-v${version}/${asset}";
         # keep-sorted end
       };
