@@ -36,6 +36,9 @@ nextest, and package it with a Nix flake that uses crane.
   compiling it. The core's `bundled-sqlite` feature compiles it for platforms without one, such as
   Android.
 - **Tests.** `cargo nextest run --workspace` runs the tests, in parallel, each in its own process.
+- **Worktrees.** The development shell uses sccache for dependencies from Cargo's registry and Git
+  caches. Tests and `zib-dev` share the compiler cache across worktrees. Each worktree keeps its own
+  `target/` directory and compiles Zib's crates incrementally.
 - **Nix.** `flake.nix` defines the `zibaldone` and `zibaldone-dev` packages and a `tests` check.
   Crane builds the dependencies once into a derivation of their own, which every package and the
   tests reuse, so a change to Zib rebuilds only Zib's crates. The flake's overlay adds both packages
@@ -59,9 +62,8 @@ Against the criteria:
 - **SQLite compiled into every build.** One build would serve every platform. But it compiles
   SQLite's C source in every fresh build and every Nix build. It does worse on fast tests and fast
   installs, so only Android takes it.
-- **sccache for every build.** It shares compiled crates between projects. But crane already caches
-  dependencies for Nix builds, and Cargo's own incremental builds cover the development loop. It
-  adds a tool for little gain.
+- **A shared Cargo build directory.** Cargo can reuse a local crate from another worktree with
+  different source files. Separate build directories let each worktree test its own changes.
 - **`cargo test` instead of nextest.** It needs no extra tool. But it runs each test binary's tests
   in one process and reports failures in less detail. It does worse on fast tests.
 
