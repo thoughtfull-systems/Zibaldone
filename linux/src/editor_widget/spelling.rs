@@ -8,7 +8,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, gio, glib, pango};
-use zib_core::spelling::Dictionary;
+use zib_core::spelling::{Dictionary, retain_misspellings};
 
 use super::{Content, EditorWidget, PasteTarget, Piece, units};
 
@@ -25,6 +25,7 @@ pub(super) struct Check {
     generation: u64,
     pending: Option<glib::SourceId>,
     misspellings: Vec<Range<usize>>,
+    text: String,
     pub(super) menu: Option<gtk::PopoverMenu>,
 }
 
@@ -34,6 +35,12 @@ impl Check {
             pending.remove();
         }
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.menu.take();
+        self.misspellings.clear();
+        self.text.clear();
     }
 }
 
@@ -57,15 +64,19 @@ impl EditorWidget {
     }
 
     /// Schedules a check after changes to the source or its space's dictionary.
-    pub(super) fn check_spelling(&self, text_changed: bool) {
+    pub(crate) fn refresh_spelling(&self) {
         let imp = self.imp();
         let mut check = imp.spelling.borrow_mut();
         check.cancel();
-        if text_changed {
-            check.misspellings.clear();
-        }
-        if imp.spelling_word.borrow().is_none() || imp.editor.borrow().is_none() {
+        if imp.spelling_word.borrow().is_none() {
             return;
+        }
+        let editor = imp.editor.borrow();
+        let Some(editor) = editor.as_ref() else { return };
+        let Check { misspellings, text, .. } = &mut *check;
+        if text != editor.text() {
+            retain_misspellings(misspellings, text, editor.text());
+            editor.text().clone_into(text);
         }
         let generation = check.generation;
         let widget = self.downgrade();
@@ -74,10 +85,6 @@ impl EditorWidget {
                 widget.run_spelling_check(generation);
             }
         }));
-    }
-
-    pub(crate) fn refresh_spelling(&self) {
-        self.check_spelling(false);
     }
 
     fn run_spelling_check(&self, generation: u64) {
@@ -299,10 +306,10 @@ mod tests {
         window.present();
         wait_until(|| widget.imp().spelling.borrow().misspellings.len() == 2);
 
-        let point = || {
+        let point = |source_index| {
             let lines = widget.imp().lines.borrow();
             let line = &lines[0];
-            let shown = u32::try_from(line.shown(4)).unwrap();
+            let shown = u32::try_from(line.shown(source_index)).unwrap();
             let attrs = line.layout.attributes().unwrap().attributes();
             assert!(attrs.iter().any(|attr| {
                 attr.type_() == pango::AttrType::UnderlineColor
@@ -315,17 +322,27 @@ mod tests {
                 line.y + pixels(rect.y()) + pixels(rect.height()) / 2.0,
             )
         };
-        let (x, y) = point();
+        let prefix = "Élan ";
+        widget.type_text(prefix);
+        // Check the rendered mark before the debounced check can complete.
+        point(4 + prefix.len());
+        widget.edit(|editor| assert!(editor.undo()));
+        let (x, y) = point(4);
         assert!(widget.spelling_menu(x, y));
         let menu = widget.imp().spelling.borrow().menu.clone().unwrap();
         menu.activate_action("spelling.replace", Some(&"spelling".to_variant())).unwrap();
         menu.popdown();
         assert_eq!(widget.text().unwrap(), format!("A **spelling** test with {MISSPELLED}"));
+        let last = widget.text().unwrap().rfind(MISSPELLED).unwrap();
+        assert_eq!(
+            widget.imp().spelling.borrow().misspellings,
+            std::slice::from_ref(&(last..last + MISSPELLED.len()))
+        );
         widget.edit(|editor| assert!(editor.undo()));
         assert_eq!(widget.text().as_deref(), Some(source.as_str()));
 
         wait_until(|| widget.imp().spelling.borrow().misspellings.len() == 2);
-        let (x, y) = point();
+        let (x, y) = point(4);
         assert!(widget.spelling_menu(x, y));
         let menu = widget.imp().spelling.borrow().menu.clone().unwrap();
         menu.activate_action("spelling.ignore", None).unwrap();
@@ -336,7 +353,7 @@ mod tests {
         let other = space.borrow_mut().create_note("note", &source).unwrap();
         widget.set_editor(Some(Editor::new(space.borrow_mut().open_body(other).unwrap())));
         wait_until(|| widget.imp().spelling.borrow().misspellings.len() == 2);
-        let (x, y) = point();
+        let (x, y) = point(4);
         assert!(widget.spelling_menu(x, y));
         let menu = widget.imp().spelling.borrow().menu.clone().unwrap();
         menu.activate_action("spelling.add", None).unwrap();
