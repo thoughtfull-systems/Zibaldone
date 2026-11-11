@@ -62,14 +62,33 @@ function sourceOf(image: HTMLImageElement): string {
   return lazy || image.getAttribute("src") || responsive?.split(/[ ,]/, 1)[0] || "";
 }
 
-function isYouTubeVideo(url: URL): boolean {
+function youtubeVideoId(url: URL): string | undefined {
   const { hostname, pathname, searchParams } = url;
-  if (hostname === "youtu.be") return /^\/[\w-]+\/?$/.test(pathname);
-  return (
-    (hostname === "youtube.com" || hostname.endsWith(".youtube.com")) &&
-    ((pathname === "/watch" && /^[\w-]+$/.test(searchParams.get("v") ?? "")) ||
-      /^\/shorts\/[\w-]+\/?$/.test(pathname))
-  );
+  if (hostname === "youtu.be") return /^\/([\w-]+)\/?$/.exec(pathname)?.[1];
+  if (hostname !== "youtube.com" && !hostname.endsWith(".youtube.com")) return;
+  if (pathname === "/watch") {
+    const id = searchParams.get("v");
+    return id && /^[\w-]+$/.test(id) ? id : undefined;
+  }
+  return /^\/shorts\/([\w-]+)\/?$/.exec(pathname)?.[1];
+}
+
+function linkTranscriptTimestamps(content: DocumentFragment, videoId: string): void {
+  const watch = new URL("https://www.youtube.com/watch");
+  watch.searchParams.set("v", videoId);
+  for (const timestamp of content.querySelectorAll(
+    ".youtube.transcript .transcript-segment > strong",
+  )) {
+    const time = timestamp.textContent?.trim();
+    if (!time || !/^\d+(?::[0-5]\d){1,2}$/.test(time)) continue;
+    const seconds = time.split(":").reduce((total, part) => total * 60 + Number(part), 0);
+    if (!Number.isSafeInteger(seconds)) continue;
+    watch.searchParams.set("t", String(seconds));
+    const link = document.createElement("a");
+    link.href = watch.href;
+    timestamp.before(link);
+    link.append(timestamp);
+  }
 }
 
 const expandedPanel =
@@ -80,6 +99,8 @@ const openTranscriptPanel =
 
 function readTranscriptPanel(): HTMLElement | undefined {
   const transcript = document.createElement("section");
+  // Use the same transcript markup as Defuddle so both paths share the link conversion.
+  transcript.className = "youtube transcript";
   const rows = document.querySelectorAll(
     "transcript-segment-view-model, ytd-transcript-segment-renderer",
   );
@@ -93,6 +114,7 @@ function readTranscriptPanel(): HTMLElement | undefined {
       ?.textContent?.trim();
     if (!time || !text) continue;
     const line = document.createElement("p");
+    line.className = "transcript-segment";
     const timestamp = document.createElement("strong");
     timestamp.textContent = time;
     line.append(timestamp, ` · ${text}`);
@@ -151,7 +173,8 @@ export async function capture(): Promise<Capture> {
     }
   }
 
-  const video = isYouTubeVideo(new URL(url));
+  const videoId = youtubeVideoId(new URL(url));
+  const video = videoId !== undefined;
   const defuddle = new Defuddle(document, {
     url,
     useAsync: video,
@@ -168,6 +191,7 @@ export async function capture(): Promise<Capture> {
       hasTranscript = true;
     }
   }
+  if (video) linkTranscriptTimestamps(fragment.content, videoId);
   for (const node of fragment.content.querySelectorAll("script, style, iframe, object, embed")) {
     node.remove();
   }

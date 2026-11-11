@@ -49,6 +49,9 @@ Firefox tries to include a timestamped transcript as markdown in the body. When 
 transcript, it saves the available video details and reports the missing transcript on the toolbar
 badge. When the body would be empty, Firefox uses a link to the video.
 
+Firefox links each transcript timestamp in `M:SS` or `H:MM:SS` form to
+`https://www.youtube.com/watch?v=ID&t=SECONDS`. `SECONDS` is the elapsed time in whole seconds.
+
 ## Import request for PDFs
 
 The instance request `import-web-pdf` has an `id` and a `pdf` map. The map contains:
