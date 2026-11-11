@@ -315,9 +315,9 @@ impl EditorWidget {
             child.unparent();
         }
         imp.table_views.borrow_mut().clear();
-        imp.spelling.borrow_mut().menu.take();
+        imp.spelling.borrow_mut().reset();
         *imp.editor.borrow_mut() = editor;
-        self.check_spelling(true);
+        self.refresh_spelling();
         self.rebuild_layout();
     }
 
@@ -545,7 +545,7 @@ impl EditorWidget {
         if changed {
             self.imp().held.borrow_mut().take();
             self.imp().drag_origin.borrow_mut().take();
-            self.check_spelling(true);
+            self.refresh_spelling();
             self.rebuild_layout();
             let caret = self.head().and_then(|head| caret_rect(&self.imp().lines.borrow(), head));
             if let (Some(scrolled), Some(screen_y), Some((_, y, _))) = (scrolled, anchor, caret) {
@@ -1235,7 +1235,7 @@ impl EditorWidget {
         *self.imp().editor.borrow_mut() = Some(editor);
         // What hides depends on the selection, so a move can change the layout too.
         if changed {
-            self.check_spelling(true);
+            self.refresh_spelling();
             self.rebuild_layout();
             let after = self.head().map(|head| {
                 let lines = self.imp().lines.borrow();

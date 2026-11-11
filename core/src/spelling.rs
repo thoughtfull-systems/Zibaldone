@@ -65,6 +65,53 @@ impl Dictionary {
     }
 }
 
+/// Keeps checked words outside a text edit at their new byte offsets until the next check.
+pub fn retain_misspellings(misspellings: &mut Vec<Range<usize>>, before: &str, after: &str) {
+    if misspellings.is_empty() || before == after {
+        return;
+    }
+    let start: usize = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum();
+    let suffix: usize = before[start..]
+        .chars()
+        .rev()
+        .zip(after[start..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum();
+    let old_end = before.len() - suffix;
+    let new_end = after.len() - suffix;
+
+    // Word boundaries can change just outside the edit, such as when two words join.
+    let around = |at: usize| {
+        let left = after[..at].rsplit(char::is_whitespace).next().unwrap_or_default();
+        let right = after[at..].split(char::is_whitespace).next().unwrap_or_default();
+        at - left.len()..at + right.len()
+    };
+    let left = around(start);
+    let right = around(new_end);
+    misspellings.retain_mut(|word| {
+        let segment = if word.end <= start {
+            &left
+        } else if word.start >= old_end {
+            *word = new_end + (word.start - old_end)..new_end + (word.end - old_end);
+            &right
+        } else {
+            return false;
+        };
+        word.end <= segment.start
+            || word.start >= segment.end
+            || after[segment.clone()].unicode_word_indices().any(|(at, text)| {
+                let start = segment.start + at;
+                *word == (start..start + text.len())
+            })
+    });
+}
+
 fn normalized(word: &str) -> String {
     word.replace('’', "'").nfc().collect()
 }
@@ -268,6 +315,21 @@ mod tests {
             words,
             ["Héading", "mistake", "label", "words", "reference", "rock’n’roll", "and", "don't"]
         );
+    }
+
+    #[test]
+    fn keeps_marks_at_utf8_offsets_and_drops_words_joined_by_an_edit() {
+        let before = "wróng’ érrör and mistke";
+        let mut marks = vec![0..6, 10..17, 22..28];
+        let after = "wróng’érrör and mistke";
+        retain_misspellings(&mut marks, before, after);
+        assert_eq!(marks, std::slice::from_ref(&(21..27)));
+
+        let before = "wróng’érrör 🚀 mistke";
+        let mut marks = vec![0..16, 22..28];
+        let after = "wróng’érrör 🛰 mistke";
+        retain_misspellings(&mut marks, before, after);
+        assert_eq!(marks, [0..16, 22..28]);
     }
 
     #[test]
