@@ -18,6 +18,7 @@ use zib_core::sync::{LiveEvent, Selection, SyncState};
 use zib_core::{Channel, Id};
 
 use crate::app::core;
+use crate::bottom_pane::BottomPane;
 use crate::editor_widget::{EditorWidget, PasteTarget, SpellingAction};
 use crate::state::State;
 use crate::tables;
@@ -68,7 +69,17 @@ pub struct Inner {
     title: adw::WindowTitle,
     stack: gtk::Stack,
     note_metadata: gtk::MenuButton,
-    backlinks: gtk::MenuButton,
+    /// The note's text above the notes that link to it, which show only when there are some.
+    backlinks: Rc<BottomPane>,
+    backlinks_panel: gtk::Box,
+    backlinks_list: gtk::ListBox,
+    /// The space, identifier, and title of each note in the backlinks list, in its order.
+    backlink_rows: RefCell<Vec<(Id, Id, String)>>,
+    /// Counts backlink lookups, so an older result cannot replace a newer list.
+    backlinks_generation: Cell<u64>,
+    /// Set while a lookup that also restores the open note's backlinks height is under way.
+    backlinks_restoring: Cell<bool>,
+    editor_scroll: gtk::ScrolledWindow,
     /// The notes opened before the open one, the latest last, and those to go forward to again.
     back: RefCell<Vec<(Id, Id)>>,
     forward: RefCell<Vec<(Id, Id)>>,
@@ -204,11 +215,6 @@ impl Window {
             .action_name("win.print")
             .build();
         content_header.pack_end(&print);
-        let backlinks = gtk::MenuButton::builder()
-            .icon_name("mail-reply-sender-symbolic")
-            .tooltip_text("Linked from")
-            .build();
-        content_header.pack_end(&backlinks);
 
         let widget = EditorWidget::default();
         let editor_scroll = gtk::ScrolledWindow::builder()
@@ -216,6 +222,29 @@ impl Window {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
+        let backlinks_list = gtk::ListBox::new();
+        backlinks_list.add_css_class("navigation-sidebar");
+        backlinks_list.set_selection_mode(gtk::SelectionMode::None);
+        let backlinks_heading = gtk::Label::builder()
+            .label("Linked from")
+            .xalign(0.0)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .css_classes(["caption-heading", "dim-label"])
+            .build();
+        let backlinks_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        backlinks_panel.append(&backlinks_heading);
+        backlinks_panel.append(
+            &gtk::ScrolledWindow::builder()
+                .child(&backlinks_list)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .propagate_natural_height(true)
+                .vexpand(true)
+                .build(),
+        );
+        backlinks_panel.set_visible(false);
+        let backlinks = BottomPane::new(&editor_scroll, &backlinks_panel);
         let empty = adw::StatusPage::builder()
             .icon_name("accessories-text-editor-symbolic")
             .title(state.channel.display_name())
@@ -223,7 +252,7 @@ impl Window {
             .build();
         let stack = gtk::Stack::new();
         stack.add_named(&empty, Some("empty"));
-        stack.add_named(&editor_scroll, Some("editor"));
+        stack.add_named(&backlinks.widget, Some("editor"));
         let content = adw::ToolbarView::new();
         content.add_top_bar(&content_header);
         content.set_content(Some(&stack));
@@ -266,6 +295,12 @@ impl Window {
             stack,
             note_metadata,
             backlinks,
+            backlinks_panel,
+            backlinks_list,
+            backlink_rows: RefCell::default(),
+            backlinks_generation: Cell::new(0),
+            backlinks_restoring: Cell::new(false),
+            editor_scroll,
             back: RefCell::default(),
             forward: RefCell::default(),
             back_button,
@@ -450,7 +485,19 @@ impl Window {
         let w = self.clone();
         self.inner().forward_button.connect_clicked(move |_| w.go(false));
         let w = self.clone();
-        self.inner().backlinks.set_create_popup_func(move |button| w.show_backlinks(button));
+        self.inner().backlinks_list.connect_row_activated(move |_, row| {
+            let picked = w
+                .inner()
+                .backlink_rows
+                .borrow()
+                .get(usize::try_from(row.index()).unwrap_or(usize::MAX))
+                .map(|(space, note, _)| (*space, *note));
+            if let Some((space, note)) = picked {
+                w.open_note(space, note);
+            }
+        });
+        let w = self.clone();
+        self.inner().backlinks.connect_resized(move |height| w.save_backlinks_height(height));
         let w = self.clone();
         self.inner().window.connect_close_request(move |window| {
             w.close_editor();
@@ -692,6 +739,8 @@ impl Window {
         self.reload_notes();
         self.refresh_link_titles();
         self.refresh_images(true);
+        // Notes in any space can link to the open note.
+        self.refresh_backlinks(false);
         let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
         if open.is_some_and(|(s, _)| s == space) {
             self.refresh_open();
@@ -829,6 +878,7 @@ impl Window {
                 .set_visible(loaded.type_name == "file" || loaded.type_name == "image");
             w.update_title();
             w.show_mode();
+            w.refresh_backlinks(true);
             if w.inner().focus_body.take() {
                 widget.grab_focus();
             }
@@ -1133,6 +1183,12 @@ impl Window {
             });
         }
         self.inner().open_file.set_visible(false);
+        let inner = self.inner();
+        inner.backlinks_generation.set(inner.backlinks_generation.get().wrapping_add(1));
+        inner.backlinks_restoring.set(false);
+        inner.backlinks_panel.set_visible(false);
+        inner.backlinks_list.remove_all();
+        inner.backlink_rows.borrow_mut().clear();
         self.inner().note_metadata.popdown();
         self.inner().note_metadata.set_visible(false);
         self.inner().note_metadata.set_popover(None::<&gtk::Popover>);
@@ -1529,7 +1585,7 @@ impl Window {
         // A minimum height keeps several notes in view when the popover has little room.
         let scroll = gtk::ScrolledWindow::builder()
             .child(&list)
-            .min_content_width(360)
+            .width_request(360)
             .min_content_height(240)
             .max_content_height(320)
             .propagate_natural_height(true)
@@ -1667,57 +1723,78 @@ impl Window {
         creation.into_iter().chain(matches).collect()
     }
 
-    /// Fills the popover of notes that link to the open note.
-    fn show_backlinks(&self, button: &gtk::MenuButton) {
-        let list = gtk::ListBox::new();
-        list.add_css_class("navigation-sidebar");
-        list.set_selection_mode(gtk::SelectionMode::None);
-        let scroll = gtk::ScrolledWindow::builder()
-            .child(&list)
-            .min_content_width(320)
-            .max_content_height(400)
-            .propagate_natural_height(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        let popover = gtk::Popover::builder().child(&scroll).build();
-        button.set_popover(Some(&popover));
-        let Some(note) = self.inner().editor.borrow().as_ref().map(|e| e.note) else { return };
+    /// Fills the pane of notes that link to the open note, and hides it when there are none. When
+    /// `restore` is set, the pane also takes the height the owner gave this note's pane.
+    fn refresh_backlinks(&self, restore: bool) {
+        let generation = self.inner().backlinks_generation.get().wrapping_add(1);
+        self.inner().backlinks_generation.set(generation);
+        // A lookup that replaces one still restoring the height restores it in its place.
+        let restore = restore || self.inner().backlinks_restoring.get();
+        self.inner().backlinks_restoring.set(restore);
+        let Some((space, note)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
+        else {
+            return;
+        };
         let w = self.clone();
         let state = self.inner().state.clone();
         glib::spawn_future_local(async move {
-            let sources = core(async move {
+            let (sources, height) = core(async move {
                 let sources = state.backlinks(note);
                 let ids: Vec<Id> = sources.iter().map(|(_, id)| *id).collect();
                 let titles = state.titles(&ids).await;
-                sources
+                let height = if restore { state.backlinks_height(space, note).await } else { None };
+                let sources = sources
                     .into_iter()
                     .map(|(space, id)| {
                         let title =
                             titles.get(&id).map(|t| body::plain_text(t)).unwrap_or_default();
+                        let title =
+                            if title.trim().is_empty() { "Untitled".to_owned() } else { title };
                         (space, id, title)
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (sources, height)
             })
             .await;
-            if sources.is_empty() {
-                list.append(
-                    &gtk::Label::builder()
-                        .label("No notes link here")
-                        .margin_top(12)
-                        .margin_bottom(12)
-                        .build(),
-                );
+            if w.inner().backlinks_generation.get() != generation {
                 return;
             }
-            for (space, id, title) in sources {
-                let title = if title.trim().is_empty() { "Untitled".to_owned() } else { title };
-                let row = adw::ActionRow::builder().title(escape(&title)).activatable(true).build();
-                let (w, popover) = (w.clone(), popover.clone());
-                row.connect_activated(move |_| {
-                    popover.popdown();
-                    w.open_note(space, id);
-                });
-                list.append(&row);
+            let inner = w.inner();
+            inner.backlinks_restoring.set(false);
+            // The note keeps two lines of text in view, however far the owner moves the divider.
+            inner.editor_scroll.set_min_content_height(inner.widget.lines_height(2));
+            // Filling the list again only when it changes keeps where the owner scrolled it.
+            if *inner.backlink_rows.borrow() != sources {
+                inner.backlinks_list.remove_all();
+                for (_, _, title) in &sources {
+                    let row =
+                        adw::ActionRow::builder().title(escape(title)).activatable(true).build();
+                    inner.backlinks_list.append(&row);
+                }
+                inner.backlinks_panel.set_visible(!sources.is_empty());
+                *inner.backlink_rows.borrow_mut() = sources;
+            }
+            if restore {
+                inner.backlinks.show(height);
+            } else {
+                inner.backlinks.update();
+            }
+        });
+    }
+
+    /// Keeps the height the owner gave the open note's backlinks pane, or forgets it when they
+    /// unpin it.
+    fn save_backlinks_height(&self, height: Option<i32>) {
+        let Some((space, note)) = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note))
+        else {
+            return;
+        };
+        let w = self.clone();
+        let state = self.inner().state.clone();
+        glib::spawn_future_local(async move {
+            let saved = core(async move { state.set_backlinks_height(space, note, height).await });
+            if let Err(error) = saved.await {
+                w.toast(&format!("Couldn't keep the backlinks height: {error}"));
             }
         });
     }

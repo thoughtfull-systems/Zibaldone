@@ -191,6 +191,19 @@ value has no effect.
 Each word syncs independently. Moving the note copies its ignored words to the destination with the
 note.
 
+## Moving note settings
+
+Moving a note to another space copies every key in its `settings` map to the destination with the
+note, including keys this specification doesn't define.
+
+## Backlinks pane height
+
+The note setting `linux.backlinks-height` holds a positive integer: the height in logical pixels
+that the owner gave the pane of notes linking to that note, below its text. When the setting is
+absent, or holds anything else, the pane fits its notes, up to a fifth of the editor's height. The
+Linux app writes the setting when the owner lets go of the pane's divider, and removes it when they
+unpin the height. Writing or removing it doesn't change the note's body or metadata.
+
 ## Platforms
 
 No platform differs.

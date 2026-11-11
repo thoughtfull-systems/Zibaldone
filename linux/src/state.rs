@@ -30,6 +30,8 @@ mod web_clip;
 
 /// The Linux app keeps every file, as decision ZIB0004 sets for it.
 pub const POLICY: Policy = Policy::All;
+/// The note setting that holds the height the owner gave the note's backlinks pane.
+const BACKLINKS_HEIGHT: &str = "linux.backlinks-height";
 /// The pet name of the space that a new machine starts with.
 const DEFAULT_SPACE: &str = "Default";
 /// How many times a machine tries to receive a space that another shared with it while pairing.
@@ -544,6 +546,33 @@ impl State {
 
     pub(crate) async fn ignore_spelling_word(&self, space: Id, note: Id, word: &str) -> Result<()> {
         self.space(space).await?.lock().await.ignore_spelling_word(note, word)?;
+        self.changed_here(space);
+        Ok(())
+    }
+
+    /// The height the owner gave a note's backlinks pane, if they moved its divider.
+    pub(crate) async fn backlinks_height(&self, space: Id, note: Id) -> Option<i32> {
+        let space = self.space(space).await.ok()?;
+        let value = space.lock().await.setting(Some(note), BACKLINKS_HEIGHT).ok()??;
+        i32::try_from(value.into_i64().ok()?).ok().filter(|height| *height > 0)
+    }
+
+    /// Keeps the height the owner gave a note's backlinks pane, or with `None` lets the pane fit
+    /// its notes again.
+    pub(crate) async fn set_backlinks_height(
+        &self,
+        space: Id,
+        note: Id,
+        height: Option<i32>,
+    ) -> Result<()> {
+        {
+            let space = self.space(space).await?;
+            let mut space = space.lock().await;
+            match height {
+                Some(height) => space.set_setting(Some(note), BACKLINKS_HEIGHT, i64::from(height)),
+                None => space.remove_setting(Some(note), BACKLINKS_HEIGHT),
+            }?;
+        }
         self.changed_here(space);
         Ok(())
     }

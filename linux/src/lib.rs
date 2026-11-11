@@ -3,6 +3,7 @@
 
 pub mod adding;
 pub mod app;
+pub mod bottom_pane;
 pub mod chat;
 pub mod derive;
 pub mod editor_widget;

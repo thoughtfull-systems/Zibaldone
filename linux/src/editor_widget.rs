@@ -1446,6 +1446,15 @@ impl EditorWidget {
         }
     }
 
+    /// The height that shows the first `lines` lines of text in the editor's font, with the margin
+    /// above them.
+    pub fn lines_height(&self, lines: i32) -> i32 {
+        let line = self.create_pango_layout(Some("X")).pixel_size().1.max(1);
+        #[allow(clippy::cast_possible_truncation)]
+        let top = MARGIN_TOP.ceil() as i32;
+        top + lines * line
+    }
+
     /// How many lines of the editor's font a page holds.
     fn page_lines(&self) -> usize {
         let page = self
