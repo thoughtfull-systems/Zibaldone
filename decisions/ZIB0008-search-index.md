@@ -38,9 +38,10 @@ Keep each machine's index for each space in a SQLite database in the machine's c
 search text with SQLite's FTS5 extension. The core reaches SQLite through the `rusqlite` crate on
 every platform. A later specification defines the tables.
 
-- **Text.** One FTS5 table holds a row for each note, with columns for its title, its body, and its
-  fields with the `text` mode, including the extracted text of its files. Search ranks matches with
-  FTS5's built-in BM25 ranking and matches prefixes of the words the owner types.
+- **Text.** One FTS5 table holds a row for each note, with one column each for its title and body.
+  Another column holds its type name and fields with the `text` mode, including the extracted text
+  of its files. Search ranks matches with FTS5's built-in BM25 ranking and matches prefixes of the
+  words the owner types.
 - **Snippets.** The text table keeps its own copy of the text, so FTS5's `snippet` function can
   return a few words around the matches in the column that matched, with the matching words marked
   for the app to highlight.

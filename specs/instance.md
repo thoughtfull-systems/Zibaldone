@@ -150,6 +150,8 @@ The note commands add these requests:
 
 These requests access the machine's spaces regardless of which spaces show in the note list.
 
+The `search` and `search-space` requests also match words in a note's type name.
+
 The browser integration adds **`import-web-clip`** with `clip` and `images`, as the
 [web clipper specification](web-clipper.md#import-request) defines. The result holds `clip` with
 `note`, `space`, and `images`, in the same order as the request's images.

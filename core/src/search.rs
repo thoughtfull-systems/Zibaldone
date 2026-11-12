@@ -109,7 +109,7 @@ impl Index {
         tx.execute("DELETE FROM links WHERE source = ?1", [&key])?;
         if let Ok(note) = space.note(id) {
             let title = space.title(id)?.plain;
-            let mut texts = Vec::new();
+            let mut texts = vec![note.type_name.clone()];
             if let Some(ty) = schema::read_type(space.doc(), &note.type_name) {
                 for (name, def) in &ty.fields {
                     let Some(value) = note.fields.get(name).and_then(|v| Value::from_loro(def, v))
@@ -254,6 +254,29 @@ fn fts_query(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn searches_note_types_and_body_text_together() {
+        let mut space = Space::create(Id::generate()).unwrap();
+        let video = space.create_note(schema::VIDEO, "# Garden tour\nSpring planting").unwrap();
+        space.create_note(schema::NOTE, "# Groceries").unwrap();
+        let mut index = Index::in_memory().unwrap();
+        index.rebuild(&space, &|_| None).unwrap();
+
+        let mention = space.create_note(schema::NOTE, "# Links\nWatch this video").unwrap();
+        index.update_note(&space, mention, &|_| None).unwrap();
+
+        let hits = index.search("video", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|hit| hit.id == mention));
+        assert!(hits.iter().any(|hit| {
+            hit.id == video && hit.snippet.contains(&format!("{MATCH_START}video{MATCH_END}"))
+        }));
+
+        let hits = index.search("vid planting", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, video);
+    }
 
     #[test]
     fn searches_titles_bodies_and_file_text() {
