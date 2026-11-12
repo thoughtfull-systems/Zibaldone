@@ -14,6 +14,23 @@ fn until(mut ready: impl FnMut() -> bool) {
     }
 }
 
+/// Present the window and wait for its first frame. GTK maps the window before it draws, but the
+/// compositor shows it only after that frame, and GTK blocks while it waits for the compositor to
+/// place a popover on a window it doesn't show yet.
+fn present(window: &gtk::Window) {
+    window.present();
+    until(|| window.is_mapped());
+    let clock = window.frame_clock().expect("the window's frame clock");
+    let painted = Rc::new(Cell::new(false));
+    let handler = clock.connect_after_paint({
+        let painted = painted.clone();
+        move |_| painted.set(true)
+    });
+    window.queue_draw();
+    until(|| painted.get());
+    clock.disconnect(handler);
+}
+
 fn input(widget: &EditorWidget) -> gtk::IMContext {
     let controllers = widget.observe_controllers();
     (0..controllers.n_items())
@@ -397,8 +414,7 @@ fn note_metadata_shows_the_note_id_and_populated_fields_without_selecting_them()
     assert!(source.label().starts_with("<a href=\"https://example.org/article?a=1&amp;b=2\">"));
     assert_eq!(source.xalign().to_bits(), values[0].1.xalign().to_bits());
 
-    window.present();
-    until(|| window.inner().window.is_mapped());
+    present(window.inner().window.upcast_ref());
     details.popup();
     let popover = details.popover().unwrap();
     until(|| popover.is_mapped());
