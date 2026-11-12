@@ -36,9 +36,12 @@ nextest, and package it with a Nix flake that uses crane.
   compiling it. The core's `bundled-sqlite` feature compiles it for platforms without one, such as
   Android.
 - **Tests.** `cargo nextest run --workspace` runs the tests, in parallel, each in its own process.
-- **Worktrees.** The development shell uses sccache for dependencies from Cargo's registry and Git
-  caches. Tests and `zib-dev` share the compiler cache across worktrees. Each worktree keeps its own
-  `target/` directory and compiles Zib's crates incrementally.
+- **Worktrees.** Each worktree keeps its own `target/` directory and compiles Zib's crates
+  incrementally. When the development shell starts in a worktree without one, it seeds `target/`
+  with copy-on-write copies of the main checkout's build outputs, which take seconds to make and no
+  space until they change. It drops the copied fingerprints of the workspace's crates, so Cargo
+  reuses the dependencies and rebuilds only Zib's crates. The shell also passes dependencies from
+  Cargo's registry and Git caches through sccache, which covers the few that the seed lacks.
 - **Nix.** `flake.nix` defines the `zibaldone` and `zibaldone-dev` packages and a `tests` check.
   Crane builds the dependencies once into a derivation of their own, which every package and the
   tests reuse, so a change to Zib rebuilds only Zib's crates. The flake's overlay adds both packages
@@ -49,7 +52,8 @@ nextest, and package it with a Nix flake that uses crane.
 
 Against the criteria:
 
-- **Fast tests:** mold, lean debug information, and nextest keep the edit and test loop short.
+- **Fast tests:** mold, lean debug information, and nextest keep the edit and test loop short, and a
+  seeded worktree's first build compiles only Zib's crates.
 - **Fast installs:** crane's separate dependency derivation stays in the Nix store between builds.
 - **Checked commits:** the hooks fail any commit that isn't formatted or doesn't pass Clippy.
 - **Small toolbox:** devenv provides Rust, mold, nextest, SQLite, and the hooks, and the flake
@@ -63,7 +67,11 @@ Against the criteria:
   SQLite's C source in every fresh build and every Nix build. It does worse on fast tests and fast
   installs, so only Android takes it.
 - **A shared Cargo build directory.** Cargo can reuse a local crate from another worktree with
-  different source files. Separate build directories let each worktree test its own changes.
+  different source files. It also locks the whole build directory while it builds, so worktrees
+  would wait on each other. Separate build directories let each worktree test its own changes.
+- **sccache alone.** It needs no seeding step. But sccache 0.18 keys each crate on the outputs of
+  build scripts and procedural macros under the worktree's own `target/`, and nearly every
+  dependency sits downstream of one, so a fresh worktree gets almost no hits. It fails fast tests.
 - **`cargo test` instead of nextest.** It needs no extra tool. But it runs each test binary's tests
   in one process and reports failures in less detail. It does worse on fast tests.
 
@@ -75,4 +83,6 @@ Against the criteria:
 - `flake.lock` pins nixpkgs and crane for the packages, apart from `devenv.lock`, which pins the
   development environment.
 - The first commit with Rust and TOML files adds their hooks, as AGENTS.md requires.
+- Seeding needs a file system with copy-on-write copies, such as Btrfs. On any other, a new worktree
+  builds its dependencies from scratch.
 - A later Android build turns on `bundled-sqlite` and builds the core for Android's targets.
