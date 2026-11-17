@@ -6,9 +6,9 @@ use std::fmt::Write as _;
 use rusqlite::params_from_iter;
 use rusqlite::types::Value;
 
-use crate::{Id, Result};
+use crate::{Error, Id, Result};
 
-use super::query::{Operator, Query};
+use super::query::{Clause, Operator, Query};
 use super::{Hit, Index, MATCH_END, MATCH_START, NOTE_ID_FIELD, TYPE_FIELD, fts_query};
 
 /// How to order search results. Field-only searches use last modified by default.
@@ -61,10 +61,10 @@ pub fn search_indexes<'a>(
     limit: usize,
 ) -> Result<Vec<(Id, Hit)>> {
     let indexes: Vec<_> = indexes.into_iter().collect();
-    let query = Query::parse(text)?;
-    let Some(statement) = Statement::new(&indexes, &query, sort, limit)? else {
-        return Ok(Vec::new());
-    };
+    let Some(query) = Query::parse(text)? else { return Ok(Vec::new()) };
+    let mut statement = Statement::default();
+    let predicate = statement.predicate(&indexes, &query, true, true)?;
+    statement.finish(&predicate, sort, limit);
     let mut hits = Vec::new();
     for (space, index) in indexes {
         hits.extend(statement.run(index)?.into_iter().map(|hit| (space, hit)));
@@ -80,9 +80,14 @@ pub fn search_indexes<'a>(
 #[derive(Default)]
 struct Statement {
     args: Vec<Value>,
-    matches: Vec<String>,
-    predicates: Vec<String>,
+    matches: Vec<TextMatch>,
     sql: String,
+}
+
+struct TextMatch {
+    cte: String,
+    required: bool,
+    scored: bool,
 }
 
 impl Statement {
@@ -91,102 +96,154 @@ impl Statement {
         format!("?{}", self.args.len())
     }
 
-    fn text_match(&mut self, query: String, field: Option<&str>) {
+    fn text_match(
+        &mut self,
+        query: String,
+        field: Option<&str>,
+        required: bool,
+        scored: bool,
+    ) -> Result<String> {
+        if self.matches.len() == 32 {
+            return Err(Error::SearchQuery("Use at most 32 separate text matches".into()));
+        }
         let text = self.bind(query.into());
-        let start = self.bind(MATCH_START.to_string().into());
-        let end = self.bind(MATCH_END.to_string().into());
-        let n = self.matches.len();
-        let (from, snippet, score) = if let Some(field) = field {
+        let (from, note, table, column, rank) = if let Some(field) = field {
             let field = self.bind(field.to_owned().into());
             (
                 format!("field_text WHERE field_text MATCH {text} AND field = {field}"),
-                format!("note, snippet(field_text, 2, {start}, {end}, '…', 12)"),
+                "note",
+                "field_text",
+                2,
                 "rank",
             )
         } else {
             (
                 format!("text WHERE text MATCH {text}"),
-                format!("id, snippet(text, -1, {start}, {end}, '…', 12)"),
+                "id",
+                "text",
+                -1,
                 "bm25(text, 0.0, 10.0, 1.0, 1.0)",
             )
         };
-        self.matches
-            .push(format!("m{n}(note, excerpt, score) AS (SELECT {snippet}, {score} FROM {from})"));
+        let (excerpt, score) = if scored {
+            let start = self.bind(MATCH_START.to_string().into());
+            let end = self.bind(MATCH_END.to_string().into());
+            (format!("snippet({table}, {column}, {start}, {end}, '…', 12)"), rank)
+        } else {
+            ("''".to_owned(), "0.0")
+        };
+        let alias = format!("m{}", self.matches.len());
+        // An optional match must compute FTS auxiliaries before the left join adds null rows.
+        let materialized = if required { "" } else { " MATERIALIZED" };
+        let cte = format!(
+            "{alias}(note, excerpt, score) AS{materialized} \
+            (SELECT {note}, {excerpt}, {score} FROM {from})"
+        );
+        self.matches.push(TextMatch { cte, required, scored });
+        Ok(format!("{alias}.note IS NOT NULL"))
     }
 
-    fn new(
+    fn predicate(
+        &mut self,
         indexes: &[(Id, &Index)],
         query: &Query<'_>,
-        sort: Sort,
-        limit: usize,
-    ) -> Result<Option<Self>> {
-        let mut statement = Self::default();
-        if let Some(text) = fts_query(&query.text) {
-            statement.text_match(text, None);
-        }
-        for clause in &query.fields {
-            if clause.field == NOTE_ID_FIELD {
-                let id = statement.bind(clause.note_id()?.to_string().into());
-                statement.predicates.push(format!("n.id = {id}"));
-                continue;
+        required: bool,
+        positive: bool,
+    ) -> Result<String> {
+        match query {
+            Query::And(terms) | Query::Or(terms) => {
+                let and = matches!(query, Query::And(_));
+                let join = if and { " AND " } else { " OR " };
+                let terms = terms
+                    .iter()
+                    .map(|term| self.predicate(indexes, term, required && and, positive))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!("({})", terms.join(join)))
             }
-            if clause.field == TYPE_FIELD {
-                let kind = statement.bind(clause.type_value()?.to_owned().into());
-                statement.predicates.push(format!("n.type = {kind}"));
-                continue;
+            Query::Field(clause) => self.field_predicate(indexes, clause, required, positive),
+            Query::Not(term) => {
+                let term = self.predicate(indexes, term, false, !positive)?;
+                Ok(format!("NOT ({term})"))
             }
-            let defs: Vec<_> = indexes
-                .iter()
-                .flat_map(|(_, index)| &index.types)
-                .filter_map(|ty| ty.fields.get(clause.field))
-                .collect();
-            clause.validate(&defs)?;
-            if matches!(clause.op, Operator::Contains) {
-                statement.text_match(clause.text_query()?, Some(clause.field));
-                continue;
+            Query::Text(text) => {
+                let words = fts_query(text).expect("text terms contain a search word");
+                self.text_match(words, None, required, positive)
             }
-            let field = statement.bind(clause.field.to_owned().into());
-            let comparison = if let Some(op) = clause.op.comparison() {
-                let value = clause.comparison_value(&defs)?;
-                let column = if matches!(value, Value::Integer(_)) { "number" } else { "text" };
-                let arg = statement.bind(value);
-                format!(" AND f.{column} {op} {arg}")
-            } else {
-                String::new()
-            };
-            let not = if matches!(clause.op, Operator::Missing) { "NOT " } else { "" };
-            statement.predicates.push(format!(
-                "{not}EXISTS (SELECT 1 FROM filters AS f \
-                WHERE f.note = n.id AND f.field = {field}{comparison})"
-            ));
         }
-        if statement.matches.is_empty() && statement.predicates.is_empty() {
-            return Ok(None);
-        }
-        statement.finish(sort, limit);
-        Ok(Some(statement))
     }
 
-    fn finish(&mut self, sort: Sort, limit: usize) {
-        let sql = &mut self.sql;
-        let (excerpt, score) = if self.matches.is_empty() {
-            ("''", "0.0".to_owned())
+    fn field_predicate(
+        &mut self,
+        indexes: &[(Id, &Index)],
+        clause: &Clause<'_>,
+        required: bool,
+        positive: bool,
+    ) -> Result<String> {
+        match clause.field {
+            NOTE_ID_FIELD => {
+                let id = self.bind(clause.note_id()?.to_string().into());
+                return Ok(format!("n.id = {id}"));
+            }
+            TYPE_FIELD => {
+                let kind = self.bind(clause.type_value()?.to_owned().into());
+                return Ok(format!("n.type = {kind}"));
+            }
+            _ => {}
+        }
+        let defs: Vec<_> = indexes
+            .iter()
+            .flat_map(|(_, index)| &index.types)
+            .filter_map(|ty| ty.fields.get(clause.field))
+            .collect();
+        clause.validate(&defs)?;
+        if matches!(clause.op, Operator::Contains) {
+            return self.text_match(clause.text_query()?, Some(clause.field), required, positive);
+        }
+        let field = self.bind(clause.field.to_owned().into());
+        let comparison = if let Some(op) = clause.op.comparison() {
+            let value = clause.comparison_value(&defs)?;
+            let column = if matches!(value, Value::Integer(_)) { "number" } else { "text" };
+            let arg = self.bind(value);
+            format!(" AND f.{column} {op} {arg}")
         } else {
-            write!(sql, "WITH {} ", self.matches.join(", ")).unwrap();
-            let score = (0..self.matches.len()).map(|n| format!("m{n}.score")).collect::<Vec<_>>();
-            ("m0.excerpt", score.join(" + "))
+            String::new()
+        };
+        let not = if matches!(clause.op, Operator::Missing) { "NOT " } else { "" };
+        Ok(format!(
+            "{not}EXISTS (SELECT 1 FROM filters AS f \
+            WHERE f.note = n.id AND f.field = {field}{comparison})"
+        ))
+    }
+
+    fn finish(&mut self, predicate: &str, sort: Sort, limit: usize) {
+        let sql = &mut self.sql;
+        if !self.matches.is_empty() {
+            let ctes: Vec<_> = self.matches.iter().map(|m| m.cte.as_str()).collect();
+            write!(sql, "WITH {} ", ctes.join(", ")).unwrap();
+        }
+        let (mut excerpts, mut scores) = (Vec::new(), Vec::new());
+        for (n, m) in self.matches.iter().enumerate().filter(|(_, m)| m.scored) {
+            excerpts.push(format!("m{n}.excerpt"));
+            scores.push(if m.required {
+                format!("m{n}.score")
+            } else {
+                format!("coalesce(m{n}.score, 0.0)")
+            });
+        }
+        let (excerpt, score) = if excerpts.is_empty() {
+            ("''".to_owned(), "0.0".to_owned())
+        } else {
+            (format!("coalesce({}, '')", excerpts.join(", ")), scores.join(" + "))
         };
         write!(sql, "SELECT n.id, n.title, {excerpt}, n.updated, {score} AS score FROM notes n")
             .unwrap();
-        for n in 0..self.matches.len() {
-            write!(sql, " JOIN m{n} ON m{n}.note = n.id").unwrap();
-        }
-        if !self.predicates.is_empty() {
-            write!(sql, " WHERE {}", self.predicates.join(" AND ")).unwrap();
+        for (n, m) in self.matches.iter().enumerate() {
+            let join = if m.required { "JOIN" } else { "LEFT JOIN" };
+            write!(sql, " {join} m{n} ON m{n}.note = n.id").unwrap();
         }
         let order = sort.sql();
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        write!(sql, " ORDER BY {order} LIMIT {limit}").unwrap();
+        write!(sql, " WHERE {predicate} ORDER BY {order} LIMIT {limit}").unwrap();
     }
 
     fn run(&self, index: &Index) -> Result<Vec<RankedHit>> {
@@ -212,6 +269,57 @@ mod tests {
     use crate::{Error, Space, schema};
 
     use super::*;
+
+    #[test]
+    fn combines_boolean_groups_with_text_and_typed_fields() {
+        let mut space = Space::create(Id::generate()).unwrap();
+        let pie = space.create_note(schema::NOTE, "Apple pie").unwrap();
+        let pear = space.create_note(schema::NOTE, "Pear tart").unwrap();
+        let tart = space.create_note(schema::ARTICLE, "Apple tart").unwrap();
+        let literal = space.create_note(schema::NOTE, "Or something else").unwrap();
+        space.set_field(tart, "published-on", &schema::Value::Date("2025-01-02".into())).unwrap();
+        space
+            .set_field(
+                tart,
+                "authors",
+                &schema::Value::List(vec![schema::Value::Text("Ada (Editor)".into())]),
+            )
+            .unwrap();
+        let mut index = Index::in_memory().unwrap();
+        index.rebuild(&space, &|_| None).unwrap();
+        let find =
+            |query: &str| search_indexes([(space.id().unwrap(), &index)], query, Sort::Title, 10);
+        let ids =
+            |query: &str| find(query).unwrap().into_iter().map(|(_, h)| h.id).collect::<Vec<_>>();
+
+        assert_eq!(ids("apple or pear and tart"), [pie, tart, pear]);
+        assert_eq!(ids("(apple OR pear) tart"), [tart, pear]);
+        assert_eq!(ids("apple NOT (pear OR @type=article)"), [pie]);
+        assert_eq!(ids("apple OR (pear AND NOT tart)"), [pie, tart]);
+        assert_eq!(ids("tart AND NOT @published-on>=2025-01-01"), [pear]);
+        assert_eq!(ids("(@published-on>=2025-01-01 OR pear) AND tart"), [tart, pear]);
+        assert_eq!(ids(r#"(@authors="Ada (Editor)" OR pear) AND tart"#), [tart, pear]);
+        assert_eq!(ids(r#""or""#), [literal]);
+
+        let matches = find(r#"@authors:"Ada (Editor)" OR pear"#).unwrap();
+        assert_eq!(matches.len(), 2);
+        for ((_, hit), word) in matches.iter().zip(["Ada", "Pear"]) {
+            assert!(hit.snippet.contains(&format!("{MATCH_START}{word}{MATCH_END}")));
+        }
+        assert!(find("NOT apple").unwrap().iter().all(|(_, hit)| hit.snippet.is_empty()));
+        assert_eq!(ids("NOT NOT apple"), [pie, tart]);
+
+        for invalid in [
+            "()",
+            "(apple or pear",
+            "apple AND",
+            "apple)",
+            "not (pear OR)",
+            "@type=note OR NOT @published-on>=2025-02-30",
+        ] {
+            assert!(matches!(find(invalid), Err(Error::SearchQuery(_))), "{invalid}");
+        }
+    }
 
     #[test]
     fn finds_a_note_by_its_metadata_id() {

@@ -51,72 +51,188 @@ pub(super) struct Clause<'a> {
     pub value: String,
 }
 
-#[derive(Default)]
-pub(super) struct Query<'a> {
-    pub text: String,
-    pub fields: Vec<Clause<'a>>,
+pub(super) enum Query<'a> {
+    And(Vec<Self>),
+    Field(Clause<'a>),
+    Not(Box<Self>),
+    Or(Vec<Self>),
+    Text(String),
 }
 
 impl<'a> Query<'a> {
-    pub fn parse(mut rest: &'a str) -> Result<Self> {
-        let mut query = Self::default();
-        while !rest.is_empty() {
-            rest = rest.trim_start();
-            let (word, tail) = split_word(rest);
-            if let Some(field) = word.strip_prefix('@') {
-                let end = field.find(['!', ':', '<', '=', '>', '?']);
-                if let Some(end) = end {
-                    let name = &field[..end];
-                    if !schema::is_name(name) {
-                        return Err(error(format!("Invalid field name {name:?}")));
-                    }
-                    // Read the value from the full input so a quoted value can contain spaces.
-                    let Some((op, value)) = Operator::take(&rest[1 + end..]) else {
-                        return Err(error(format!("Invalid operator for {name}")));
-                    };
-                    let (value, tail) = match op {
-                        Operator::Missing | Operator::Present => (String::new(), value),
-                        _ => take_value(value, name)?,
-                    };
-                    if tail.starts_with(|c: char| !c.is_whitespace()) {
-                        return Err(error(format!("Expected a space after the {name} condition")));
-                    }
-                    if query.fields.len() == 16 {
-                        return Err(error("Use at most 16 field conditions"));
-                    }
-                    query.fields.push(Clause { field: name, op, value });
-                    rest = tail;
-                    continue;
-                }
-            }
-            // Quotes in ordinary text keep a leading @ literal but use the existing word search.
-            if let Some(quoted) = rest.strip_prefix('"')
-                && let Some((value, tail)) = quoted.split_once('"')
-            {
-                query.text.push_str(value);
-                rest = tail;
-            } else {
-                query.text.push_str(word);
-                rest = tail;
-            }
-            query.text.push(' ');
+    pub fn parse(text: &'a str) -> Result<Option<Self>> {
+        let mut tokens = tokenize(text)?.into_iter().peekable();
+        if tokens.peek().is_none() {
+            return Ok(None);
         }
-        Ok(query)
+        let query = parse_or(&mut tokens, 0)?;
+        if tokens.next().is_some() {
+            return Err(error("Unexpected closing parenthesis"));
+        }
+        Ok(Some(query))
     }
 }
 
+enum Token<'a> {
+    And,
+    Close,
+    Not,
+    Open,
+    Or,
+    Term(Query<'a>),
+}
+
+type Tokens<'a> = std::iter::Peekable<std::vec::IntoIter<Token<'a>>>;
+
+fn parse_or<'a>(tokens: &mut Tokens<'a>, depth: usize) -> Result<Query<'a>> {
+    let first = parse_and(tokens, depth)?;
+    if !matches!(tokens.peek(), Some(Token::Or)) {
+        return Ok(first);
+    }
+    let mut terms = vec![first];
+    while matches!(tokens.peek(), Some(Token::Or)) {
+        tokens.next();
+        terms.push(parse_and(tokens, depth)?);
+    }
+    Ok(Query::Or(terms))
+}
+
+fn parse_and<'a>(tokens: &mut Tokens<'a>, depth: usize) -> Result<Query<'a>> {
+    let mut terms = Vec::new();
+    let mut text = String::new();
+    loop {
+        match parse_unary(tokens, depth)? {
+            // Keep the existing combined full-text ranking for a conjunction of search words.
+            Query::Text(word) => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&word);
+            }
+            term => terms.push(term),
+        }
+        match tokens.peek() {
+            None | Some(Token::Close | Token::Or) => break,
+            Some(Token::And) => {
+                tokens.next();
+            }
+            _ => {}
+        }
+    }
+    if !text.is_empty() {
+        terms.insert(0, Query::Text(text));
+    }
+    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Query::And(terms) })
+}
+
+fn parse_unary<'a>(tokens: &mut Tokens<'a>, depth: usize) -> Result<Query<'a>> {
+    if depth > 32 {
+        return Err(error("Search groups and NOT can nest at most 32 levels"));
+    }
+    match tokens.next() {
+        Some(Token::Not) => Ok(Query::Not(Box::new(parse_unary(tokens, depth + 1)?))),
+        Some(Token::Open) => {
+            let query = parse_or(tokens, depth + 1)?;
+            if !matches!(tokens.next(), Some(Token::Close)) {
+                return Err(error("Close the search group with a parenthesis"));
+            }
+            Ok(query)
+        }
+        Some(Token::Term(term)) => Ok(term),
+        _ => Err(error("Expected a search term, field condition, or group")),
+    }
+}
+
+fn tokenize(mut rest: &str) -> Result<Vec<Token<'_>>> {
+    let mut tokens = Vec::new();
+    let mut fields = 0;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Ok(tokens);
+        }
+        if tokens.len() == 512 {
+            return Err(error("Use at most 512 search terms and operators"));
+        }
+        let (token, tail) = match rest.as_bytes()[0] {
+            b'(' => (Some(Token::Open), &rest[1..]),
+            b')' => (Some(Token::Close), &rest[1..]),
+            b'"' => {
+                let (value, tail) = take_quoted(&rest[1..], "search text")?;
+                if tail.starts_with(|c: char| !separator(c)) {
+                    return Err(error("Expected a space or parenthesis after quoted search text"));
+                }
+                (text_token(value), tail)
+            }
+            _ => {
+                let (word, tail) = split_word(rest);
+                if let Some((clause, tail)) = take_clause(rest, word)? {
+                    fields += 1;
+                    if fields > 16 {
+                        return Err(error("Use at most 16 field conditions"));
+                    }
+                    (Some(Token::Term(Query::Field(clause))), tail)
+                } else {
+                    let token = match word {
+                        w if w.eq_ignore_ascii_case("and") => Some(Token::And),
+                        w if w.eq_ignore_ascii_case("not") => Some(Token::Not),
+                        w if w.eq_ignore_ascii_case("or") => Some(Token::Or),
+                        _ => text_token(word.to_owned()),
+                    };
+                    (token, tail)
+                }
+            }
+        };
+        tokens.extend(token);
+        rest = tail;
+    }
+}
+
+fn text_token(text: String) -> Option<Token<'static>> {
+    text.chars().any(char::is_alphanumeric).then_some(Token::Term(Query::Text(text)))
+}
+
+fn take_clause<'a>(text: &'a str, word: &'a str) -> Result<Option<(Clause<'a>, &'a str)>> {
+    let Some(field) = word.strip_prefix('@') else { return Ok(None) };
+    let Some(end) = field.find(['!', ':', '<', '=', '>', '?']) else { return Ok(None) };
+    let name = &field[..end];
+    if !schema::is_name(name) {
+        return Err(error(format!("Invalid field name {name:?}")));
+    }
+    // Read from the full input so a quoted value can contain spaces or parentheses.
+    let Some((op, value)) = Operator::take(&text[1 + end..]) else {
+        return Err(error(format!("Invalid operator for {name}")));
+    };
+    let (value, tail) = match op {
+        Operator::Missing | Operator::Present => (String::new(), value),
+        _ => take_value(value, name)?,
+    };
+    if tail.starts_with(|c: char| !separator(c)) {
+        return Err(error(format!("Expected a space or parenthesis after the {name} condition")));
+    }
+    Ok(Some((Clause { field: name, op, value }, tail)))
+}
+
+fn separator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '(' | ')')
+}
+
 fn split_word(text: &str) -> (&str, &str) {
-    text.split_at(text.find(char::is_whitespace).unwrap_or(text.len()))
+    text.split_at(text.find(separator).unwrap_or(text.len()))
 }
 
 fn take_value<'a>(text: &'a str, field: &str) -> Result<(String, &'a str)> {
-    let Some(quoted) = text.strip_prefix('"') else {
-        let (value, tail) = split_word(text);
-        if value.is_empty() {
-            return Err(error(format!("Enter a value for {field}")));
-        }
-        return Ok((value.into(), tail));
-    };
+    if let Some(quoted) = text.strip_prefix('"') {
+        return take_quoted(quoted, field);
+    }
+    let (value, tail) = split_word(text);
+    if value.is_empty() {
+        return Err(error(format!("Enter a value for {field}")));
+    }
+    Ok((value.into(), tail))
+}
+
+fn take_quoted<'a>(quoted: &'a str, label: &str) -> Result<(String, &'a str)> {
     let mut value = String::new();
     let mut chars = quoted.char_indices();
     while let Some((i, ch)) = chars.next() {
@@ -124,12 +240,12 @@ fn take_value<'a>(text: &'a str, field: &str) -> Result<(String, &'a str)> {
             '"' => return Ok((value, &quoted[i + 1..])),
             '\\' => match chars.next() {
                 Some((_, ch @ ('"' | '\\'))) => value.push(ch),
-                _ => return Err(error(format!("Invalid escape in the value for {field}"))),
+                _ => return Err(error(format!("Invalid escape in the quoted value for {label}"))),
             },
             _ => value.push(ch),
         }
     }
-    Err(error(format!("Close the quoted value for {field}")))
+    Err(error(format!("Close the quoted value for {label}")))
 }
 
 fn error(message: impl Into<String>) -> Error {

@@ -230,7 +230,7 @@ fn edit_at_cursor(text: &str, position: i32) -> Option<FieldEdit<'_>> {
             escaped = true;
         } else if ch == '"' {
             quoted = !quoted;
-        } else if !quoted && ch.is_whitespace() {
+        } else if !quoted && (ch.is_whitespace() || matches!(ch, '(' | ')')) {
             start = i + ch.len_utf8();
         }
     }
@@ -277,5 +277,6 @@ mod tests {
         assert!(edit_at_cursor("mail@example", -1).is_none());
         assert!(edit_at_cursor("@type=", -1).is_none());
         assert!(edit_at_cursor(r#"@authors:"Name @no"#, -1).is_none());
+        assert_eq!(edit_at_cursor("apple OR (@pub", -1).unwrap().prefix, "pub");
     }
 }
