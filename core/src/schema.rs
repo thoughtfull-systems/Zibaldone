@@ -422,7 +422,11 @@ pub fn is_date(text: &str) -> bool {
 /// `HH:MM` or `HH:MM:SS` on a 24-hour clock.
 pub fn is_time(text: &str) -> bool {
     let parts: Vec<&str> = text.split(':').collect();
-    let two = |s: &str, max: u32| s.len() == 2 && s.parse::<u32>().is_ok_and(|n| n <= max);
+    let two = |s: &str, max: u32| {
+        s.len() == 2
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && s.parse::<u32>().is_ok_and(|n| n <= max)
+    };
     match parts.as_slice() {
         [h, m] => two(h, 23) && two(m, 59),
         [h, m, s] => two(h, 23) && two(m, 59) && two(s, 59),

@@ -13,7 +13,7 @@ use zib_core::body;
 use zib_core::editing::{Drawing, LinkTarget};
 use zib_core::render::Kind;
 use zib_core::schema::Value;
-use zib_core::search::{MATCH_END, MATCH_START};
+use zib_core::search::{MATCH_END, MATCH_START, Sort};
 use zib_core::sync::{LiveEvent, Selection, SyncState};
 use zib_core::{Channel, Id};
 
@@ -23,8 +23,11 @@ use crate::editor_widget::{EditorWidget, PasteTarget, SpellingAction};
 use crate::state::State;
 use crate::tables;
 
+mod search_completion;
 #[cfg(test)]
 mod tests;
+
+use search_completion::SearchCompletion;
 
 /// How long metadata and search updates wait after typing stops, or while editing live.
 const REPORT_LIVE: Duration = Duration::from_millis(50);
@@ -56,6 +59,8 @@ pub struct Inner {
     last_space: Cell<Option<Id>>,
     new_note_menu: gio::Menu,
     search: gtk::SearchEntry,
+    search_completion: SearchCompletion,
+    sort: Cell<Sort>,
     list: gtk::ListBox,
     rows: RefCell<Vec<(Id, Id)>>,
     /// Counts reloads of the list, so only the latest one fills it.
@@ -148,10 +153,21 @@ impl Window {
         let menu_button =
             gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build();
         let sidebar_header = adw::HeaderBar::new();
+        let sort_menu = gio::Menu::new();
+        sort_menu.append(Some("Relevance"), Some("win.sort-notes::relevance"));
+        sort_menu.append(Some("Last modified"), Some("win.sort-notes::modified"));
+        sort_menu.append(Some("Title"), Some("win.sort-notes::title"));
+        let sort = gtk::MenuButton::builder()
+            .icon_name("view-sort-ascending-symbolic")
+            .menu_model(&sort_menu)
+            .tooltip_text("Sort notes")
+            .build();
+        sort.update_property(&[gtk::accessible::Property::Label("Sort notes")]);
         sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Notes", "")));
         sidebar_header.pack_start(&new_note);
         sidebar_header.pack_start(&add_file);
         sidebar_header.pack_end(&menu_button);
+        sidebar_header.pack_end(&sort);
         let space_toggles = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .column_spacing(4)
@@ -285,6 +301,8 @@ impl Window {
             last_space: Cell::new(None),
             new_note_menu,
             search,
+            search_completion: SearchCompletion::new(),
+            sort: Cell::new(Sort::Relevance),
             list,
             rows: RefCell::default(),
             generation: Cell::new(0),
@@ -313,6 +331,7 @@ impl Window {
             body_timer: RefCell::default(),
         }));
         this.connect(&new_note, &add_file, &delete);
+        this.inner().search_completion.connect(&this);
         this.inner().chat.connect(this.clone());
         let w = this.clone();
         chat_toggle.connect_clicked(move |_| w.inner().chat.toggle());
@@ -531,6 +550,25 @@ impl Window {
             }
         });
         actions.add_action(&new_note_in);
+        let sort = gio::SimpleAction::new_stateful(
+            "sort-notes",
+            Some(glib::VariantTy::STRING),
+            &"relevance".to_variant(),
+        );
+        let w = self.clone();
+        sort.connect_change_state(move |action, value| {
+            let Some(value) = value else { return };
+            let order = match value.str() {
+                Some("modified") => Sort::Modified,
+                Some("relevance") => Sort::Relevance,
+                Some("title") => Sort::Title,
+                _ => return,
+            };
+            action.set_state(value);
+            w.inner().sort.set(order);
+            w.reload_notes();
+        });
+        actions.add_action(&sort);
         self.inner().window.insert_action_group("win", Some(&actions));
         self.connect_history();
     }
@@ -649,6 +687,7 @@ impl Window {
             toggles.set_visible(spaces.len() > 1);
             *w.inner().spaces.borrow_mut() = spaces;
             w.inner().last_space.set(last);
+            w.refresh_search_completion();
             w.reload_notes();
         });
     }
@@ -662,17 +701,18 @@ impl Window {
         glib::spawn_future_local(async move {
             let _ = core(async move { state.set_hidden(space, !shown).await }).await;
         });
+        self.refresh_search_completion();
         self.reload_notes();
     }
 
-    /// Fills the note list with the notes of the spaces that show, most recently changed first, or
-    /// with search results from them.
+    /// Fills the note list with the notes or search results from the spaces that show.
     fn reload_notes(&self) {
         let generation = self.inner().generation.get() + 1;
         self.inner().generation.set(generation);
         let w = self.clone();
         let state = self.inner().state.clone();
         let query = self.inner().search.text().to_string();
+        let sort = self.inner().sort.get();
         let spaces = self.shown_spaces();
         let names: HashMap<Id, String> = spaces.iter().cloned().collect();
         let several = spaces.len() > 1;
@@ -686,7 +726,14 @@ impl Window {
                         let notes = state.notes(space).await.unwrap_or_default();
                         all.extend(notes.into_iter().map(|note| (space, note)));
                     }
-                    all.sort_by_key(|(_, note)| std::cmp::Reverse(note.updated));
+                    all.sort_by(|(a_space, a), (b_space, b)| {
+                        let order = if sort == Sort::Title {
+                            Sort::compare_titles(&a.plain, &b.plain)
+                        } else {
+                            b.updated.cmp(&a.updated)
+                        };
+                        order.then_with(|| a.id.cmp(&b.id)).then_with(|| a_space.cmp(b_space))
+                    });
                     all
                 })
                 .await;
@@ -703,10 +750,31 @@ impl Window {
                     rows.push((space, note.id, escape(title), subtitle));
                 }
             } else {
-                let hits = core(async move { state.search(&query, 50) }).await;
-                for (space, hit) in hits.into_iter().filter(|(space, _)| names.contains_key(space))
-                {
-                    rows.push((space, hit.id, escape(&hit.title), snippet_markup(&hit.snippet)));
+                let ids: Vec<_> = spaces.into_iter().map(|(id, _)| id).collect();
+                match core(async move { state.search_shown(&ids, &query, sort, 50) }).await {
+                    Ok(hits) => {
+                        for (space, hit) in hits {
+                            rows.push((
+                                space,
+                                hit.id,
+                                escape(&hit.title),
+                                snippet_markup(&hit.snippet),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        if w.inner().generation.get() == generation {
+                            w.inner().rows.borrow_mut().clear();
+                            w.inner().list.remove_all();
+                            let row = adw::ActionRow::builder()
+                                .title("Couldn't search")
+                                .subtitle(escape(&error.to_string()))
+                                .selectable(false)
+                                .build();
+                            w.inner().list.append(&row);
+                        }
+                        return;
+                    }
                 }
             }
             // A later reload started while this one waited, and fills the list instead.
@@ -736,6 +804,7 @@ impl Window {
             self.reload_spaces();
             return;
         }
+        self.refresh_search_completion();
         self.reload_notes();
         self.refresh_link_titles();
         self.refresh_images(true);

@@ -17,7 +17,7 @@ use zib_core::net::{Nearby, Network, Node, OpenNote, Pairing};
 use zib_core::pairing::{Invite, Paired, Party};
 use zib_core::render::{Image, Kind, Renderer};
 use zib_core::schema::{self, Value};
-use zib_core::search::{Hit, Index};
+use zib_core::search::{Hit, Index, Sort, field_names, search_indexes};
 use zib_core::space::{FileHash, Machine, Note, Policy};
 use zib_core::store::Store;
 use zib_core::sync::{Exchanged, SyncState};
@@ -643,6 +643,28 @@ impl State {
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<(Id, Hit)> {
         self.search_in(query, limit, None)
+    }
+
+    pub(crate) fn search_fields(&self, spaces: &[Id]) -> Vec<String> {
+        let indexes = self.indexes.lock().expect("unpoisoned");
+        field_names(spaces.iter().filter_map(|id| indexes.get(id)))
+    }
+
+    /// Searches the note list's spaces, applying the query and sort before the limit.
+    pub(crate) fn search_shown(
+        &self,
+        spaces: &[Id],
+        query: &str,
+        sort: Sort,
+        limit: usize,
+    ) -> Result<Vec<(Id, Hit)>> {
+        let indexes = self.indexes.lock().expect("unpoisoned");
+        search_indexes(
+            spaces.iter().filter_map(|id| indexes.get(id).map(|index| (*id, index))),
+            query,
+            sort,
+            limit,
+        )
     }
 
     /// The notes in any space that link to `note`, with their spaces.

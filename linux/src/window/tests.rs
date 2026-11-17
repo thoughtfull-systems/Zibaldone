@@ -453,3 +453,46 @@ fn note_metadata_shows_the_note_id_and_populated_fields_without_selecting_them()
     runtime.block_on(state.finish());
     window.inner().window.destroy();
 }
+
+#[test]
+fn sidebar_search_sorts_matches_and_shows_invalid_values() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, alpha, zulu) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let alpha = state.create_note(space, "Alpha gardening").await.unwrap();
+        let zulu = state.create_note(space, "Zulu gardening").await.unwrap();
+        (space, alpha, zulu)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.SearchTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    let inner = window.inner();
+    gtk::prelude::WidgetExt::activate_action(
+        &inner.window,
+        "win.sort-notes",
+        Some(&"title".to_variant()),
+    )
+    .unwrap();
+    inner.search.set_text("gardening @type=note @published-on!?");
+    until(|| *inner.rows.borrow() == [(space, alpha), (space, zulu)]);
+    inner.search.set_text("@published-on>=2025-02-30");
+    until(|| {
+        inner.list.row_at_index(0).and_downcast::<adw::ActionRow>().is_some_and(|row| {
+            row.title() == "Couldn't search"
+                && row.subtitle().is_some_and(|text| text.contains("2025-02-30"))
+        })
+    });
+    assert!(inner.rows.borrow().is_empty());
+    inner.search.set_text("gardening @type=note @published-on>=2025-01-01");
+    until(|| inner.list.row_at_index(0).is_none());
+    runtime.block_on(state.finish());
+    inner.window.destroy();
+}

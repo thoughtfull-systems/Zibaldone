@@ -1,19 +1,41 @@
 //! The search index of one space, as decision ZIB0008 describes: SQLite with FTS5 for text, plain
 //! tables for filter fields and backlinks.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::body;
-use crate::schema::{self, Kind, SearchMode, Value};
+use crate::schema::{self, SearchMode, Value};
 use crate::space::FileHash;
 use crate::{Id, Result, Space};
+
+mod query;
+mod structured;
+
+pub use structured::{Sort, search_indexes};
 
 /// Marks the start of a match in a snippet, for the app to highlight.
 pub const MATCH_START: char = '\u{2}';
 /// Marks the end of a match in a snippet.
 pub const MATCH_END: char = '\u{3}';
+
+const NOTE_ID_FIELD: &str = "note-id";
+const TYPE_FIELD: &str = "type";
+
+/// Searchable field names and built-in metadata names for the supplied spaces.
+pub fn field_names<'a>(indexes: impl IntoIterator<Item = &'a Index>) -> Vec<String> {
+    let mut names = BTreeSet::from([NOTE_ID_FIELD, TYPE_FIELD]);
+    for index in indexes {
+        for ty in &index.types {
+            names.extend(ty.fields.iter().filter_map(|(name, def)| {
+                (def.search != SearchMode::None).then_some(name.as_str())
+            }));
+        }
+    }
+    names.into_iter().map(str::to_owned).collect()
+}
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS notes (
@@ -34,6 +56,11 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS filters_text ON filters (field, text);
     CREATE INDEX IF NOT EXISTS filters_number ON filters (field, number);
     CREATE INDEX IF NOT EXISTS filters_note ON filters (note);
+    CREATE VIRTUAL TABLE IF NOT EXISTS field_text USING fts5(
+        note UNINDEXED, field UNINDEXED, content, tokenize = 'unicode61 remove_diacritics 2'
+    );
+    CREATE TABLE IF NOT EXISTS field_text_rows (rowid INTEGER PRIMARY KEY, note TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS field_text_note ON field_text_rows (note);
     CREATE TABLE IF NOT EXISTS links (source TEXT NOT NULL, target TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS links_target ON links (target);
     CREATE INDEX IF NOT EXISTS links_source ON links (source);
@@ -55,6 +82,7 @@ pub struct Hit {
 /// A space's search index.
 pub struct Index {
     db: Connection,
+    types: Vec<schema::TypeDef>,
 }
 
 impl Index {
@@ -73,7 +101,7 @@ impl Index {
 
     fn with(db: Connection) -> Result<Self> {
         db.execute_batch(SCHEMA)?;
-        Ok(Self { db })
+        Ok(Self { db, types: Vec::new() })
     }
 
     /// Rebuilds the whole index from the space. `file_text` gives the text of a blob the machine
@@ -85,9 +113,16 @@ impl Index {
     ) -> Result<()> {
         let tx = self.db.transaction()?;
         tx.execute_batch(
-            "DELETE FROM notes; DELETE FROM text; DELETE FROM filters; DELETE FROM links;",
+            "DELETE FROM notes; DELETE FROM text; DELETE FROM filters; \
+            DELETE FROM field_text; DELETE FROM field_text_rows; DELETE FROM links;",
         )?;
         tx.commit()?;
+        self.types = space
+            .doc()
+            .get_map(schema::SCHEMAS)
+            .keys()
+            .filter_map(|name| schema::read_type(space.doc(), &name))
+            .collect();
         for id in space.note_ids() {
             self.update_note(space, id, file_text)?;
         }
@@ -106,28 +141,47 @@ impl Index {
         tx.execute("DELETE FROM notes WHERE id = ?1", [&key])?;
         tx.execute("DELETE FROM text WHERE id = ?1", [&key])?;
         tx.execute("DELETE FROM filters WHERE note = ?1", [&key])?;
+        tx.execute(
+            "DELETE FROM field_text WHERE rowid IN (
+                SELECT rowid FROM field_text_rows WHERE note = ?1
+            )",
+            [&key],
+        )?;
+        tx.execute("DELETE FROM field_text_rows WHERE note = ?1", [&key])?;
         tx.execute("DELETE FROM links WHERE source = ?1", [&key])?;
         if let Ok(note) = space.note(id) {
             let title = space.title(id)?.plain;
             let mut texts = vec![note.type_name.clone()];
             if let Some(ty) = schema::read_type(space.doc(), &note.type_name) {
                 for (name, def) in &ty.fields {
+                    if def.search == SearchMode::None {
+                        continue;
+                    }
                     let Some(value) = note.fields.get(name).and_then(|v| Value::from_loro(def, v))
                     else {
                         continue;
                     };
+                    let mut content = Vec::new();
                     for item in flatten(value) {
-                        match def.search {
-                            SearchMode::Text => match &item {
-                                Value::File(hash) => texts.extend(file_text(*hash)),
-                                other => texts.extend(text_of(other)),
-                            },
-                            SearchMode::Filter => {
-                                let (text, number) = filter_of(def.value_kind(), &item);
-                                tx.execute(INSERT_FILTER, params![key, name, text, number])?;
+                        if def.search == SearchMode::Text {
+                            match &item {
+                                Value::File(hash) => content.extend(file_text(*hash)),
+                                other => content.extend(text_of(other)),
                             }
-                            SearchMode::None => {}
                         }
+                        let (text, number) = filter_of(&item);
+                        tx.execute(INSERT_FILTER, params![key, name, text, number])?;
+                    }
+                    if !content.is_empty() {
+                        tx.execute(
+                            "INSERT INTO field_text (note, field, content) VALUES (?1, ?2, ?3)",
+                            params![key, name, content.join("\n\n")],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO field_text_rows (rowid, note) VALUES (?1, ?2)",
+                            params![tx.last_insert_rowid(), key],
+                        )?;
+                        texts.extend(content);
                     }
                 }
             }
@@ -192,17 +246,6 @@ impl Index {
         Ok(ids)
     }
 
-    /// The notes whose filter field `field` holds `value` exactly.
-    pub fn filter_equals(&self, field: &str, value: &str) -> Result<Vec<Id>> {
-        let mut statement =
-            self.db.prepare("SELECT DISTINCT note FROM filters WHERE field = ?1 AND text = ?2")?;
-        let ids = statement
-            .query_map([field, value], |row| row.get::<_, String>(0))?
-            .filter_map(|id| Id::parse(&id.ok()?).ok())
-            .collect();
-        Ok(ids)
-    }
-
     /// The plain title the index holds for a note.
     pub fn title(&self, id: Id) -> Result<Option<String>> {
         Ok(self
@@ -231,13 +274,14 @@ fn text_of(value: &Value) -> Option<String> {
 }
 
 /// A filter value as text for exact matches and sorting, or as a number for ranges.
-fn filter_of(kind: Kind, value: &Value) -> (Option<String>, Option<i64>) {
-    match (kind, value) {
-        (_, Value::Integer(n) | Value::Timestamp(n)) => (None, Some(*n)),
-        (_, Value::Boolean(b)) => (None, Some(i64::from(*b))),
-        (_, Value::Link(id)) => (Some(id.to_string()), None),
-        (_, Value::File(hash)) => (Some(hash.to_string()), None),
-        (_, other) => (text_of(other), None),
+fn filter_of(value: &Value) -> (Option<String>, Option<i64>) {
+    match value {
+        Value::Boolean(b) => (None, Some(i64::from(*b))),
+        Value::Decimal(s) => (Some(query::decimal_key(s)), None),
+        Value::Integer(n) | Value::Timestamp(n) => (None, Some(*n)),
+        Value::Link(id) => (Some(id.to_string()), None),
+        Value::Time(s) => (Some(query::time_key(s)), None),
+        other => (text_of(other), None),
     }
 }
 

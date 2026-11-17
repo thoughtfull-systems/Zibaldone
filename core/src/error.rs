@@ -36,6 +36,9 @@ pub enum Error {
     /// The search index failed.
     #[error("search index: {0}")]
     Search(#[from] rusqlite::Error),
+    /// A search expression doesn't match the query syntax or the available fields.
+    #[error("{0}")]
+    SearchQuery(String),
     /// Math or a diagram couldn't be drawn.
     #[error("render: {0}")]
     Render(String),
