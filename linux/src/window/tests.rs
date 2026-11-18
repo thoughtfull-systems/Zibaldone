@@ -481,9 +481,9 @@ fn sidebar_search_sorts_matches_and_shows_invalid_values() {
         Some(&"title".to_variant()),
     )
     .unwrap();
-    inner.search.set_text("gardening @type=note @published-on!?");
+    inner.search.buffer().set_text("gardening @type=note @published-on!?");
     until(|| *inner.rows.borrow() == [(space, alpha), (space, zulu)]);
-    inner.search.set_text("@published-on>=2025-02-30");
+    inner.search.buffer().set_text("@published-on>=2025-02-30");
     until(|| {
         inner.list.row_at_index(0).and_downcast::<adw::ActionRow>().is_some_and(|row| {
             row.title() == "Couldn't search"
@@ -491,8 +491,93 @@ fn sidebar_search_sorts_matches_and_shows_invalid_values() {
         })
     });
     assert!(inner.rows.borrow().is_empty());
-    inner.search.set_text("gardening @type=note @published-on>=2025-01-01");
+    inner.search.buffer().set_text("gardening @type=note @published-on>=2025-01-01");
     until(|| inner.list.row_at_index(0).is_none());
     runtime.block_on(state.finish());
     inner.window.destroy();
+}
+
+#[test]
+fn saved_sidebar_keeps_drafts_saves_copies_and_restores_after_restart() {
+    use zib_core::search::saved::Definition;
+
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(root.path());
+    let state = runtime.block_on(State::for_test(dirs.clone())).unwrap();
+    let (space, note) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let note = state.create_note(space, "Garden planning").await.unwrap();
+        state
+            .save_search(
+                space,
+                None,
+                "Garden".into(),
+                Definition { query: "garden\n@type=note".into(), ..Definition::default() },
+            )
+            .await
+            .unwrap();
+        (space, note)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.SavedSearchTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    let inner = window.inner();
+    until(|| inner.search_sidebar.picker.model().is_some_and(|model| model.n_items() == 2));
+    inner.search_sidebar.picker.set_selected(1);
+    until(|| window.search_definition().query == "garden\n@type=note");
+    assert!(!inner.search_sidebar.save.is_sensitive());
+    window.open_note(space, note);
+    until(|| inner.widget.text().as_deref() == Some("Garden planning"));
+    inner.search.buffer().set_text("garden AND NOT @type=article");
+    until(|| inner.search_sidebar.save.is_sensitive());
+    inner.search_sidebar.picker.set_selected(0);
+    inner.search_sidebar.picker.set_selected(1);
+    assert_eq!(window.search_definition().query, "garden AND NOT @type=article");
+    until(|| inner.search_sidebar.save.is_sensitive());
+    inner.search_sidebar.save.emit_clicked();
+    until(|| {
+        runtime.block_on(state.saved_searches())[0].search.definition.query
+            == "garden AND NOT @type=article"
+    });
+    until(|| !inner.search_sidebar.save.is_sensitive());
+    let entries = runtime.block_on(state.saved_searches());
+    assert_eq!(entries[0].search.definition.query, "garden AND NOT @type=article");
+    assert_eq!(inner.widget.text().as_deref(), Some("Garden planning"));
+
+    // A copy changes only the new entry, and an empty query restores the full note list.
+    inner.search.buffer().set_text("");
+    until(|| inner.search_sidebar.copy.is_sensitive());
+    inner.search_sidebar.copy.emit_clicked();
+    let dialog = inner.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+    let name =
+        dialog.extra_child().unwrap().first_child().unwrap().downcast::<gtk::Entry>().unwrap();
+    name.set_text("Everything");
+    dialog.emit_by_name::<()>("response", &[&"save"]);
+    dialog.close();
+    until(|| runtime.block_on(state.saved_searches()).len() == 2);
+    until(|| inner.search_sidebar.picker.model().is_some_and(|model| model.n_items() == 3));
+    assert_eq!(
+        runtime.block_on(state.saved_searches())[1].search.definition.query,
+        "garden AND NOT @type=article"
+    );
+    gtk::prelude::WidgetExt::activate_action(&inner.window, "win.toggle-search", None).unwrap();
+    assert!(!inner.sidebar_split.shows_sidebar());
+    assert_eq!(inner.widget.text().as_deref(), Some("Garden planning"));
+    window.close_editor();
+    runtime.block_on(state.finish());
+    inner.window.destroy();
+
+    let reopened = runtime.block_on(State::for_test(dirs)).unwrap();
+    let saved = runtime.block_on(reopened.saved_searches());
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[0].search.name, "Everything");
+    assert!(saved[0].search.definition.query.is_empty());
+    runtime.block_on(reopened.finish());
 }

@@ -12,7 +12,9 @@ use crate::space::FileHash;
 use crate::{Id, Result, Space};
 
 mod query;
+pub mod saved;
 mod structured;
+mod timestamp;
 
 pub use structured::{Sort, search_indexes};
 

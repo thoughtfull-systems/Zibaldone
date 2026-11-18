@@ -26,6 +26,7 @@ render = [
 
 [dependencies]
 blake3 = "1.8.7"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 ciborium = "0.2.2"
 futures-util = { version = "0.3.31", default-features = false, optional = true }
 getrandom = "0.3.4"

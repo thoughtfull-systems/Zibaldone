@@ -204,6 +204,11 @@ absent, or holds anything else, the pane fits its notes, up to a fifth of the ed
 Linux app writes the setting when the owner lets go of the pane's divider, and removes it when they
 unpin the height. Writing or removing it doesn't change the note's body or metadata.
 
+## Saved searches
+
+The optional `saved-searches` root map holds the definitions in the
+[saved searches specification](saved-searches.md).
+
 ## Platforms
 
 No platform differs.

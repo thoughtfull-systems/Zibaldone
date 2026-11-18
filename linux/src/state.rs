@@ -26,6 +26,7 @@ use zib_core::{Channel, Error, Id, Result, Space};
 use crate::derive;
 
 mod agent;
+pub(crate) mod searches;
 mod web_clip;
 
 /// The Linux app keeps every file, as decision ZIB0004 sets for it.

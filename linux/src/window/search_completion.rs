@@ -59,9 +59,9 @@ impl SearchCompletion {
         let w = window.clone();
         self.focus.connect_leave(move |_| w.inner().search_completion.dismiss());
         let w = window.clone();
-        search.connect_changed(move |_| w.refresh_search_completion());
+        search.buffer().connect_changed(move |_| w.refresh_search_completion());
         let w = window.clone();
-        search.connect_cursor_position_notify(move |_| w.refresh_search_completion());
+        search.buffer().connect_cursor_position_notify(move |_| w.refresh_search_completion());
         let w = window.clone();
         search.connect_unrealize(move |_| {
             let completion = &w.inner().search_completion;
@@ -94,7 +94,7 @@ impl SearchCompletion {
         }
     }
 
-    fn show(&self, search: &gtk::SearchEntry, names: &[String]) {
+    fn show(&self, search: &gtk::TextView, names: &[String]) {
         if names.is_empty() {
             self.dismiss();
             return;
@@ -103,6 +103,11 @@ impl SearchCompletion {
         if self.popover.parent().is_none() {
             self.popover.set_parent(search);
         }
+        let buffer = search.buffer();
+        let rect = search.iter_location(&buffer.iter_at_offset(buffer.cursor_position()));
+        let (x, y) =
+            search.buffer_to_window_coords(gtk::TextWindowType::Widget, rect.x(), rect.y());
+        self.popover.set_pointing_to(Some(&gdk::Rectangle::new(x, y, rect.width(), rect.height())));
         if self.popover.is_mapped() {
             self.popover.present();
         } else {
@@ -129,25 +134,30 @@ impl SearchCompletion {
         self.scroll.vadjustment().set_value(0.0);
     }
 
-    fn pick(&self, search: &gtk::SearchEntry, row: &gtk::ListBoxRow) {
+    fn pick(&self, search: &gtk::TextView, row: &gtk::ListBoxRow) {
         let Some(label) = row.child().and_downcast::<gtk::Label>() else { return };
-        let mut text = search.text().to_string();
-        let Some(edit) = edit_at_cursor(&text, search.position()) else { return };
+        let buffer = search.buffer();
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
+        let Some(edit) = edit_at_cursor(&text, search.buffer().cursor_position()) else { return };
         let name = label.text();
         if !name.starts_with(edit.prefix) {
             return;
         }
-        let end = text[..edit.name.start].chars().count() + name.len();
-        text.replace_range(edit.name, &name);
+        let start = i32::try_from(text[..edit.name.start].chars().count()).unwrap_or(i32::MAX);
+        let end = i32::try_from(text[..edit.name.end].chars().count()).unwrap_or(i32::MAX);
         self.picking.set(true);
         self.dismiss();
-        search.set_text(&text);
+        buffer.begin_user_action();
+        let mut at = buffer.iter_at_offset(start);
+        buffer.delete(&mut at, &mut buffer.iter_at_offset(end));
+        buffer.insert(&mut at, &name);
+        buffer.end_user_action();
         search.grab_focus();
-        search.set_position(i32::try_from(end).unwrap_or(i32::MAX));
+        buffer.place_cursor(&at);
         self.picking.set(false);
     }
 
-    fn key(&self, search: &gtk::SearchEntry, key: gdk::Key) -> glib::Propagation {
+    fn key(&self, search: &gtk::TextView, key: gdk::Key) -> glib::Propagation {
         if !self.popover.is_mapped() {
             return glib::Propagation::Proceed;
         }
@@ -180,12 +190,13 @@ impl Window {
         let inner = self.inner();
         let chooser = &inner.search_completion;
         let search = &inner.search;
-        let text = search.text();
-        let Some(edit) = edit_at_cursor(&text, search.position()).filter(|_| {
+        let buffer = search.buffer();
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+        let Some(edit) = edit_at_cursor(&text, search.buffer().cursor_position()).filter(|_| {
             !chooser.picking.get()
                 && chooser.focus.contains_focus()
                 && search.is_mapped()
-                && search.selection_bounds().is_none()
+                && buffer.selection_bounds().is_none()
         }) else {
             chooser.dismiss();
             return;
@@ -193,7 +204,7 @@ impl Window {
         let prefix = edit.prefix.to_owned();
         let generation = chooser.generation.get().wrapping_add(1);
         chooser.generation.set(generation);
-        let spaces: Vec<_> = self.shown_spaces().into_iter().map(|(id, _)| id).collect();
+        let spaces: Vec<_> = self.search_spaces().into_iter().map(|(id, _)| id).collect();
         let w = self.clone();
         let state = inner.state.clone();
         glib::spawn_future_local(async move {
@@ -246,6 +257,26 @@ fn edit_at_cursor(text: &str, position: i32) -> Option<FieldEdit<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completing_a_field_preserves_multiline_query_and_undo() {
+        if adw::init().is_err() {
+            return;
+        }
+        let search = gtk::TextView::new();
+        let buffer = search.buffer();
+        buffer.set_enable_undo(true);
+        let before = "apple OR (\n@note-draft=123)";
+        buffer.set_text(before);
+        buffer.place_cursor(&buffer.iter_at_offset(16));
+        let chooser = SearchCompletion::new();
+        chooser.set_names(&["note-id".into()]);
+        chooser.pick(&search, &chooser.list.row_at_index(0).unwrap());
+        let text = || buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
+        assert_eq!(text(), "apple OR (\n@note-id=123)");
+        buffer.undo();
+        assert_eq!(text(), before);
+    }
 
     #[test]
     fn completion_list_measures_its_current_field_names() {

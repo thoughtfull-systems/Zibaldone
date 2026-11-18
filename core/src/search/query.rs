@@ -49,6 +49,25 @@ pub(super) struct Clause<'a> {
     pub field: &'a str,
     pub op: Operator,
     pub value: String,
+    range: Option<Range>,
+}
+
+struct Range {
+    start: String,
+    end: String,
+    inclusive: bool,
+}
+
+impl Range {
+    fn parse(value: &str) -> Result<Option<Self>> {
+        let Some((start, end)) = value.split_once("..") else { return Ok(None) };
+        let inclusive = end.starts_with('.');
+        let end = end.strip_prefix('.').unwrap_or(end);
+        if start.is_empty() || end.is_empty() || end.contains("..") {
+            return Err(error("Enter two range bounds separated by .. or ..."));
+        }
+        Ok(Some(Self { start: start.into(), end: end.into(), inclusive }))
+    }
 }
 
 pub(super) enum Query<'a> {
@@ -203,6 +222,7 @@ fn take_clause<'a>(text: &'a str, word: &'a str) -> Result<Option<(Clause<'a>, &
     let Some((op, value)) = Operator::take(&text[1 + end..]) else {
         return Err(error(format!("Invalid operator for {name}")));
     };
+    let quoted = value.starts_with('"');
     let (value, tail) = match op {
         Operator::Missing | Operator::Present => (String::new(), value),
         _ => take_value(value, name)?,
@@ -210,7 +230,8 @@ fn take_clause<'a>(text: &'a str, word: &'a str) -> Result<Option<(Clause<'a>, &
     if tail.starts_with(|c: char| !separator(c)) {
         return Err(error(format!("Expected a space or parenthesis after the {name} condition")));
     }
-    Ok(Some((Clause { field: name, op, value }, tail)))
+    let range = if matches!(op, Operator::Equal) && !quoted { Range::parse(&value)? } else { None };
+    Ok(Some((Clause { field: name, op, value, range }, tail)))
 }
 
 fn separator(c: char) -> bool {
@@ -292,15 +313,57 @@ impl Clause<'_> {
             }
             Operator::Missing | Operator::Present => {}
             _ => {
-                self.comparison_value(defs)?;
+                if self.range.is_some() {
+                    self.range_bounds(defs)?;
+                } else {
+                    self.comparison_value(defs)?;
+                }
             }
         }
         Ok(())
     }
 
     pub fn comparison_value(&self, defs: &[&FieldDef]) -> Result<rusqlite::types::Value> {
+        self.typed_value(
+            &self.value,
+            defs,
+            matches!(self.op, Operator::Greater | Operator::LessEqual),
+        )
+    }
+
+    pub fn range_bounds(
+        &self,
+        defs: &[&FieldDef],
+    ) -> Result<Option<(rusqlite::types::Value, rusqlite::types::Value, bool)>> {
+        use rusqlite::types::Value;
+
+        let (start, end, inclusive) = if let Some(range) = &self.range {
+            (range.start.as_str(), range.end.as_str(), range.inclusive)
+        } else if matches!(self.op, Operator::Equal)
+            && self.comparison_kind(defs)? == Kind::Timestamp
+        {
+            (self.value.as_str(), self.value.as_str(), true)
+        } else {
+            return Ok(None);
+        };
+        let start = self.typed_value(start, defs, false)?;
+        let end = self.typed_value(end, defs, inclusive)?;
+        let reversed = match (&start, &end) {
+            (Value::Integer(a), Value::Integer(b)) => a > b,
+            (Value::Text(a), Value::Text(b)) => a > b,
+            _ => unreachable!("ordered values have one integer or text kind"),
+        };
+        if reversed {
+            return Err(error(format!(
+                "The range start must not exceed its end for {}",
+                self.field
+            )));
+        }
+        Ok(Some((start, end, inclusive)))
+    }
+
+    fn comparison_kind(&self, defs: &[&FieldDef]) -> Result<Kind> {
         let field = self.field;
-        let raw = self.value.as_str();
         let mut comparable = defs.iter().copied().filter(|def| comparable(def));
         let Some(def) = comparable.next() else {
             return Err(error(format!("{field} doesn't support value comparisons")));
@@ -309,7 +372,7 @@ impl Clause<'_> {
         if comparable.any(|def| def.value_kind() != kind) {
             return Err(error(format!("{field} has more than one value kind in these spaces")));
         }
-        if !matches!(self.op, Operator::Equal)
+        if (!matches!(self.op, Operator::Equal) || self.range.is_some())
             && !matches!(
                 kind,
                 Kind::Date | Kind::Decimal | Kind::Integer | Kind::Time | Kind::Timestamp
@@ -317,6 +380,17 @@ impl Clause<'_> {
         {
             return Err(error(format!("{field} doesn't support ordered comparisons")));
         }
+        Ok(kind)
+    }
+
+    fn typed_value(
+        &self,
+        raw: &str,
+        defs: &[&FieldDef],
+        end: bool,
+    ) -> Result<rusqlite::types::Value> {
+        let field = self.field;
+        let kind = self.comparison_kind(defs)?;
         let invalid = || {
             let expected = match kind {
                 Kind::Boolean => "true or false",
@@ -325,7 +399,7 @@ impl Clause<'_> {
                 Kind::Integer => "an integer",
                 Kind::Link => "a note ID",
                 Kind::Time => "a time in HH:MM or HH:MM:SS format",
-                Kind::Timestamp => "an integer timestamp in milliseconds since the Unix epoch",
+                Kind::Timestamp => "a timestamp such as 2026-01-01 or 2026-02-12T05",
                 _ => "a valid field value",
             };
             error(format!("Invalid value {raw:?} for {field}. Use {expected}"))
@@ -334,9 +408,13 @@ impl Clause<'_> {
             Kind::Boolean => i64::from(raw.parse::<bool>().map_err(|_| invalid())?).into(),
             Kind::Date if schema::is_date(raw) => raw.to_owned().into(),
             Kind::Decimal if schema::is_decimal(raw) => decimal_key(raw).into(),
-            Kind::Integer | Kind::Timestamp => raw.parse::<i64>().map_err(|_| invalid())?.into(),
+            Kind::Integer => raw.parse::<i64>().map_err(|_| invalid())?.into(),
             Kind::Link => Id::parse(raw).map_err(|_| invalid())?.to_string().into(),
             Kind::Time if schema::is_time(raw) => time_key(raw).into(),
+            Kind::Timestamp => {
+                let bounds = super::timestamp::parse(raw, field)?;
+                if end { bounds.end.into() } else { bounds.start.into() }
+            }
             Kind::Choice if defs.iter().any(|d| comparable_choice(d, raw)) => raw.to_owned().into(),
             Kind::Text => raw.to_owned().into(),
             _ => return Err(invalid()),

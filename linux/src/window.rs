@@ -24,10 +24,12 @@ use crate::state::State;
 use crate::tables;
 
 mod search_completion;
+mod search_sidebar;
 #[cfg(test)]
 mod tests;
 
 use search_completion::SearchCompletion;
+use search_sidebar::SearchSidebar;
 
 /// How long metadata and search updates wait after typing stops, or while editing live.
 const REPORT_LIVE: Duration = Duration::from_millis(50);
@@ -51,17 +53,18 @@ pub struct Inner {
     state: Arc<State>,
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
-    /// A toggle for each space, which shows or hides its notes.
-    space_toggles: gtk::FlowBox,
+    search_sidebar: SearchSidebar,
+    sidebar_split: adw::OverlaySplitView,
     /// Each space, by pet name, with whether its notes are hidden.
     spaces: RefCell<Vec<(Id, String, bool)>>,
     /// The space the owner last put a note into.
     last_space: Cell<Option<Id>>,
     new_note_menu: gio::Menu,
-    search: gtk::SearchEntry,
+    search: gtk::TextView,
     search_completion: SearchCompletion,
     sort: Cell<Sort>,
     list: gtk::ListBox,
+    results_scroll: gtk::ScrolledWindow,
     rows: RefCell<Vec<(Id, Id)>>,
     /// Counts reloads of the list, so only the latest one fills it.
     generation: Cell<u64>,
@@ -152,7 +155,6 @@ impl Window {
         menu.append(Some("Quit"), Some("app.quit"));
         let menu_button =
             gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build();
-        let sidebar_header = adw::HeaderBar::new();
         let sort_menu = gio::Menu::new();
         sort_menu.append(Some("Relevance"), Some("win.sort-notes::relevance"));
         sort_menu.append(Some("Last modified"), Some("win.sort-notes::modified"));
@@ -163,39 +165,38 @@ impl Window {
             .tooltip_text("Sort notes")
             .build();
         sort.update_property(&[gtk::accessible::Property::Label("Sort notes")]);
-        sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Notes", "")));
-        sidebar_header.pack_start(&new_note);
-        sidebar_header.pack_start(&add_file);
-        sidebar_header.pack_end(&menu_button);
-        sidebar_header.pack_end(&sort);
-        let space_toggles = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .column_spacing(4)
-            .row_spacing(4)
-            .max_children_per_line(8)
-            .margin_start(8)
-            .margin_end(8)
-            .margin_bottom(6)
+        let search = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .monospace(true)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(8)
+            .right_margin(8)
             .build();
-        let search = gtk::SearchEntry::builder()
-            .placeholder_text("Search the spaces that show")
-            .margin_start(8)
-            .margin_end(8)
-            .margin_bottom(6)
-            .build();
+        search.buffer().set_enable_undo(true);
+        search.update_property(&[gtk::accessible::Property::Label("Search definition")]);
+        let search_sidebar = SearchSidebar::new(&search, &sort);
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
         let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        sidebar_box.append(&space_toggles);
-        sidebar_box.append(&search);
-        sidebar_box.append(&gtk::ScrolledWindow::builder().child(&list).vexpand(true).build());
-        let sidebar = adw::ToolbarView::new();
-        sidebar.add_top_bar(&sidebar_header);
-        sidebar.set_content(Some(&sidebar_box));
+        sidebar_box.append(&search_sidebar.widget);
+        let results_scroll = gtk::ScrolledWindow::builder().child(&list).vexpand(true).build();
+        sidebar_box.append(&results_scroll);
 
         let title = adw::WindowTitle::new("", "");
         let content_header = adw::HeaderBar::new();
         content_header.set_title_widget(Some(&title));
+        let sidebar_toggle = gtk::ToggleButton::builder()
+            .icon_name("sidebar-show-symbolic")
+            .active(true)
+            .tooltip_text("Show or hide search sidebar")
+            .build();
+        sidebar_toggle.update_property(&[gtk::accessible::Property::Label("Search sidebar")]);
+        content_header.pack_start(&sidebar_toggle);
+        content_header.pack_start(&new_note);
+        content_header.pack_start(&add_file);
+        content_header.pack_end(&menu_button);
+
         let chat_toggle = gtk::Button::from_icon_name("user-available-symbolic");
         chat_toggle.set_tooltip_text(Some("Show or hide AI chat (Ctrl+Tab)"));
         content_header.pack_end(&chat_toggle);
@@ -273,9 +274,16 @@ impl Window {
         content.add_top_bar(&content_header);
         content.set_content(Some(&stack));
 
-        let split = adw::NavigationSplitView::new();
-        split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Notes")));
-        split.set_content(Some(&adw::NavigationPage::new(&content, "Note")));
+        let split = adw::OverlaySplitView::new();
+        split.set_sidebar(Some(&sidebar_box));
+        split.set_content(Some(&content));
+        split.set_min_sidebar_width(280.0);
+        split.set_max_sidebar_width(400.0);
+        sidebar_toggle
+            .bind_property("active", &split, "show-sidebar")
+            .bidirectional()
+            .sync_create()
+            .build();
         let chat = crate::chat::Chat::new(state.clone());
         let panes = gtk::Paned::new(gtk::Orientation::Horizontal);
         panes.set_start_child(Some(&split));
@@ -296,7 +304,8 @@ impl Window {
             state,
             window,
             toasts,
-            space_toggles,
+            search_sidebar,
+            sidebar_split: split,
             spaces: RefCell::default(),
             last_space: Cell::new(None),
             new_note_menu,
@@ -304,6 +313,7 @@ impl Window {
             search_completion: SearchCompletion::new(),
             sort: Cell::new(Sort::Relevance),
             list,
+            results_scroll,
             rows: RefCell::default(),
             generation: Cell::new(0),
             opening: Cell::new(0),
@@ -332,6 +342,7 @@ impl Window {
         }));
         this.connect(&new_note, &add_file, &delete);
         this.inner().search_completion.connect(&this);
+        this.connect_search_sidebar();
         this.inner().chat.connect(this.clone());
         let w = this.clone();
         chat_toggle.connect_clicked(move |_| w.inner().chat.toggle());
@@ -472,8 +483,6 @@ impl Window {
 
     fn connect(&self, new_note: &adw::SplitButton, add_file: &gtk::Button, delete: &gtk::Button) {
         let w = self.clone();
-        self.inner().search.connect_search_changed(move |_| w.reload_notes());
-        let w = self.clone();
         self.inner().list.connect_row_activated(move |_, row| {
             let picked = w
                 .inner()
@@ -535,6 +544,7 @@ impl Window {
             ("rename-space", Self::rename_space),
             ("settings", |w: &Self| crate::settings::show(w, w.inner().state.clone())),
             ("share-space", |w: &Self| crate::sharing::share(w, w.inner().state.clone())),
+            ("toggle-search", Self::toggle_search),
         ] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
@@ -566,7 +576,7 @@ impl Window {
             };
             action.set_state(value);
             w.inner().sort.set(order);
-            w.reload_notes();
+            w.search_edited();
         });
         actions.add_action(&sort);
         self.inner().window.insert_action_group("win", Some(&actions));
@@ -658,51 +668,27 @@ impl Window {
         spaces.iter().filter(|(_, _, hidden)| !hidden).map(|(id, n, _)| (*id, n.clone())).collect()
     }
 
-    /// Fills the space toggles and the new-note menu, then the note list.
+    /// Refreshes the available spaces, new-note menu, saved searches, and results.
     fn reload_spaces(&self) {
         let w = self.clone();
         let state = self.inner().state.clone();
         glib::spawn_future_local(async move {
             let (spaces, last) =
                 core(async move { (state.space_list().await, state.last_space().await) }).await;
-            let toggles = &w.inner().space_toggles;
-            toggles.remove_all();
             let menu = &w.inner().new_note_menu;
             menu.remove_all();
-            for (id, name, hidden) in &spaces {
-                let toggle = gtk::ToggleButton::builder()
-                    .label(name)
-                    .active(!hidden)
-                    .tooltip_text("Show this space's notes")
-                    .build();
-                let (window, id) = (w.clone(), *id);
-                toggle.connect_toggled(move |toggle| window.show_space(id, toggle.is_active()));
-                toggles.append(&toggle);
+            for (id, name, _) in &spaces {
                 menu.append(
                     Some(&format!("New note in {name}")),
                     Some(&format!("win.new-note-in('{id}')")),
                 );
             }
-            // With one space, there's nothing to choose between.
-            toggles.set_visible(spaces.len() > 1);
             *w.inner().spaces.borrow_mut() = spaces;
             w.inner().last_space.set(last);
+            w.reload_saved_searches();
             w.refresh_search_completion();
             w.reload_notes();
         });
-    }
-
-    /// Shows or hides a space's notes, and remembers the choice on this machine.
-    fn show_space(&self, space: Id, shown: bool) {
-        for entry in self.inner().spaces.borrow_mut().iter_mut().filter(|(id, _, _)| *id == space) {
-            entry.2 = !shown;
-        }
-        let state = self.inner().state.clone();
-        glib::spawn_future_local(async move {
-            let _ = core(async move { state.set_hidden(space, !shown).await }).await;
-        });
-        self.refresh_search_completion();
-        self.reload_notes();
     }
 
     /// Fills the note list with the notes or search results from the spaces that show.
@@ -711,9 +697,9 @@ impl Window {
         self.inner().generation.set(generation);
         let w = self.clone();
         let state = self.inner().state.clone();
-        let query = self.inner().search.text().to_string();
+        let query = self.search_definition().query;
         let sort = self.inner().sort.get();
-        let spaces = self.shown_spaces();
+        let spaces = self.search_spaces();
         let names: HashMap<Id, String> = spaces.iter().cloned().collect();
         let several = spaces.len() > 1;
         glib::spawn_future_local(async move {
@@ -764,6 +750,7 @@ impl Window {
                     }
                     Err(error) => {
                         if w.inner().generation.get() == generation {
+                            w.search_validated(false);
                             w.inner().rows.borrow_mut().clear();
                             w.inner().list.remove_all();
                             let row = adw::ActionRow::builder()
@@ -781,9 +768,16 @@ impl Window {
             if w.inner().generation.get() != generation {
                 return;
             }
+            w.search_validated(true);
             let list = &w.inner().list;
+            let selected = list
+                .selected_row()
+                .and_then(|row| usize::try_from(row.index()).ok())
+                .and_then(|index| w.inner().rows.borrow().get(index).copied());
+            let adjustment = w.inner().results_scroll.vadjustment();
+            let scroll = adjustment.value();
             list.remove_all();
-            for (_, _, title, subtitle) in &rows {
+            for (space, note, title, subtitle) in &rows {
                 let row = adw::ActionRow::builder()
                     .title(title.as_str())
                     .subtitle(subtitle.as_str())
@@ -791,9 +785,13 @@ impl Window {
                     .activatable(true)
                     .build();
                 list.append(&row);
+                if Some((*space, *note)) == selected {
+                    list.select_row(Some(&row));
+                }
             }
             *w.inner().rows.borrow_mut() =
                 rows.into_iter().map(|(space, note, _, _)| (space, note)).collect();
+            glib::idle_add_local_once(move || adjustment.set_value(scroll));
         });
     }
 
@@ -804,6 +802,7 @@ impl Window {
             self.reload_spaces();
             return;
         }
+        self.reload_saved_searches();
         self.refresh_search_completion();
         self.reload_notes();
         self.refresh_link_titles();
