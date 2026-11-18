@@ -106,3 +106,32 @@ in one commit, as decision ZIB0002 describes.
 - **Derivations.** Each platform runs the derivations it has libraries for. The Linux app reads the
   text of PDFs and draws their first page. The Android app may leave PDFs to Linux, and draws
   thumbnails of images.
+
+## Date and timestamp names
+
+New date fields use the suffix `-on`, and new timestamp fields use `-at`. Note metadata uses the
+same convention. The [field inventory](note-fields.md) lists the built-in fields and metadata.
+
+## Identifier names
+
+Current search expressions and the Note metadata control use `id` for a note's identifier. This
+replaces the `note-id` label in the earlier control description. The identifier remains the note's
+key in the space's `notes` map. The project and task parent link field is `parent-id`.
+
+## Timestamp metadata controls
+
+The Note metadata control also shows `created-at` and `updated-at` for every note type, using the
+same local timestamp display as `captured-at`. Refresh `updated-at` after the app records local body
+edits and when updates arrive from another machine.
+
+The popup omits fields named `file`, `text`, or `thumbnail`, including derived values. These fields
+remain stored and keep their schema-defined search behavior. Other populated fields and `id` remain
+visible in name order. Keep values selectable and open the popup with no text selected.
+
+Search expressions and field-name completion recognize `created-at` and `updated-at` as timestamp
+metadata for every type. Resolve them from the note's `meta` map, including the older-key read rules
+in the space document specification, rather than from a same-named entry in `fields`. Their search
+behavior follows the timestamp comparison and range rules in the [search ranges][ranges]
+specification, including partial calendar values, explicit offsets, and exact milliseconds.
+
+[ranges]: search-ranges.md

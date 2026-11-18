@@ -35,9 +35,15 @@ pub struct MachineConfig {
     pub id: Id,
     /// The machine's own name, which it gives itself when it joins a space.
     pub name: String,
+    /// The project sidebar's chosen width on this machine, in logical pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_sidebar_width: Option<u32>,
     /// A relay of the owner's own, instead of n0's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
+    /// The search sidebar's layout on this machine, independent of synced search definitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_sidebar: Option<SidebarLayout>,
     /// Each space the machine holds, with its pet name.
     #[serde(default)]
     pub spaces: BTreeMap<Id, SpaceEntry>,
@@ -67,6 +73,13 @@ pub struct MachineConfig {
     /// differs from the default, so a machine that never chose a page follows the default.
     #[serde(default, skip_serializing_if = "Page::is_default")]
     pub page: Page,
+}
+
+/// The search sidebar's last usable width in logical pixels and whether it shows.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarLayout {
+    pub visible: bool,
+    pub width: u32,
 }
 
 /// The last open note and the space that holds it.
@@ -177,7 +190,9 @@ impl Store {
                     chat_width: None,
                     id: Id::generate(),
                     name: default_name(),
+                    project_sidebar_width: None,
                     relay: None,
+                    search_sidebar: None,
                     spaces: BTreeMap::new(),
                     versions: BTreeMap::new(),
                     last_synced: BTreeMap::new(),
@@ -316,6 +331,24 @@ impl Store {
         self.save()
     }
 
+    /// Records the search sidebar's width and visibility on this machine.
+    pub fn set_search_sidebar(&mut self, layout: SidebarLayout) -> Result<()> {
+        if self.config.search_sidebar == Some(layout) {
+            return Ok(());
+        }
+        self.config.search_sidebar = Some(layout);
+        self.save()
+    }
+
+    /// Records the width chosen for project details on this machine.
+    pub fn set_project_sidebar_width(&mut self, width: u32) -> Result<()> {
+        if self.config.project_sidebar_width == Some(width) {
+            return Ok(());
+        }
+        self.config.project_sidebar_width = Some(width);
+        self.save()
+    }
+
     /// Records a successfully opened note without changing the destination for new notes.
     pub fn set_last_note(&mut self, space: Id, note: Id) -> Result<()> {
         let last = Some(LastNote { note, space });
@@ -400,6 +433,35 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::schema;
+
+    #[test]
+    fn project_sidebar_width_defaults_to_half_and_preserves_the_machine_choice() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(root.path());
+        let mut store = Store::open(&dirs, Policy::All).unwrap();
+        assert_eq!(store.config.project_sidebar_width, None);
+        store.set_project_sidebar_width(420).unwrap();
+        let reopened = Store::open(&dirs, Policy::All).unwrap();
+        assert_eq!(reopened.config.project_sidebar_width, Some(420));
+        let old = format!(r#"{{"id":"{}","name":"old"}}"#, store.config.id);
+        let old: MachineConfig = serde_json::from_str(&old).unwrap();
+        assert_eq!(old.project_sidebar_width, None);
+    }
+
+    #[test]
+    fn search_sidebar_layout_defaults_to_none_and_survives_store_reopening() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(root.path());
+        let mut store = Store::open(&dirs, Policy::All).unwrap();
+        assert_eq!(store.config.search_sidebar, None);
+        let layout = SidebarLayout { visible: false, width: 460 };
+        store.set_search_sidebar(layout).unwrap();
+        let reopened = Store::open(&dirs, Policy::All).unwrap();
+        assert_eq!(reopened.config.search_sidebar, Some(layout));
+        let old = format!(r#"{{"id":"{}","name":"old"}}"#, store.config.id);
+        let old: MachineConfig = serde_json::from_str(&old).unwrap();
+        assert_eq!(old.search_sidebar, None);
+    }
 
     #[test]
     fn last_open_note_defaults_to_none_and_survives_reopening_the_machine_store() {

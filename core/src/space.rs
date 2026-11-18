@@ -26,7 +26,7 @@ pub(crate) const SETTINGS: &str = "settings";
 const FILES: &str = "files";
 const MACHINES: &str = "machines";
 
-/// While an editor has a note open, how long a writer waits before it sets `updated` again.
+/// While an editor has a note open, how long a writer waits before it sets `updated-at` again.
 const UPDATED_INTERVAL: Timestamp = 60_000;
 
 /// A blob's BLAKE3 hash.
@@ -91,9 +91,9 @@ impl Policy {
 /// A note's attributes from its `meta` map.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NoteMeta {
-    pub created: Timestamp,
+    pub created_at: Timestamp,
     pub created_by: Option<Id>,
-    pub updated: Timestamp,
+    pub updated_at: Timestamp,
     pub updated_by: Option<Id>,
 }
 
@@ -121,7 +121,7 @@ impl Note {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tombstone {
     pub title: String,
-    pub deleted: Timestamp,
+    pub deleted_at: Timestamp,
     pub deleted_by: Option<Id>,
 }
 
@@ -146,7 +146,7 @@ pub struct Machine {
 /// A note that an editor has open.
 #[derive(Clone, Copy, Debug, Default)]
 struct OpenNote {
-    /// When this process last set `updated`.
+    /// When this process last set `updated-at`.
     written: Option<Timestamp>,
     /// Whether edits came after that, which closing the note records.
     pending: bool,
@@ -160,7 +160,7 @@ pub struct Space {
     joining: Option<Id>,
     /// The separate writer that stages local imports before saving them.
     import_peer: Option<u64>,
-    /// The notes an editor has open, with when this process last set each one's `updated`.
+    /// The notes an editor has open, with when this process last set each one's `updated-at`.
     open: HashMap<Id, OpenNote>,
 }
 
@@ -320,9 +320,9 @@ impl Space {
         let meta = note.insert_container("meta", LoroMap::new())?;
         let now = time::now();
         let machine = self.machine.to_string();
-        meta.insert("created", now)?;
+        meta.insert("created-at", now)?;
         meta.insert("created-by", machine.as_str())?;
-        meta.insert("updated", now)?;
+        meta.insert("updated-at", now)?;
         meta.insert("updated-by", machine.as_str())?;
         note.insert_container("settings", LoroMap::new())?;
         Ok(())
@@ -360,7 +360,7 @@ impl Space {
         let LoroValue::Map(meta) = value.get("meta").cloned().unwrap_or(LoroValue::Null) else {
             return Err(Error::Space(format!("note {id} has no meta")));
         };
-        let number = |key: &str| match meta.get(key) {
+        let number = |key: &str, legacy: &str| match meta.get(key).or_else(|| meta.get(legacy)) {
             Some(LoroValue::I64(n)) => *n,
             _ => 0,
         };
@@ -380,9 +380,9 @@ impl Space {
             body: text("body"),
             fields,
             meta: NoteMeta {
-                created: number("created"),
+                created_at: number("created-at", "created"),
                 created_by: machine("created-by"),
-                updated: number("updated"),
+                updated_at: number("updated-at", "updated"),
                 updated_by: machine("updated-by"),
             },
         })
@@ -423,6 +423,7 @@ impl Space {
 
     /// Sets a field's value, in one commit.
     pub fn set_field(&mut self, id: Id, name: &str, value: &Value) -> Result<()> {
+        crate::work::validate(self, id, name, Some(value))?;
         if !schema::is_name(name) {
             return Err(Error::invalid("field name", name));
         }
@@ -457,12 +458,12 @@ impl Space {
         Ok(())
     }
 
-    /// Records that an editor opened a note, so `updated` changes at most once a minute.
+    /// Records that an editor opened a note, so `updated-at` changes at most once a minute.
     pub fn open_note(&mut self, id: Id) {
         self.open.entry(id).or_default();
     }
 
-    /// Records that an editor closed a note, and sets `updated` if it held unrecorded edits.
+    /// Records that an editor closed a note, and sets `updated-at` if it held unrecorded edits.
     pub fn close_note(&mut self, id: Id) -> Result<()> {
         if self.open.remove(&id).is_some_and(|open| open.pending) {
             self.write_updated(id)?;
@@ -471,7 +472,7 @@ impl Space {
         Ok(())
     }
 
-    /// Sets `updated` and `updated-by`, but while an editor has the note open, at most once a
+    /// Sets `updated-at` and `updated-by`, but while an editor has the note open, at most once a
     /// minute.
     /// Records that an editor changed a note's body, as `insert_text` does, and commits.
     pub fn note_edited(&mut self, id: Id) -> Result<()> {
@@ -495,7 +496,7 @@ impl Space {
     fn write_updated(&self, id: Id) -> Result<()> {
         let now = time::now();
         let meta = child_map(&self.note_map(id)?, "meta")?;
-        meta.insert("updated", now)?;
+        meta.insert("updated-at", now)?;
         meta.insert("updated-by", self.machine.to_string())?;
         Ok(())
     }
@@ -513,19 +514,31 @@ impl Space {
         self.doc.get_cursor_pos(&cursor).ok().map(|found| found.current.pos)
     }
 
-    /// Deletes a note for good, leaving a tombstone with its title, in one commit.
-    pub fn delete_note(&mut self, id: Id) -> Result<()> {
+    /// Deletes a note and its work descendants in one commit, leaving a tombstone for each.
+    /// Returns every deleted identifier, including the requested note.
+    pub fn delete_note(&mut self, id: Id) -> Result<Vec<Id>> {
         let note = self.note(id)?;
-        let title = self.title_of(&note.body);
-        let tombstone =
-            self.doc.get_map(TOMBSTONES).insert_container(&id.to_string(), LoroMap::new())?;
-        tombstone.insert("title", title.markdown)?;
-        tombstone.insert("deleted", time::now())?;
-        tombstone.insert("deleted-by", self.machine.to_string())?;
-        self.notes().delete(&id.to_string())?;
-        self.open.remove(&id);
+        let mut deleted = vec![(id, self.title_of(&note.body).markdown)];
+        if crate::work::is_work(&note.type_name) {
+            let tree = crate::work::Tree::read(self);
+            for child in
+                tree.items.keys().copied().filter(|child| tree.ancestors(*child).contains(&id))
+            {
+                deleted.push((child, self.title(child)?.markdown));
+            }
+        }
+        let now = time::now();
+        for (id, title) in &deleted {
+            let tombstone =
+                self.doc.get_map(TOMBSTONES).insert_container(&id.to_string(), LoroMap::new())?;
+            tombstone.insert("title", title.as_str())?;
+            tombstone.insert("deleted-at", now)?;
+            tombstone.insert("deleted-by", self.machine.to_string())?;
+            self.notes().delete(&id.to_string())?;
+            self.open.remove(id);
+        }
         commit(&self.doc);
-        Ok(())
+        Ok(deleted.into_iter().map(|(id, _)| id).collect())
     }
 
     /// The tombstone of a note deleted for good.
@@ -540,7 +553,7 @@ impl Space {
                 Some(LoroValue::String(s)) => s.to_string(),
                 _ => String::new(),
             },
-            deleted: match map.get("deleted") {
+            deleted_at: match map.get("deleted-at").or_else(|| map.get("deleted")) {
                 Some(LoroValue::I64(n)) => *n,
                 _ => 0,
             },
@@ -851,6 +864,37 @@ pub(crate) fn commit(doc: &LoroDoc) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn timestamp_metadata_uses_at_suffixes_and_reads_legacy_names() {
+        let mut space = Space::create(Id::generate()).unwrap();
+        let id = space.create_note(schema::NOTE, "A note").unwrap();
+        let meta = child_map(&space.note_map(id).unwrap(), "meta").unwrap();
+        assert!(meta.get("created-at").is_some());
+        assert!(meta.get("updated-at").is_some());
+        assert!(meta.get("created").is_none());
+        assert!(meta.get("updated").is_none());
+        meta.delete("created-at").unwrap();
+        meta.delete("updated-at").unwrap();
+        meta.insert("created", 123_i64).unwrap();
+        meta.insert("updated", 456_i64).unwrap();
+        let note = space.note(id).unwrap();
+        assert_eq!(note.meta.created_at, 123);
+        assert_eq!(note.meta.updated_at, 456);
+        meta.insert("created-at", 789_i64).unwrap();
+        assert_eq!(space.note(id).unwrap().meta.created_at, 789);
+        space.set_body(id, "Edited").unwrap();
+        assert!(space.note(id).unwrap().meta.updated_at > 456);
+        assert_eq!(meta.get("updated").unwrap().get_deep_value(), LoroValue::I64(456));
+        space.delete_note(id).unwrap();
+        let tombstone = child_map(&space.doc.get_map(TOMBSTONES), &id.to_string()).unwrap();
+        assert!(tombstone.get("deleted-at").is_some());
+        assert!(tombstone.get("deleted").is_none());
+        assert!(space.tombstone(id).unwrap().deleted_at > 0);
+        tombstone.delete("deleted-at").unwrap();
+        tombstone.insert("deleted", 999_i64).unwrap();
+        assert_eq!(space.tombstone(id).unwrap().deleted_at, 999);
+    }
+
     fn space() -> Space {
         Space::create(Id::generate()).unwrap()
     }
@@ -937,9 +981,9 @@ mod tests {
         let id = space.create_note(schema::NOTE, "a").unwrap();
         space.open_note(id);
         space.insert_text(id, 1, "b").unwrap();
-        let first = space.note(id).unwrap().meta.updated;
+        let first = space.note(id).unwrap().meta.updated_at;
         space.insert_text(id, 2, "c").unwrap();
-        assert_eq!(space.note(id).unwrap().meta.updated, first);
+        assert_eq!(space.note(id).unwrap().meta.updated_at, first);
     }
 
     #[test]

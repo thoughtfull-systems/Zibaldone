@@ -266,14 +266,14 @@ mod tests {
         let search = gtk::TextView::new();
         let buffer = search.buffer();
         buffer.set_enable_undo(true);
-        let before = "apple OR (\n@note-draft=123)";
+        let before = "apple OR (\n@i-draft=123)";
         buffer.set_text(before);
-        buffer.place_cursor(&buffer.iter_at_offset(16));
+        buffer.place_cursor(&buffer.iter_at_offset(13));
         let chooser = SearchCompletion::new();
-        chooser.set_names(&["note-id".into()]);
+        chooser.set_names(&["id".into()]);
         chooser.pick(&search, &chooser.list.row_at_index(0).unwrap());
         let text = || buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
-        assert_eq!(text(), "apple OR (\n@note-id=123)");
+        assert_eq!(text(), "apple OR (\n@id=123)");
         buffer.undo();
         assert_eq!(text(), before);
     }
@@ -290,8 +290,8 @@ mod tests {
             let (_, height, _, _) = chooser.scroll.measure(gtk::Orientation::Vertical, width);
             (width, height)
         };
-        let (wide, tall) = size(&["note-id", "longer-custom-field-name", "published-on"]);
-        let (narrow, short) = size(&["note-id"]);
+        let (wide, tall) = size(&["id", "longer-custom-field-name", "published-on"]);
+        let (narrow, short) = size(&["id"]);
         assert!(wide > narrow && tall > short);
         let label = chooser.list.row_at_index(0).unwrap().child().unwrap();
         let (label_width, _, _, _) = label.measure(gtk::Orientation::Horizontal, -1);

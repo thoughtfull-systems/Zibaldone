@@ -115,6 +115,32 @@ instants the same across machines.
 The desktop search box and saved-search definitions use this syntax. The command-line search retains
 its existing word search.
 
+## Relative calendar dates
+
+Date fields also accept `today` in comparisons and either range bound. Resolve it to the machine's
+current local calendar date each time the query runs. Saved searches keep the symbolic text.
+
+## Relative date offsets
+
+A relative calendar date also accepts one signed offset from today, with an optional `today` prefix.
+Write a plus or minus sign, a count using one or more digits `0` through `9`, and a lowercase unit.
+Zero and leading zeros are valid. The unit `d` means calendar days, and `w` means seven calendar
+days. A plus sign advances the date, and a minus sign moves it back. For example, `+6d` and
+`today+6d` both mean six calendar days after today. `-1w` and `today-1w` both mean seven calendar
+days before today.
+
+Offsets work in date comparisons and either range bound. For example, `@scheduled-on<=today+3d`
+includes scheduled dates through three days from today, and `@due-on=-1w...today+2w` includes the
+dates from one week ago through two weeks from today. Saved searches retain the expression and
+resolve it each time they run. Daylight saving transitions don't change the number of calendar days.
+
+An offset doesn't accept spaces, chained offsets, fractional counts, or other units. Absolute dates
+and timestamp fields don't accept these offsets. Reject malformed offsets and results outside
+`0000-01-01` through `9999-12-31` as invalid comparison values.
+
+The only relative-date keyword is lowercase `today`. Reject `tomorrow` and `yesterday`, including
+when they have offsets. Use `+1d` and `-1d` for the adjacent calendar dates.
+
 [decision]: ../decisions/ZIB0023-search-ranges.md
 [saved]: saved-searches.md
 [timestamps]: ../decisions/ZIB0024-search-timestamps.md

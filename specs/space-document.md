@@ -213,4 +213,31 @@ The optional `saved-searches` root map holds the definitions in the
 
 No platform differs.
 
+## Work order
+
+The optional `work-order` root container is a Loro movable list. It holds work-item identifiers in
+the order that the [projects and tasks specification](projects-and-tasks.md) defines. Parent links
+determine membership; this sequence supplies only presentation order. Preserve the container when
+writing other parts of the space.
+
+## Timestamp metadata names
+
+Current writers use `created-at` and `updated-at` in a note's `meta` map, and `deleted-at` in a
+tombstone. These values remain integer milliseconds since the Unix epoch. The machine identifier
+keys remain `created-by`, `updated-by`, and `deleted-by`. Creating a note sets both timestamp keys;
+editing it updates only `updated-at`, with the existing throttling rules.
+
+For each timestamp, readers prefer the suffixed key and fall back to the earlier `created`,
+`updated`, or `deleted` key when the suffixed key is absent. Readers preserve older keys in existing
+documents. New notes and tombstones use only the suffixed timestamp keys. The
+[field inventory](note-fields.md) lists the canonical names.
+
+## Work subtree deletion
+
+Deleting a project or task removes its whole derived subtree and writes a tombstone for each note in
+one commit. The [projects and tasks specification](projects-and-tasks.md#subtree-deletion) defines
+the affected set. Record the same `deleted-at` and `deleted-by` values on every tombstone in that
+operation. Keep existing work-order entries and unrelated notes. Sync imports the written removals
+and tombstones without walking the receiving replica's hierarchy again.
+
 [blake3]: https://github.com/BLAKE3-team/BLAKE3

@@ -106,3 +106,19 @@ describes video imports.
 
 No platform differs in the types it defines. Which derivations each platform runs is in the
 [schemas specification](schemas.md#platforms).
+
+## `project` and `task`
+
+Projects hold design notes and organize tasks and child projects. Tasks hold their own markdown and
+can belong to a project or another task, or stand alone. Their types never change.
+
+Both types define these optional fields with search mode `filter`:
+
+- **`due-on`:** date. An explicit due date that overrides inheritance.
+- **`parent-id`:** link. A project parent for a project, or a project or task parent for a task.
+- **`scheduled-on`:** date. An explicit availability date that overrides inheritance.
+
+The `task` type also defines **`completed-on`**, a date with search mode `filter`. A valid date
+means completed; an absent or invalid value means incomplete. Neither type has a preview. The
+[projects and tasks specification](projects-and-tasks.md) defines parent validation, inheritance,
+completion, and their search behavior.

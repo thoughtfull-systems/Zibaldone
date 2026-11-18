@@ -40,6 +40,12 @@ pub(super) struct SearchSidebar {
 
 impl SearchSidebar {
     pub fn new(search: &gtk::TextView, sort: &gtk::MenuButton) -> Self {
+        let literal =
+            gtk::TextTag::builder().name("literal-search-query").insert_hyphens(false).build();
+        search.buffer().tag_table().add(&literal);
+        search.buffer().connect_changed(move |buffer| {
+            buffer.apply_tag(&literal, &buffer.start_iter(), &buffer.end_iter());
+        });
         let picker = gtk::DropDown::from_strings(&["New search…"]);
         picker.update_property(&[gtk::accessible::Property::Label("Saved search")]);
         let scope = gtk::DropDown::from_strings(&["All spaces"]);

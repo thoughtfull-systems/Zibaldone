@@ -23,12 +23,12 @@ pub const MATCH_START: char = '\u{2}';
 /// Marks the end of a match in a snippet.
 pub const MATCH_END: char = '\u{3}';
 
-const NOTE_ID_FIELD: &str = "note-id";
+const ID_FIELD: &str = "id";
 const TYPE_FIELD: &str = "type";
 
 /// Searchable field names and built-in metadata names for the supplied spaces.
 pub fn field_names<'a>(indexes: impl IntoIterator<Item = &'a Index>) -> Vec<String> {
-    let mut names = BTreeSet::from([NOTE_ID_FIELD, TYPE_FIELD]);
+    let mut names = BTreeSet::from(["created-at", ID_FIELD, "project", TYPE_FIELD, "updated-at"]);
     for index in indexes {
         for ty in &index.types {
             names.extend(ty.fields.iter().filter_map(|(name, def)| {
@@ -125,8 +125,9 @@ impl Index {
             .keys()
             .filter_map(|name| schema::read_type(space.doc(), &name))
             .collect();
+        let tree = crate::work::Tree::read(space);
         for id in space.note_ids() {
-            self.update_note(space, id, file_text)?;
+            self.update_note_rows(space, id, file_text, &tree)?;
         }
         Ok(())
     }
@@ -137,6 +138,57 @@ impl Index {
         space: &Space,
         id: Id,
         file_text: &dyn Fn(FileHash) -> Option<String>,
+    ) -> Result<()> {
+        let previous: Option<String> = self
+            .db
+            .query_row("SELECT type FROM notes WHERE id = ?1", [id.to_string()], |row| row.get(0))
+            .optional()?;
+        let current = space.note(id).ok().map(|note| note.type_name);
+        if !previous.as_deref().is_some_and(crate::work::is_work)
+            && !current.as_deref().is_some_and(crate::work::is_work)
+        {
+            return self.update_note_rows(space, id, file_text, &crate::work::Tree::default());
+        }
+        let tree = crate::work::Tree::read(space);
+        let before = self.work_signature(id)?;
+        self.update_note_rows(space, id, file_text, &tree)?;
+        if previous.is_some() && current.is_some() && before == self.work_signature(id)? {
+            return Ok(());
+        }
+        // Include indexed work items: deleted descendants no longer appear in the current tree.
+        let previous = self
+            .db
+            .prepare("SELECT id FROM notes WHERE type IN (?1, ?2)")?
+            .query_map([schema::PROJECT, schema::TASK], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut affected: BTreeSet<_> = tree.items.keys().copied().collect();
+        for key in previous {
+            affected.insert(Id::parse(&key)?);
+        }
+        // Parent edits, moves, and deletions can change any descendant's effective fields.
+        for child in affected.into_iter().filter(|child| *child != id) {
+            self.update_note_rows(space, child, file_text, &tree)?;
+        }
+        Ok(())
+    }
+
+    fn work_signature(&self, id: Id) -> Result<Vec<(String, String)>> {
+        let mut statement = self.db.prepare(
+            "SELECT field, text FROM filters WHERE note = ?1 AND \
+            field IN ('due-on', 'parent-id', 'project', 'scheduled-on') AND text IS NOT NULL \
+            ORDER BY field, text",
+        )?;
+        Ok(statement
+            .query_map([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn update_note_rows(
+        &mut self,
+        space: &Space,
+        id: Id,
+        file_text: &dyn Fn(FileHash) -> Option<String>,
+        tree: &crate::work::Tree,
     ) -> Result<()> {
         let key = id.to_string();
         let tx = self.db.transaction()?;
@@ -156,11 +208,23 @@ impl Index {
             let mut texts = vec![note.type_name.clone()];
             if let Some(ty) = schema::read_type(space.doc(), &note.type_name) {
                 for (name, def) in &ty.fields {
-                    if def.search == SearchMode::None {
+                    if def.search == SearchMode::None
+                        || matches!(name.as_str(), "created-at" | "updated-at")
+                    {
                         continue;
                     }
-                    let Some(value) = note.fields.get(name).and_then(|v| Value::from_loro(def, v))
-                    else {
+                    let value = if let Some(item) = tree.items.get(&id) {
+                        match name.as_str() {
+                            "due-on" | "scheduled-on" => {
+                                tree.date(id, name).map(|d| Value::Date(d.value))
+                            }
+                            "parent-id" => item.parent.map(Value::Link),
+                            _ => note.fields.get(name).and_then(|v| Value::from_loro(def, v)),
+                        }
+                    } else {
+                        note.fields.get(name).and_then(|v| Value::from_loro(def, v))
+                    };
+                    let Some(value) = value else {
                         continue;
                     };
                     let mut content = Vec::new();
@@ -187,9 +251,20 @@ impl Index {
                     }
                 }
             }
+            for (field, timestamp) in
+                [("created-at", note.meta.created_at), ("updated-at", note.meta.updated_at)]
+            {
+                tx.execute(INSERT_FILTER, params![key, field, Option::<String>::None, timestamp])?;
+            }
+            for project in tree.projects(id) {
+                tx.execute(
+                    INSERT_FILTER,
+                    params![key, "project", project.to_string(), Option::<i64>::None],
+                )?;
+            }
             tx.execute(
                 "INSERT INTO notes (id, type, title, updated) VALUES (?1, ?2, ?3, ?4)",
-                params![key, note.type_name, title, note.meta.updated],
+                params![key, note.type_name, title, note.meta.updated_at],
             )?;
             tx.execute(
                 "INSERT INTO text (id, title, body, fields) VALUES (?1, ?2, ?3, ?4)",

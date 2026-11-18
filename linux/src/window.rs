@@ -23,12 +23,17 @@ use crate::editor_widget::{EditorWidget, PasteTarget, SpellingAction};
 use crate::state::State;
 use crate::tables;
 
+mod project_pane;
 mod search_completion;
+mod search_pane;
 mod search_sidebar;
+mod tasks;
 #[cfg(test)]
 mod tests;
 
+use project_pane::ProjectPane;
 use search_completion::SearchCompletion;
+use search_pane::SearchPane;
 use search_sidebar::SearchSidebar;
 
 /// How long metadata and search updates wait after typing stops, or while editing live.
@@ -54,7 +59,7 @@ pub struct Inner {
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     search_sidebar: SearchSidebar,
-    sidebar_split: adw::OverlaySplitView,
+    sidebar_split: SearchPane,
     /// Each space, by pet name, with whether its notes are hidden.
     spaces: RefCell<Vec<(Id, String, bool)>>,
     /// The space the owner last put a note into.
@@ -88,6 +93,8 @@ pub struct Inner {
     /// Set while a lookup that also restores the open note's backlinks height is under way.
     backlinks_restoring: Cell<bool>,
     editor_scroll: gtk::ScrolledWindow,
+    editor_content: gtk::Box,
+    project_pane: ProjectPane,
     /// The notes opened before the open one, the latest last, and those to go forward to again.
     back: RefCell<Vec<(Id, Id)>>,
     forward: RefCell<Vec<(Id, Id)>>,
@@ -100,6 +107,7 @@ pub struct Inner {
     focus_body: Cell<bool>,
     /// The note editor, backed directly by the space's Loro text.
     widget: EditorWidget,
+    work: tasks::WorkPanel,
     /// The metadata and search update after a pause in typing.
     body_timer: RefCell<Option<glib::SourceId>>,
 }
@@ -156,8 +164,9 @@ impl Window {
         let menu_button =
             gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build();
         let sort_menu = gio::Menu::new();
-        sort_menu.append(Some("Relevance"), Some("win.sort-notes::relevance"));
+        sort_menu.append(Some("Due date"), Some("win.sort-notes::due"));
         sort_menu.append(Some("Last modified"), Some("win.sort-notes::modified"));
+        sort_menu.append(Some("Relevance"), Some("win.sort-notes::relevance"));
         sort_menu.append(Some("Title"), Some("win.sort-notes::title"));
         let sort = gtk::MenuButton::builder()
             .icon_name("view-sort-ascending-symbolic")
@@ -234,8 +243,13 @@ impl Window {
         content_header.pack_end(&print);
 
         let widget = EditorWidget::default();
+        let work = tasks::WorkPanel::new();
+        let editor_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        editor_content.append(&work.header);
+        editor_content.append(&widget);
+        editor_content.append(&work.widget);
         let editor_scroll = gtk::ScrolledWindow::builder()
-            .child(&widget)
+            .child(&editor_content)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
@@ -262,6 +276,7 @@ impl Window {
         );
         backlinks_panel.set_visible(false);
         let backlinks = BottomPane::new(&editor_scroll, &backlinks_panel);
+        let project_pane = ProjectPane::new(&backlinks.widget);
         let empty = adw::StatusPage::builder()
             .icon_name("accessories-text-editor-symbolic")
             .title(state.channel.display_name())
@@ -269,24 +284,15 @@ impl Window {
             .build();
         let stack = gtk::Stack::new();
         stack.add_named(&empty, Some("empty"));
-        stack.add_named(&backlinks.widget, Some("editor"));
+        stack.add_named(&project_pane.widget, Some("editor"));
         let content = adw::ToolbarView::new();
         content.add_top_bar(&content_header);
         content.set_content(Some(&stack));
 
-        let split = adw::OverlaySplitView::new();
-        split.set_sidebar(Some(&sidebar_box));
-        split.set_content(Some(&content));
-        split.set_min_sidebar_width(280.0);
-        split.set_max_sidebar_width(400.0);
-        sidebar_toggle
-            .bind_property("active", &split, "show-sidebar")
-            .bidirectional()
-            .sync_create()
-            .build();
+        let split = SearchPane::new(&sidebar_box, &content, &sidebar_toggle);
         let chat = crate::chat::Chat::new(state.clone());
         let panes = gtk::Paned::new(gtk::Orientation::Horizontal);
-        panes.set_start_child(Some(&split));
+        panes.set_start_child(Some(&split.widget));
         panes.set_end_child(Some(chat.widget()));
         panes.set_resize_end_child(false);
         panes.set_shrink_end_child(false);
@@ -329,6 +335,8 @@ impl Window {
             backlinks_generation: Cell::new(0),
             backlinks_restoring: Cell::new(false),
             editor_scroll,
+            editor_content,
+            project_pane,
             back: RefCell::default(),
             forward: RefCell::default(),
             back_button,
@@ -338,11 +346,15 @@ impl Window {
             editor: RefCell::default(),
             focus_body: Cell::new(false),
             widget,
+            work,
             body_timer: RefCell::default(),
         }));
         this.connect(&new_note, &add_file, &delete);
         this.inner().search_completion.connect(&this);
         this.connect_search_sidebar();
+        this.connect_search_pane();
+        this.connect_project_pane();
+        this.connect_work();
         this.inner().chat.connect(this.clone());
         let w = this.clone();
         chat_toggle.connect_clicked(move |_| w.inner().chat.toggle());
@@ -528,6 +540,8 @@ impl Window {
         self.inner().backlinks.connect_resized(move |height| w.save_backlinks_height(height));
         let w = self.clone();
         self.inner().window.connect_close_request(move |window| {
+            w.save_search_pane();
+            w.save_project_pane();
             w.close_editor();
             window.set_visible(false);
             glib::Propagation::Stop
@@ -538,7 +552,9 @@ impl Window {
             ("edit-space-dictionary", |w: &Self| w.spelling_dictionary(None)),
             ("move-note", Self::move_note),
             ("move-notes", |w: &Self| crate::sharing::move_all(w, w.inner().state.clone())),
+            ("new-project", |w: &Self| w.new_work(zib_core::schema::PROJECT, None)),
             ("new-space", Self::new_space),
+            ("new-task", |w: &Self| w.new_work(zib_core::schema::TASK, None)),
             ("print", |w: &Self| w.print(false)),
             ("print-linked", |w: &Self| w.print(true)),
             ("rename-space", Self::rename_space),
@@ -560,6 +576,12 @@ impl Window {
             }
         });
         actions.add_action(&new_note_in);
+        self.connect_sort(&actions);
+        self.inner().window.insert_action_group("win", Some(&actions));
+        self.connect_history();
+    }
+
+    fn connect_sort(&self, actions: &gio::SimpleActionGroup) {
         let sort = gio::SimpleAction::new_stateful(
             "sort-notes",
             Some(glib::VariantTy::STRING),
@@ -569,6 +591,7 @@ impl Window {
         sort.connect_change_state(move |action, value| {
             let Some(value) = value else { return };
             let order = match value.str() {
+                Some("due") => Sort::Due,
                 Some("modified") => Sort::Modified,
                 Some("relevance") => Sort::Relevance,
                 Some("title") => Sort::Title,
@@ -579,8 +602,6 @@ impl Window {
             w.search_edited();
         });
         actions.add_action(&sort);
-        self.inner().window.insert_action_group("win", Some(&actions));
-        self.connect_history();
     }
 
     /// Lets Alt+Left and Alt+Right, and a mouse's back and forward buttons, walk the history.
@@ -677,6 +698,8 @@ impl Window {
                 core(async move { (state.space_list().await, state.last_space().await) }).await;
             let menu = &w.inner().new_note_menu;
             menu.remove_all();
+            menu.append(Some("New project…"), Some("win.new-project"));
+            menu.append(Some("New standalone task…"), Some("win.new-task"));
             for (id, name, _) in &spaces {
                 menu.append(
                     Some(&format!("New note in {name}")),
@@ -705,7 +728,10 @@ impl Window {
         glib::spawn_future_local(async move {
             // Each row: its space, its note, its title, and its subtitle, as Pango markup.
             let mut rows: Vec<(Id, Id, String, String)> = Vec::new();
-            if query.trim().is_empty() {
+            let work_state = state.clone();
+            let work_spaces: Vec<_> = spaces.iter().map(|(id, _)| *id).collect();
+
+            if query.trim().is_empty() && sort != Sort::Due {
                 let notes = core(async move {
                     let mut all = Vec::new();
                     for (space, _) in spaces {
@@ -750,20 +776,13 @@ impl Window {
                     }
                     Err(error) => {
                         if w.inner().generation.get() == generation {
-                            w.search_validated(false);
-                            w.inner().rows.borrow_mut().clear();
-                            w.inner().list.remove_all();
-                            let row = adw::ActionRow::builder()
-                                .title("Couldn't search")
-                                .subtitle(escape(&error.to_string()))
-                                .selectable(false)
-                                .build();
-                            w.inner().list.append(&row);
+                            w.search_error(&error);
                         }
                         return;
                     }
                 }
             }
+            let styles = Self::work_result_context(work_state, work_spaces, &mut rows).await;
             // A later reload started while this one waited, and fills the list instead.
             if w.inner().generation.get() != generation {
                 return;
@@ -784,6 +803,9 @@ impl Window {
                     .subtitle_lines(2)
                     .activatable(true)
                     .build();
+                if let Some(class) = styles.get(&(*space, *note)) {
+                    row.add_css_class(class);
+                }
                 list.append(&row);
                 if Some((*space, *note)) == selected {
                     list.select_row(Some(&row));
@@ -793,6 +815,60 @@ impl Window {
                 rows.into_iter().map(|(space, note, _, _)| (space, note)).collect();
             glib::idle_add_local_once(move || adjustment.set_value(scroll));
         });
+    }
+
+    fn search_error(&self, error: &zib_core::Error) {
+        self.search_validated(false);
+        self.inner().rows.borrow_mut().clear();
+        self.inner().list.remove_all();
+        let row = adw::ActionRow::builder()
+            .title("Couldn't search")
+            .subtitle(escape(&error.to_string()))
+            .selectable(false)
+            .build();
+        self.inner().list.append(&row);
+    }
+
+    async fn work_result_context(
+        state: Arc<State>,
+        spaces: Vec<Id>,
+        rows: &mut [(Id, Id, String, String)],
+    ) -> HashMap<(Id, Id), &'static str> {
+        let trees = core(async move {
+            let mut trees = HashMap::new();
+            for space in spaces {
+                if let Ok(tree) = state.work_tree(space).await {
+                    trees.insert(space, tree);
+                }
+            }
+            trees
+        })
+        .await;
+        let mut styles = HashMap::new();
+        for (space, note, _, subtitle) in rows {
+            let Some(tree) = trees.get(space) else { continue };
+            let Some(item) = tree.items.get(note) else { continue };
+            let mut path = tree.path(*note);
+            if path.is_empty() {
+                path = if item.note.type_name == zib_core::schema::TASK {
+                    "Standalone task".into()
+                } else {
+                    "Project".into()
+                };
+            }
+            let due = tree.date(*note, "due-on");
+            let (label, class) = zib_core::work::urgency(due.as_ref().map(|d| d.value.as_str()));
+            let label = if item.completed() { "Completed".into() } else { label };
+            let context = escape(&format!("{path} · {label}"));
+            *subtitle =
+                if subtitle.is_empty() { context } else { format!("{context}\n{subtitle}") };
+            if item.completed() {
+                styles.insert((*space, *note), "dim-label");
+            } else if matches!(class, "error" | "warning") {
+                styles.insert((*space, *note), class);
+            }
+        }
+        styles
     }
 
     /// Something in a space changed through sync or a derivation.
@@ -813,6 +889,7 @@ impl Window {
         if open.is_some_and(|(s, _)| s == space) {
             self.refresh_open();
             self.refresh_note_metadata();
+            self.refresh_work();
         }
     }
 
@@ -861,31 +938,49 @@ impl Window {
         else {
             return;
         };
+        self.delete_note_at(space, note);
+    }
+
+    fn delete_note_at(&self, space: Id, note: Id) {
         let w = self.clone();
         let state = self.inner().state.clone();
         glib::spawn_future_local(async move {
-            let dialog = adw::AlertDialog::new(
-                Some("Delete this note?"),
-                Some("Links to it will show its last title."),
-            );
+            let reading = state.clone();
+            let type_name = match core(async move { reading.note(space, note).await }).await {
+                Ok(note) => note.type_name,
+                Err(error) => {
+                    w.toast(&format!("Couldn't delete note: {error}"));
+                    return;
+                }
+            };
+            let (heading, body) = match type_name.as_str() {
+                "project" => (
+                    "Delete this project?",
+                    "This also deletes all subprojects and tasks, including completed tasks. \
+                      Links keep each item's last title.",
+                ),
+                "task" => (
+                    "Delete this task?",
+                    "This also deletes all subtasks, including completed tasks. \
+                      Links keep each item's last title.",
+                ),
+                _ => ("Delete this note?", "Links to it will show its last title."),
+            };
+            let dialog = adw::AlertDialog::new(Some(heading), Some(body));
             dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
             dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
             if dialog.choose_future(Some(&w.inner().window)).await != "delete" {
                 return;
             }
-            w.close_editor();
-            for history in [&w.inner().back, &w.inner().forward] {
-                history.borrow_mut().retain(|&(_, id)| id != note);
+            match core(async move { state.delete_note(space, note).await }).await {
+                Ok(deleted) => w.forget_deleted_notes(space, &deleted),
+                Err(error) => w.toast(&format!("Couldn't delete note: {error}")),
             }
-            w.update_history();
-            let _ = core(async move { state.delete_note(space, note).await }).await;
-            w.inner().stack.set_visible_child_name("empty");
-            w.reload_notes();
         });
     }
 
     /// Opens a note in the editor, and adds the open one to the history.
-    pub fn open_note(&self, space: Id, note: Id) {
+    fn open_note_direct(&self, space: Id, note: Id) {
         let open = self.inner().editor.borrow().as_ref().map(|e| (e.space, e.note));
         if let Some(open) = open.filter(|&(_, open)| open != note) {
             let mut back = self.inner().back.borrow_mut();
@@ -936,6 +1031,7 @@ impl Window {
                 titles: titles.clone(),
                 cursors: None,
             });
+            w.work_layout(&loaded.type_name);
             let widget = &w.inner().widget;
             widget.set_editor(Some(zib_core::editor::Editor::new(body)));
             widget.set_titles(titles);
@@ -946,6 +1042,7 @@ impl Window {
                 .set_visible(loaded.type_name == "file" || loaded.type_name == "image");
             w.update_title();
             w.show_mode();
+            w.refresh_work();
             w.refresh_backlinks(true);
             if w.inner().focus_body.take() {
                 widget.grab_focus();
@@ -1010,9 +1107,12 @@ impl Window {
         editor.fields = fields;
         let fields = &editor.fields;
         let note_id = Value::Text(editor.note.to_string());
-        let mut entries: Vec<_> =
-            fields.iter().map(|(name, value)| (name.as_str(), value)).collect();
-        entries.push(("note-id", &note_id));
+        let mut entries: Vec<_> = fields
+            .iter()
+            .filter(|(name, _)| !matches!(name.as_str(), "file" | "text" | "thumbnail"))
+            .map(|(name, value)| (name.as_str(), value))
+            .collect();
+        entries.push(("id", &note_id));
         entries.sort_unstable_by_key(|(name, _)| *name);
         let rows = gtk::Grid::builder()
             .column_spacing(16)
@@ -1233,11 +1333,18 @@ impl Window {
         glib::spawn_future_local(async move {
             let _ = core(async move { state.body_edited(space, note).await }).await;
             w.reload_notes();
+            w.refresh_note_metadata();
+            w.refresh_work();
         });
     }
 
     /// Reports pending metadata and ends the note's live sessions.
     fn close_editor(&self) {
+        self.save_project_pane();
+        self.inner().project_pane.show(false);
+        self.save_task_titles();
+        self.inner().work.header.set_visible(false);
+        self.inner().work.widget.set_visible(false);
         self.begin_open();
         self.inner().label_generation.set(self.inner().label_generation.get().wrapping_add(1));
         self.inner().drawing_generation.set(self.inner().drawing_generation.get().wrapping_add(1));
@@ -1284,8 +1391,11 @@ impl Window {
                 widget.remote_started(machine);
                 self.refresh_open();
                 let state = self.inner().state.clone();
+                let w = self.clone();
                 glib::spawn_future_local(async move {
                     core(async move { state.live_changed(space).await }).await;
+                    w.refresh_work();
+                    w.reload_notes();
                 });
             }
             LiveEvent::Cursor { machine, selections } => {

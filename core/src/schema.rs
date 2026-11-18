@@ -155,6 +155,8 @@ pub const ARTICLE: &str = "article";
 pub const FILE: &str = "file";
 pub const IMAGE: &str = "image";
 pub const NOTE: &str = "note";
+pub const PROJECT: &str = "project";
+pub const TASK: &str = "task";
 pub const VIDEO: &str = "video";
 
 /// The types this release defines, as the built-in types specification lists them.
@@ -170,6 +172,20 @@ pub fn built_in() -> Vec<TypeDef> {
     ];
     let fields = |extra: &[(&str, FieldDef)]| {
         source.iter().chain(extra).map(|(name, def)| ((*name).to_owned(), def.clone())).collect()
+    };
+    let work_fields = |task| {
+        let mut fields: BTreeMap<String, FieldDef> = [
+            ("due-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
+            ("parent-id", FieldDef::new(Kind::Link, SearchMode::Filter)),
+            ("scheduled-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
+        ]
+        .into_iter()
+        .map(|(name, def)| (name.into(), def))
+        .collect();
+        if task {
+            fields.insert("completed-on".into(), FieldDef::new(Kind::Date, SearchMode::Filter));
+        }
+        fields
     };
     vec![
         TypeDef { name: AGENT_TRANSCRIPT.into(), fields: BTreeMap::new() },
@@ -190,6 +206,8 @@ pub fn built_in() -> Vec<TypeDef> {
             ]),
         },
         TypeDef { name: NOTE.into(), fields: BTreeMap::new() },
+        TypeDef { name: PROJECT.into(), fields: work_fields(false) },
+        TypeDef { name: TASK.into(), fields: work_fields(true) },
         TypeDef { name: VIDEO.into(), fields: fields(&[]) },
     ]
 }

@@ -1,6 +1,7 @@
 [Aa]utolinks?
 [Bb]acklinks?
 [Ll]ibadwaita
+[Ss]ubprojects?
 [Ww]ikilinks?
 [Zz]ib
 [Zz]ibaldone

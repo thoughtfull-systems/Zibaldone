@@ -27,6 +27,7 @@ use crate::derive;
 
 mod agent;
 pub(crate) mod searches;
+mod tasks;
 mod web_clip;
 
 /// The Linux app keeps every file, as decision ZIB0004 sets for it.
@@ -377,6 +378,25 @@ impl State {
         self.store.lock().await.set_chat_width(width)
     }
 
+    pub(crate) async fn search_sidebar(&self) -> Option<zib_core::store::SidebarLayout> {
+        self.store.lock().await.config.search_sidebar
+    }
+
+    pub(crate) async fn project_sidebar_width(&self) -> Option<u32> {
+        self.store.lock().await.config.project_sidebar_width
+    }
+
+    pub(crate) async fn set_project_sidebar_width(&self, width: u32) -> Result<()> {
+        self.store.lock().await.set_project_sidebar_width(width)
+    }
+
+    pub(crate) async fn set_search_sidebar(
+        &self,
+        layout: zib_core::store::SidebarLayout,
+    ) -> Result<()> {
+        self.store.lock().await.set_search_sidebar(layout)
+    }
+
     /// The space the owner last put a note into.
     pub async fn last_space(&self) -> Option<Id> {
         self.store.lock().await.config.last_space
@@ -435,7 +455,7 @@ impl State {
                     id,
                     title: title.markdown,
                     plain: title.plain,
-                    updated: note.meta.updated,
+                    updated: note.meta.updated_at,
                     type_name: note.type_name,
                 })
             })
@@ -448,7 +468,7 @@ impl State {
         self.space(space_id).await?.lock().await.note(id)
     }
 
-    /// Reads a note and its populated, schema-validated fields from the same space snapshot.
+    /// Reads fields and searchable timestamp metadata from the same space snapshot as the note.
     pub(crate) async fn note_with_fields(
         &self,
         space_id: Id,
@@ -457,15 +477,22 @@ impl State {
         let space = self.space(space_id).await?;
         let space = space.lock().await;
         let note = space.note(id)?;
-        let mut fields = Vec::new();
+        let mut fields = vec![
+            ("created-at".into(), Value::Timestamp(note.meta.created_at)),
+            ("updated-at".into(), Value::Timestamp(note.meta.updated_at)),
+        ];
         if !note.fields.is_empty()
             && let Some(schema) = schema::read_type(space.doc(), &note.type_name)
         {
             fields.extend(schema.fields.into_iter().filter_map(|(name, def)| {
+                if matches!(name.as_str(), "created-at" | "updated-at") {
+                    return None;
+                }
                 let value = Value::from_loro(&def, note.fields.get(&name)?)?;
                 Some((name, value))
             }));
         }
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
         Ok((note, fields))
     }
 
@@ -620,13 +647,17 @@ impl State {
         Err(Error::NotFound(format!("note {note}{scope}")))
     }
 
-    pub async fn delete_note(&self, space_id: Id, id: Id) -> Result<()> {
+    pub async fn delete_note(&self, space_id: Id, id: Id) -> Result<Vec<Id>> {
+        let store = self.store.lock().await;
         let space = self.space(space_id).await?;
         let mut space = space.lock().await;
-        space.delete_note(id)?;
+        let deleted = space.delete_note(id)?;
+        let saved = store.save_space(&space);
         self.reindex_note(space_id, &space, id);
         self.changed_here(space_id);
-        Ok(())
+        self.send_ui(UiEvent::Changed(space_id));
+        saved?;
+        Ok(deleted)
     }
 
     /// Searches the selected space or every space, best matches first within each space.

@@ -5,6 +5,7 @@ use zib_core::channel::Dirs;
 use super::*;
 
 /// Drive GTK's queued work without waiting for a display event or the periodic status timer.
+#[track_caller]
 fn until(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready() {
@@ -37,6 +38,1108 @@ fn input(widget: &EditorWidget) -> gtk::IMContext {
         .filter_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerKey>().ok())
         .find_map(|keys| keys.im_context())
         .expect("the editor's input method")
+}
+
+fn descendants(root: &impl IsA<gtk::Widget>) -> Vec<gtk::Widget> {
+    let mut pending = vec![root.as_ref().clone()];
+    let mut result = Vec::new();
+    while let Some(widget) = pending.pop() {
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            child = next.next_sibling();
+            pending.push(next);
+        }
+        result.push(widget);
+    }
+    result
+}
+
+fn task_title(window: &Window, title: &str) -> Option<gtk::Entry> {
+    descendants(&window.inner().work.widget)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Entry>().ok())
+        .find(|entry| entry.text() == title)
+}
+
+#[test]
+fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(root.path());
+    let state = runtime.block_on(State::for_test(dirs.clone())).unwrap();
+    let (space, project, ordinary, standalone) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let body = format!("# Project design\n\n{}", "Design notes.\n\n".repeat(80));
+        let project = state.create_work(space, "project", &body, None).await.unwrap();
+        for (field, date) in [("due-on", "2026-11-30"), ("scheduled-on", "2026-11-20")] {
+            state
+                .set_work_field(space, project, field, Some(Value::Date(date.into())))
+                .await
+                .unwrap();
+        }
+        state.create_work(space, "project", "Subproject", Some(project)).await.unwrap();
+        state.create_work(space, "task", "Task", Some(project)).await.unwrap();
+        let ordinary = state.create_note(space, "Ordinary").await.unwrap();
+        let standalone = state.create_work(space, "task", "Standalone", None).await.unwrap();
+        (space, project, ordinary, standalone)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.ProjectPaneTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    window.inner().window.set_default_size(1800, 900);
+    present(&window.inner().window.clone().upcast());
+    let flush = |window: &Window| {
+        let done = Rc::new(Cell::new(false));
+        let (w, result) = (window.clone(), done.clone());
+        glib::spawn_future_local(async move {
+            w.finish_project_pane().await;
+            result.set(true);
+        });
+        until(|| done.get());
+    };
+    window.open_note(space, project);
+    until(|| task_title(&window, "Task").is_some());
+    flush(&window);
+    let inner = window.inner();
+    let pane = &inner.project_pane;
+    until(|| {
+        pane.scroll.width() >= 600
+            && (pane.scroll.width() - inner.backlinks.widget.width()).abs() <= 2
+    });
+    assert_eq!(inner.work.header.parent(), Some(pane.content.clone().upcast()));
+    assert_eq!(inner.work.widget.parent(), Some(pane.content.clone().upcast()));
+    assert!(!inner.work.widget.is_ancestor(&inner.editor_content));
+    assert_eq!(runtime.block_on(state.project_sidebar_width()), None);
+    assert_ne!(pane.scroll.vadjustment(), inner.editor_scroll.vadjustment());
+    inner.editor_scroll.vadjustment().set_value(100.0);
+    assert_eq!(pane.scroll.vadjustment().value(), 0.0);
+
+    let resize = |position| {
+        assert!(pane.widget.grab_focus());
+        pane.widget.set_position(position);
+        inner.widget.grab_focus();
+        flush(&window);
+    };
+    let available = pane.scroll.width() + inner.backlinks.widget.width();
+    resize(available - 640);
+    until(|| pane.scroll.width() == 640);
+    assert_eq!(runtime.block_on(state.project_sidebar_width()), Some(640));
+    resize(i32::MAX);
+    until(|| pane.scroll.width() == 600);
+    assert!(pane.scroll.is_visible());
+    let row = task_title(&window, "Task").unwrap().parent().unwrap();
+    let controls = row.last_child().unwrap().downcast::<gtk::FlowBox>().unwrap();
+    let first = controls.child_at_index(0).unwrap().compute_bounds(&controls).unwrap();
+    for index in 1..3 {
+        let bounds = controls.child_at_index(index).unwrap().compute_bounds(&controls).unwrap();
+        assert!((bounds.y() - first.y()).abs() <= 1.0, "task controls must stay on one line");
+    }
+    let bounds = controls.compute_bounds(&pane.scroll).unwrap();
+    assert!(bounds.x() + bounds.width() <= 601.0, "task controls must fit in the sidebar");
+    resize(0);
+    until(|| pane.scroll.width() >= 600 && inner.backlinks.widget.width() >= 280);
+    assert!(pane.scroll.width() <= available * 7 / 10);
+    assert!(pane.scroll.is_visible());
+    resize(available - 640);
+
+    window.open_note(space, ordinary);
+    until(|| inner.widget.text().as_deref() == Some("Ordinary"));
+    assert!(!pane.scroll.is_visible());
+    window.open_note(space, standalone);
+    until(|| {
+        inner.work.widget.is_visible() && inner.widget.text().as_deref() == Some("Standalone")
+    });
+    assert!(!pane.scroll.is_visible());
+    assert_eq!(inner.work.widget.parent(), Some(inner.editor_content.clone().upcast()));
+    window.open_note(space, project);
+    until(|| pane.scroll.is_mapped() && pane.scroll.width() == 640);
+    window.inner().window.close();
+    flush(&window);
+    window.inner().window.destroy();
+    let reopened = runtime.block_on(State::for_test(dirs)).unwrap();
+    let next = Window::new(&app, reopened.clone());
+    next.inner().window.set_default_size(1800, 900);
+    present(&next.inner().window.clone().upcast());
+    next.open_note(space, project);
+    until(|| {
+        next.inner().project_pane.scroll.is_mapped()
+            && next.inner().project_pane.scroll.width() == 640
+    });
+    assert_eq!(runtime.block_on(reopened.project_sidebar_width()), Some(640));
+    next.inner().window.destroy();
+    runtime.block_on(reopened.set_project_sidebar_width(320)).unwrap();
+    let narrow = Window::new(&app, reopened.clone());
+    narrow.inner().window.set_default_size(1800, 900);
+    present(&narrow.inner().window.clone().upcast());
+    narrow.open_note(space, project);
+    until(|| narrow.inner().project_pane.scroll.is_mapped());
+    flush(&narrow);
+    until(|| narrow.inner().project_pane.scroll.width() == 600);
+    assert_eq!(runtime.block_on(reopened.project_sidebar_width()), Some(320));
+    narrow.inner().window.destroy();
+}
+
+#[test]
+fn inline_additions_keep_focus_drafts_and_project_context() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Root", None).await.unwrap();
+        (space, project)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.InlineAddTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, project);
+    let addition = |placeholder| {
+        descendants(&window.inner().work.widget)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Entry>().ok())
+            .find(|entry| entry.placeholder_text().as_deref() == Some(placeholder))
+    };
+    until(|| addition("New task").is_some());
+    assert!(descendants(&window.inner().work.widget).iter().any(|widget| {
+        widget.downcast_ref::<gtk::Label>().is_some_and(|label| label.text() == "Subprojects")
+    }));
+    let entry = addition("New task").unwrap();
+    let project_entry = addition("New subproject").unwrap();
+    let start = |entry: &gtk::Entry| {
+        let row = entry.parent().unwrap();
+        (entry.width() > 0 && row.first_child().unwrap().width() > 0)
+            .then(|| entry.compute_bounds(&window.inner().work.widget).unwrap().x())
+    };
+    until(|| start(&entry).is_some() && start(&project_entry).is_some());
+    let task_start = start(&entry).unwrap();
+    let project_start = start(&project_entry).unwrap();
+    assert!(task_start > 4.0 && project_start > 4.0);
+    assert_eq!(entry.parent().unwrap().last_child().as_ref(), Some(entry.upcast_ref()));
+    entry.emit_by_name::<()>("activate", &[]);
+    assert!(runtime.block_on(state.work_tree(space)).unwrap().children(project).is_empty());
+    entry.set_text("First task");
+    entry.emit_by_name::<()>("activate", &[]);
+    entry.set_text("Second task");
+    until(|| task_title(&window, "First task").is_some());
+    assert_eq!(entry.text(), "Second task");
+    entry.emit_by_name::<()>("activate", &[]);
+    until(|| task_title(&window, "Second task").is_some() && entry.text().is_empty());
+    assert!(
+        gtk::prelude::RootExt::focus(&window.inner().window)
+            .is_some_and(|focus| focus == entry || focus.is_ancestor(&entry))
+    );
+    entry.set_text("Keep this draft");
+    runtime
+        .block_on(state.set_work_field(
+            space,
+            project,
+            "due-on",
+            Some(Value::Date("2026-12-31".into())),
+        ))
+        .unwrap();
+    window.refresh_work();
+    until(|| window.inner().work.tree.borrow().date(project, "due-on").is_some());
+    assert_eq!(entry, addition("New task").unwrap());
+    assert_eq!(entry.text(), "Keep this draft");
+    let project_entry = addition("New subproject").unwrap();
+    project_entry.set_text("Subproject *title*");
+    project_entry.emit_by_name::<()>("activate", &[]);
+    until(|| subproject_row(&window, "Subproject *title*").is_some());
+    assert!(project_entry.text().is_empty());
+    assert_eq!(
+        project_entry.parent().unwrap().last_child().as_ref(),
+        Some(project_entry.upcast_ref())
+    );
+    let aligned = |input: &gtk::Entry, title: &gtk::Widget| {
+        let container = &window.inner().work.widget;
+        input.width() > 0
+            && title.width() > 0
+            && input
+                .compute_bounds(container)
+                .zip(title.compute_bounds(container))
+                .is_some_and(|(input, title)| (input.x() - title.x()).abs() < 1.0)
+    };
+    until(|| aligned(&entry, task_title(&window, "First task").unwrap().upcast_ref()));
+    until(|| {
+        let row = subproject_row(&window, "Subproject *title*").unwrap();
+        let title = row.last_child().unwrap().downcast::<gtk::Button>().unwrap().child().unwrap();
+        aligned(&project_entry, &title)
+    });
+    assert_eq!(start(&entry), Some(task_start));
+    assert_eq!(start(&project_entry), Some(project_start));
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, project);
+    assert!(window.inner().window.visible_dialog().is_none());
+    let tree = runtime.block_on(state.work_tree(space)).unwrap();
+    assert_eq!(tree.children(project).len(), 3);
+    for id in tree.children(project) {
+        assert_eq!(tree.items[&id].parent, Some(project));
+        assert!(tree.items[&id].explicit_date("due-on").is_none());
+    }
+    for id in tree.children(project) {
+        runtime.block_on(state.delete_note(space, id)).unwrap();
+    }
+    window.space_changed(space);
+    until(|| window.inner().work.tree.borrow().children(project).is_empty());
+    until(|| start(&entry) == Some(task_start) && start(&project_entry) == Some(project_start));
+    window.inner().window.destroy();
+}
+
+#[test]
+fn search_sidebar_resizes_collapses_and_restores_machine_layout() {
+    use zib_core::store::SidebarLayout;
+
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(root.path());
+    let state = runtime.block_on(State::for_test(dirs.clone())).unwrap();
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.SearchPaneTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    let flush = |window: &Window| {
+        let done = Rc::new(Cell::new(false));
+        let (w, finished) = (window.clone(), done.clone());
+        glib::spawn_future_local(async move {
+            w.finish_search_pane().await;
+            finished.set(true);
+        });
+        until(|| done.get());
+    };
+    flush(&window);
+    let pane = &window.inner().sidebar_split;
+    window.inner().search.buffer().set_text("garden AND @type=note");
+    pane.widget.set_position(460);
+    flush(&window);
+    assert_eq!(
+        runtime.block_on(state.search_sidebar()),
+        Some(SidebarLayout { visible: true, width: 460 })
+    );
+    pane.widget.set_position(140);
+    pane.widget.set_position(90);
+    assert!(!pane.shows_sidebar());
+    flush(&window);
+    assert_eq!(
+        runtime.block_on(state.search_sidebar()),
+        Some(SidebarLayout { visible: false, width: 460 })
+    );
+    pane.set_show_sidebar(true);
+    assert_eq!(pane.widget.position(), 460);
+    assert_eq!(window.search_definition().query, "garden AND @type=note");
+    pane.widget.set_position(480);
+    window.inner().window.close();
+    flush(&window);
+    assert_eq!(runtime.block_on(state.search_sidebar()).unwrap().width, 480);
+    pane.set_show_sidebar(false);
+    flush(&window);
+    window.inner().window.destroy();
+    let reopened = runtime.block_on(State::for_test(dirs)).unwrap();
+    let next = Window::new(&app, reopened);
+    flush(&next);
+    assert!(!next.inner().sidebar_split.shows_sidebar());
+    next.toggle_search();
+    assert_eq!(next.inner().sidebar_split.widget.position(), 480);
+    flush(&next);
+    next.inner().window.destroy();
+    let pending = Window::new(&app, next.inner().state.clone());
+    pending.toggle_search();
+    flush(&pending);
+    assert!(!pending.inner().sidebar_split.shows_sidebar());
+    assert_eq!(pending.inner().sidebar_split.widget.position(), 480);
+    flush(&pending);
+    pending.inner().window.destroy();
+}
+
+#[test]
+fn completed_results_dim_while_open_results_keep_normal_or_urgent_emphasis() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, open, overdue, completed) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let open = state.create_work(space, "task", "Open", None).await.unwrap();
+        let overdue = state.create_work(space, "task", "Overdue", None).await.unwrap();
+        let completed = state.create_work(space, "task", "Completed", None).await.unwrap();
+        for note in [overdue, completed] {
+            state
+                .set_work_field(space, note, "due-on", Some(Value::Date("0001-01-01".into())))
+                .await
+                .unwrap();
+        }
+        state
+            .set_work_field(
+                space,
+                completed,
+                "completed-on",
+                Some(Value::Date(zib_core::work::today())),
+            )
+            .await
+            .unwrap();
+        (space, open, overdue, completed)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.ResultEmphasisTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    window.inner().search.buffer().set_text("@type=task");
+    until(|| window.inner().rows.borrow().len() == 3);
+    let row = |note| {
+        let index = window.inner().rows.borrow().iter().position(|(_, id)| *id == note).unwrap();
+        window.inner().list.row_at_index(i32::try_from(index).unwrap()).unwrap()
+    };
+    assert!(row(completed).has_css_class("dim-label"));
+    assert!(!row(completed).has_css_class("error"));
+    assert!(!row(open).has_css_class("dim-label"));
+    assert!(row(overdue).has_css_class("error"));
+    assert!(!row(overdue).has_css_class("dim-label"));
+    runtime.block_on(state.set_work_field(space, completed, "completed-on", None)).unwrap();
+    window.space_changed(space);
+    until(|| !row(completed).has_css_class("dim-label"));
+    assert!(row(completed).has_css_class("error"));
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+}
+
+#[test]
+fn remote_title_changes_preserve_dirty_inline_drafts() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project, task) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Project", None).await.unwrap();
+        let task = state.create_work(space, "task", "Task", Some(project)).await.unwrap();
+        (space, project, task)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.TitleSyncTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    window.open_note(space, task);
+    until(|| task_title(&window, "Task").is_some());
+    let entry = task_title(&window, "Task").unwrap();
+    entry.set_text("My draft");
+    runtime.block_on(async {
+        let document = state.node.spaces().lock().await.get(&space).cloned().unwrap();
+        let mut document = document.lock().await;
+        let mut remote =
+            zib_core::Space::open(&document.snapshot().unwrap(), Id::generate()).unwrap();
+        remote.set_body(task, "Remote title\n\nRemote notes").unwrap();
+        remote.commit();
+        document.import_checked(&remote.snapshot().unwrap()).unwrap();
+    });
+    window.live_event(space, project, LiveEvent::Changed { machine: Id::generate() });
+    until(|| window.inner().work.tree.borrow().items[&task].title == "Remote title");
+    assert_eq!(entry.text(), "My draft");
+    entry.emit_by_name::<()>("activate", &[]);
+    until(|| entry.has_css_class("error"));
+    assert_eq!(
+        runtime.block_on(state.work_tree(space)).unwrap().items[&task].note.body,
+        "Remote title\n\nRemote notes"
+    );
+    let keys = entry.observe_controllers();
+    let keys = (0..keys.n_items())
+        .filter_map(|i| keys.item(i)?.downcast::<gtk::EventControllerKey>().ok())
+        .next()
+        .unwrap();
+    keys.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::Escape, &0u32, &gdk::ModifierType::empty()],
+    );
+    assert_eq!(entry.text(), "Remote title");
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+}
+
+#[track_caller]
+fn work_popup(parent: &impl IsA<gtk::Widget>, tooltip: &str) -> gtk::Popover {
+    let button = descendants(parent)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::MenuButton>().ok())
+        .find(|button| button.tooltip_text().is_some_and(|text| text.starts_with(tooltip)))
+        .unwrap();
+    // Hierarchy refreshes create controls before GTK maps and allocates their rows.
+    until(|| button.is_mapped() && button.width() > 0 && button.height() > 0);
+    button.popup();
+    let popup = button.popover().unwrap();
+    until(|| popup.is_mapped());
+    popup
+}
+
+fn menu_item(popup: &gtk::Popover, label: &str) -> Option<gtk::Widget> {
+    descendants(popup).into_iter().find(|widget| {
+        widget.accessible_role() == gtk::AccessibleRole::MenuItem
+            && widget.is_mapped()
+            && descendants(widget).iter().any(|child| {
+                child.downcast_ref::<gtk::Label>().is_some_and(|text| text.text() == label)
+            })
+    })
+}
+
+fn subproject_row(window: &Window, title: &str) -> Option<gtk::Widget> {
+    let label = format!("{title} →");
+    descendants(&window.inner().work.widget)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+        .find(|button| button.label().as_deref() == Some(label.as_str()))
+        .and_then(|button| button.parent())
+}
+
+#[test]
+fn subproject_drag_targets_reorder_siblings_without_changing_parents() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project, a, b, c, task, child) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Root", None).await.unwrap();
+        let a = state.create_work(space, "project", "Alpha", Some(project)).await.unwrap();
+        let task = state.create_work(space, "task", "Task", Some(project)).await.unwrap();
+        let b = state.create_work(space, "project", "Beta", Some(project)).await.unwrap();
+        let c = state.create_work(space, "project", "Charlie", Some(project)).await.unwrap();
+        let child = state.create_work(space, "task", "Subtask", Some(c)).await.unwrap();
+        (space, project, a, b, c, task, child)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.ProjectDragTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, project);
+    until(|| subproject_row(&window, "Charlie").is_some());
+    let projects = || {
+        let tree = window.inner().work.tree.borrow();
+        tree.children(project)
+            .into_iter()
+            .filter(|id| tree.items[id].note.type_name == "project")
+            .collect::<Vec<_>>()
+    };
+    let drop_on = |source, target, fraction| {
+        drop_work_row(
+            &subproject_row(&window, source).unwrap(),
+            &subproject_row(&window, target).unwrap(),
+            fraction,
+        )
+    };
+    assert!(drop_on("Charlie", "Alpha", 0.4));
+    until(|| projects() == [c, a, b]);
+    assert!(drop_on("Charlie", "Beta", 0.6));
+    until(|| projects() == [a, b, c]);
+    assert!(!drop_on("Alpha", "Alpha", 0.5));
+    let task_row = task_title(&window, "Task").unwrap().parent().unwrap();
+    let project_row = subproject_row(&window, "Alpha").unwrap();
+    assert!(!drop_work_row(&task_row, &project_row, 0.4));
+    assert!(!drop_work_row(&project_row, &task_row, 0.4));
+    let tree = runtime.block_on(state.work_tree(space)).unwrap();
+    assert_eq!(tree.children(c), [child]);
+    for id in [a, b, c, task] {
+        assert_eq!(tree.items[&id].parent, Some(project));
+    }
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, project);
+    let button = descendants(&subproject_row(&window, "Beta").unwrap())
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::Button>().ok())
+        .unwrap();
+    button.emit_clicked();
+    until(|| window.inner().editor.borrow().as_ref().is_some_and(|e| e.note == b));
+    window.inner().window.destroy();
+}
+
+fn drop_work_row(source_row: &gtk::Widget, target_row: &gtk::Widget, fraction: f64) -> bool {
+    let source = descendants(source_row)
+        .iter()
+        .find_map(|widget| {
+            let controllers = widget.observe_controllers();
+            (0..controllers.n_items())
+                .find_map(|i| controllers.item(i)?.downcast::<gtk::DragSource>().ok())
+        })
+        .unwrap();
+    let controllers = target_row.observe_controllers();
+    let target = (0..controllers.n_items())
+        .find_map(|i| controllers.item(i)?.downcast::<gtk::DropTarget>().ok())
+        .unwrap();
+    let content = source
+        .emit_by_name::<Option<gdk::ContentProvider>>("prepare", &[&0.0_f64, &0.0_f64])
+        .unwrap();
+    let value = glib::BoxedValue(content.value(target.types()[0]).unwrap());
+    let y = f64::from(target_row.height().max(1)) * fraction;
+    target.emit_by_name::<bool>("drop", &[&value, &0.0_f64, &y])
+}
+
+#[test]
+fn task_drag_targets_reorder_nest_and_reject_descendant_drops() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project, a, b, c, child) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Project", None).await.unwrap();
+        let a = state.create_work(space, "task", "Alpha", Some(project)).await.unwrap();
+        let b = state.create_work(space, "task", "Beta", Some(project)).await.unwrap();
+        let c = state.create_work(space, "task", "Charlie", Some(project)).await.unwrap();
+        let child = state.create_work(space, "task", "Subtask", Some(a)).await.unwrap();
+        (space, project, a, b, c, child)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.TaskDragTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, project);
+    until(|| task_title(&window, "Charlie").is_some());
+
+    let drop_on = |source: &str, destination: &str, fraction: f64| {
+        let row = task_title(&window, source).unwrap().parent().unwrap();
+        let target = task_title(&window, destination).unwrap().parent().unwrap();
+        drop_work_row(&row, &target, fraction)
+    };
+
+    assert!(drop_on("Charlie", "Alpha", 0.0));
+    until(|| window.inner().work.tree.borrow().children(project) == [c, a, b]);
+    assert!(drop_on("Beta", "Alpha", 0.5));
+    until(|| window.inner().work.tree.borrow().items[&b].parent == Some(a));
+    until(|| task_title(&window, "Subtask").is_some());
+    assert_eq!(window.inner().work.tree.borrow().children(a), [child, b]);
+    assert!(!drop_on("Alpha", "Beta", 0.5));
+    assert!(!drop_on("Alpha", "Alpha", 0.0));
+    assert!(drop_on("Beta", "Charlie", 1.0));
+    until(|| window.inner().work.tree.borrow().children(project) == [c, b, a]);
+    let tree = runtime.block_on(state.work_tree(space)).unwrap();
+    assert_eq!(tree.children(project), [c, b, a]);
+    assert_eq!(tree.children(a), [child]);
+    assert_eq!(tree.items[&b].note.body, "Beta");
+    window.inner().window.destroy();
+}
+
+#[test]
+fn task_titles_are_compact_preserve_notes_and_flush_pending_edits() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(root.path());
+    let state = runtime.block_on(State::for_test(dirs.clone())).unwrap();
+    let (space, project, task) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Project design", None).await.unwrap();
+        let task = state
+            .create_work(space, "task", "# Task\n\nKeep these notes.\n", Some(project))
+            .await
+            .unwrap();
+        (space, project, task)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.CompactTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, task);
+    until(|| task_title(&window, "Task").is_some());
+    let row = task_title(&window, "Task").unwrap().parent().unwrap();
+    assert!(row.measure(gtk::Orientation::Vertical, 700).1 <= 64);
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, project);
+    assert!(!descendants(&window.inner().work.widget).iter().any(|w| w.is::<EditorWidget>()));
+    let entry = task_title(&window, "Task").unwrap();
+    entry.grab_focus_without_selecting();
+    entry.set_text("Updated task");
+    entry.emit_by_name::<()>("activate", &[]);
+    entry.set_text("Latest task");
+    entry.set_position(3);
+    let flushed = Rc::new(Cell::new(None));
+    let (w, result) = (window.clone(), flushed.clone());
+    glib::spawn_future_local(async move {
+        result.set(Some(w.finish_task_titles().await));
+    });
+    until(|| flushed.get().is_some());
+    assert_eq!(flushed.get(), Some(true));
+    until(|| task_title(&window, "Latest task").is_some());
+    assert!(gtk::prelude::RootExt::focus(&window.inner().window).unwrap().is_ancestor(&entry));
+    assert_eq!(entry.position(), 3);
+    assert_eq!(
+        runtime.block_on(state.work_tree(space)).unwrap().items[&task].note.body,
+        "# Latest task\n\nKeep these notes.\n"
+    );
+    window.inner().search.buffer().set_text(zib_core::work::WORK_QUERY);
+    until(|| window.inner().rows.borrow().iter().any(|(_, id)| *id == task));
+    let check = descendants(&window.inner().work.widget)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::CheckButton>().ok())
+        .find(|c| c.tooltip_text().as_deref() == Some("Complete Latest task"))
+        .unwrap();
+    check.set_active(true);
+    until(|| !window.inner().rows.borrow().iter().any(|(_, id)| *id == task));
+    assert_eq!(
+        runtime.block_on(state.work_tree(space)).unwrap().items[&task]
+            .explicit_date("completed-on"),
+        Some(zib_core::work::today())
+    );
+    assert!(task_title(&window, "Latest task").is_some());
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+    let reopened = runtime.block_on(State::for_test(dirs)).unwrap();
+    assert_eq!(
+        runtime.block_on(reopened.work_tree(space)).unwrap().items[&task].title,
+        "Latest task"
+    );
+    runtime.block_on(reopened.finish());
+}
+
+#[test]
+fn task_dates_show_only_effective_values_and_add_from_the_actions_menu() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project, task) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Project", None).await.unwrap();
+        let task = state.create_work(space, "task", "Task", Some(project)).await.unwrap();
+        (space, project, task)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.OptionalTaskDatesTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, project);
+    until(|| task_title(&window, "Task").is_some());
+    let row = || task_title(&window, "Task").unwrap().parent().unwrap();
+    let shows = |prefix: &str| {
+        descendants(&row()).iter().any(|widget| {
+            widget.downcast_ref::<gtk::MenuButton>().is_some_and(|button| {
+                button.tooltip_text().is_some_and(|text| text.starts_with(prefix))
+            })
+        })
+    };
+    let button = |popup: &gtk::Popover, label: &str| {
+        descendants(popup)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.label().as_deref() == Some(label))
+    };
+    assert!(!shows("Due date") && !shows("Scheduled date"));
+    // Exercise each date independently so neither leaves an empty control behind.
+    for (action, prefix, field, date) in [
+        ("Add schedule date", "Scheduled date", "scheduled-on", "2026-11-20"),
+        ("Add due date", "Due date", "due-on", "2026-11-30"),
+    ] {
+        let popup = work_popup(&row(), "Task actions");
+        assert!(menu_item(&popup, action).unwrap().activate());
+        let entry = descendants(&popup)
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::Entry>().ok())
+            .unwrap();
+        until(|| entry.is_mapped());
+        entry.set_text(date);
+        entry.emit_by_name::<()>("activate", &[]);
+        until(|| shows(prefix));
+        assert_eq!(window.inner().work.tree.borrow().date(task, field).unwrap().value, date);
+        let popup = work_popup(&row(), "Task actions");
+        assert!(menu_item(&popup, action).is_none());
+        popup.popdown();
+        until(|| !popup.is_mapped());
+        let popup = work_popup(&row(), prefix);
+        button(&popup, "Clear date").unwrap().emit_clicked();
+        until(|| !shows(prefix));
+        assert!(window.inner().work.tree.borrow().date(task, field).is_none());
+        let popup = work_popup(&row(), "Task actions");
+        assert!(menu_item(&popup, action).is_some());
+        popup.popdown();
+        until(|| !popup.is_mapped());
+    }
+    for (field, date) in [("due-on", "2026-12-10"), ("scheduled-on", "2026-12-01")] {
+        runtime
+            .block_on(state.set_work_field(space, project, field, Some(Value::Date(date.into()))))
+            .unwrap();
+    }
+    window.space_changed(space);
+    until(|| shows("Due date") && shows("Scheduled date"));
+    let popup = work_popup(&row(), "Task actions");
+    assert!(menu_item(&popup, "Add due date").is_none());
+    assert!(menu_item(&popup, "Add schedule date").is_none());
+    popup.popdown();
+    until(|| !popup.is_mapped());
+    let popup = work_popup(&row(), "Due date");
+    assert!(!button(&popup, "Clear date").unwrap().is_sensitive());
+    let entry = descendants(&popup)
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::Entry>().ok())
+        .unwrap();
+    entry.set_text("2026-12-12");
+    entry.emit_by_name::<()>("activate", &[]);
+    until(|| window.inner().work.tree.borrow().date(task, "due-on").unwrap().source == task);
+    let popup = work_popup(&row(), "Due date");
+    button(&popup, "Clear date").unwrap().emit_clicked();
+    until(|| window.inner().work.tree.borrow().date(task, "due-on").unwrap().source == project);
+    assert!(shows("Due date"));
+    runtime.block_on(state.set_work_field(space, project, "due-on", None)).unwrap();
+    window.space_changed(space);
+    until(|| !shows("Due date"));
+    assert!(shows("Scheduled date"));
+    window.inner().window.destroy();
+}
+
+#[test]
+fn calendar_popovers_sync_typed_dates_selection_and_clear_to_inherit() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project, task) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Project", None).await.unwrap();
+        let task = state.create_work(space, "task", "Task", Some(project)).await.unwrap();
+        state
+            .set_work_field(space, project, "due-on", Some(Value::Date("2026-11-30".into())))
+            .await
+            .unwrap();
+        (space, project, task)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.CalendarTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, task);
+    until(|| task_title(&window, "Task").is_some());
+    let popup = work_popup(&window.inner().work.widget, "Due date");
+    let widgets = descendants(&popup);
+    let entry = widgets.iter().find_map(|w| w.clone().downcast::<gtk::Entry>().ok()).unwrap();
+    let calendar = widgets.iter().find_map(|w| w.clone().downcast::<gtk::Calendar>().ok()).unwrap();
+    let apply = widgets
+        .iter()
+        .filter_map(|w| w.clone().downcast::<gtk::Button>().ok())
+        .find(|b| b.label().as_deref() == Some("Apply"))
+        .unwrap();
+    entry.set_text("2026-02-30");
+    window.space_changed(space);
+    assert!(popup.is_visible());
+    assert_eq!(entry.text(), "2026-02-30");
+    assert!(!apply.is_sensitive());
+    entry.set_text("2026-12-02");
+    assert!(apply.is_sensitive());
+    assert_eq!(calendar.date().format("%Y-%m-%d").unwrap(), "2026-12-02");
+    calendar.select_day(&glib::DateTime::from_iso8601("2026-12-03T12:00:00Z", None).unwrap());
+    assert_eq!(entry.text(), "2026-12-03");
+    apply.emit_clicked();
+    until(|| {
+        window
+            .inner()
+            .work
+            .tree
+            .borrow()
+            .date(task, "due-on")
+            .is_some_and(|d| d.source == task && d.value == "2026-12-03")
+    });
+    let popup = work_popup(&window.inner().work.widget, "Due date");
+    let clear = descendants(&popup)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Button>().ok())
+        .find(|b| b.label().as_deref() == Some("Clear date"))
+        .unwrap();
+    clear.emit_clicked();
+    until(|| {
+        window.inner().work.tree.borrow().date(task, "due-on").is_some_and(|d| d.source == project)
+    });
+    let popup = work_popup(&window.inner().work.header, "Scheduled date");
+    let entry =
+        descendants(&popup).into_iter().find_map(|w| w.downcast::<gtk::Entry>().ok()).unwrap();
+    entry.set_text("2026-11-20");
+    entry.emit_by_name::<()>("activate", &[]);
+    until(|| {
+        window
+            .inner()
+            .work
+            .tree
+            .borrow()
+            .date(task, "scheduled-on")
+            .is_some_and(|d| d.source == project)
+    });
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+}
+
+#[test]
+fn task_actions_choose_parent_without_an_inline_parent_selector() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project, other, task, child) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Current", None).await.unwrap();
+        let other = state.create_work(space, "project", "Destination", None).await.unwrap();
+        let task = state.create_work(space, "task", "Task", Some(project)).await.unwrap();
+        let child = state.create_work(space, "task", "Subtask", Some(task)).await.unwrap();
+        (space, project, other, task, child)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.TaskParentMenuTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, project);
+    until(|| task_title(&window, "Task").is_some());
+    let row = task_title(&window, "Task").unwrap().parent().unwrap();
+    assert!(!descendants(&row).iter().any(|widget| {
+        widget.tooltip_text().is_some_and(|text| text.starts_with("Change parent"))
+    }));
+    let popup = work_popup(&row, "Task actions");
+    assert!(popup.is::<gtk::PopoverMenu>());
+    assert!(menu_item(&popup, "Add subtask").is_none());
+    let choose = || assert!(menu_item(&popup, "Choose parent…").unwrap().activate());
+    choose();
+    let search = descendants(&popup)
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::SearchEntry>().ok())
+        .unwrap();
+    let focused = || {
+        gtk::prelude::RootExt::focus(&window.inner().window)
+            .is_some_and(|focus| focus == search || focus.is_ancestor(&search))
+    };
+    until(focused);
+    search.set_text("draft");
+    assert!(menu_item(&popup, "Choose parent…").unwrap().activate());
+    until(|| !search.is_mapped());
+    choose();
+    until(focused);
+    assert_eq!(search.text(), "draft");
+    popup.popdown();
+    until(|| !popup.is_mapped());
+    let reopened = work_popup(&row, "Task actions");
+    assert_eq!(reopened, popup);
+    assert!(!search.is_mapped());
+    choose();
+    until(focused);
+    let widgets = descendants(&popup);
+    let search =
+        widgets.iter().find_map(|widget| widget.downcast_ref::<gtk::SearchEntry>()).unwrap();
+    search.set_text("dest");
+    let list = widgets.iter().find_map(|widget| widget.downcast_ref::<gtk::ListBox>()).unwrap();
+    until(|| !list.row_at_index(0).unwrap().is_visible());
+    let destination = list.row_at_index(1).unwrap();
+    assert!(destination.is_visible());
+    list.emit_by_name::<()>("row-activated", &[&destination]);
+    until(|| window.inner().editor.borrow().as_ref().is_some_and(|editor| editor.note == other));
+    until(|| task_title(&window, "Task").is_some());
+    let tree = runtime.block_on(state.work_tree(space)).unwrap();
+    assert_eq!(tree.items[&task].parent, Some(other));
+    assert_eq!(tree.items[&child].parent, Some(task));
+    assert!(window.inner().window.visible_dialog().is_none());
+    window.inner().window.destroy();
+}
+
+#[test]
+fn deleting_work_cascades_from_task_menu_and_project_header_and_persists() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(root.path());
+    let state = runtime.block_on(State::for_test(dirs.clone())).unwrap();
+    let (space, project, child, task, subtask, completed, nested_task, standalone) = runtime
+        .block_on(async {
+            let space = state.spaces().await[0].0;
+            let project = state.create_work(space, "project", "Root", None).await.unwrap();
+            let child =
+                state.create_work(space, "project", "Subproject", Some(project)).await.unwrap();
+            let task = state.create_work(space, "task", "Task", Some(project)).await.unwrap();
+            let subtask = state.create_work(space, "task", "Subtask", Some(task)).await.unwrap();
+            let completed =
+                state.create_work(space, "task", "Completed", Some(task)).await.unwrap();
+            state
+                .set_work_field(
+                    space,
+                    completed,
+                    "completed-on",
+                    Some(Value::Date(zib_core::work::today())),
+                )
+                .await
+                .unwrap();
+            let nested_task =
+                state.create_work(space, "task", "Nested task", Some(child)).await.unwrap();
+            let standalone = state.create_work(space, "task", "Standalone", None).await.unwrap();
+            (space, project, child, task, subtask, completed, nested_task, standalone)
+        });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.WorkDeletionTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, subtask);
+    until(|| task_title(&window, "Subtask").is_some());
+    let draft = task_title(&window, "Subtask").unwrap();
+    draft.set_text("Unsaved subtask draft");
+    assert!(task_title(&window, "Completed").is_none());
+    let ask = || {
+        let row = task_title(&window, "Task").unwrap().parent().unwrap();
+        let popup = work_popup(&row, "Task actions");
+        assert!(menu_item(&popup, "Delete task…").unwrap().activate());
+    };
+    let respond = |heading, detail: &str, response| {
+        until(|| window.inner().window.visible_dialog().is_some());
+        let dialog =
+            window.inner().window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+        assert_eq!(dialog.heading().as_deref(), Some(heading));
+        assert!(dialog.body().contains(detail));
+        dialog.emit_by_name::<()>("response", &[&response]);
+        dialog.close();
+        until(|| window.inner().window.visible_dialog().is_none());
+    };
+    ask();
+    respond("Delete this task?", "all subtasks", "cancel");
+    for id in [completed, subtask, task] {
+        assert!(runtime.block_on(state.note(space, id)).is_ok());
+    }
+    // An invalid draft cannot autosave; deleting its ancestor must discard it too.
+    draft.set_text("");
+    ask();
+    respond("Delete this task?", "all subtasks", "delete");
+    until(|| task_title(&window, "Task").is_none());
+    for id in [completed, subtask, task] {
+        assert!(runtime.block_on(state.note(space, id)).is_err());
+        assert!(
+            state.search_shown(&[space], &format!("@id={id}"), Sort::Title, 20).unwrap().is_empty()
+        );
+    }
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, project);
+    let flushed = Rc::new(Cell::new(None));
+    let (w, result) = (window.clone(), flushed.clone());
+    glib::spawn_future_local(async move {
+        result.set(Some(w.finish_task_titles().await));
+    });
+    until(|| flushed.get().is_some());
+    assert_eq!(flushed.get(), Some(true));
+    window.open_note(space, child);
+    until(|| window.inner().editor.borrow().as_ref().is_some_and(|e| e.note == child));
+    window.open_note(space, project);
+    until(|| window.inner().editor.borrow().as_ref().is_some_and(|e| e.note == project));
+    window.delete_note();
+    respond("Delete this project?", "all subprojects and tasks", "delete");
+    until(|| window.inner().editor.borrow().is_none());
+    assert!(!window.inner().back.borrow().iter().any(|(_, id)| [child, project].contains(id)));
+    assert!(!window.inner().forward.borrow().iter().any(|(_, id)| [child, project].contains(id)));
+    assert_eq!(
+        state
+            .search_shown(&[space], "@type=task", Sort::Title, 20)
+            .unwrap()
+            .into_iter()
+            .map(|(_, hit)| hit.id)
+            .collect::<Vec<_>>(),
+        [standalone]
+    );
+    let reopened = runtime.block_on(State::for_test(dirs)).unwrap();
+    for id in [child, completed, nested_task, project, subtask, task] {
+        assert!(runtime.block_on(reopened.note(space, id)).is_err());
+    }
+    assert!(runtime.block_on(reopened.note(space, standalone)).is_ok());
+    window.inner().window.destroy();
+    runtime.block_on(reopened.finish());
+    runtime.block_on(state.finish());
+}
+
+#[test]
+fn parent_popup_filters_projects_and_excludes_cycles_and_tasks() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project, beta) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Current", None).await.unwrap();
+        state.create_work(space, "project", "Subproject", Some(project)).await.unwrap();
+        state.create_work(space, "task", "Not a project", Some(project)).await.unwrap();
+        state.create_work(space, "project", "Alpha", None).await.unwrap();
+        let beta = state.create_work(space, "project", "Beta", None).await.unwrap();
+        (space, project, beta)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.ParentTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, project);
+    until(|| window.inner().work.header.is_visible());
+    let popup = work_popup(&window.inner().work.header, "Change parent");
+    let widgets = descendants(&popup);
+    let search =
+        widgets.iter().find_map(|w| w.clone().downcast::<gtk::SearchEntry>().ok()).unwrap();
+    let list = widgets.iter().find_map(|w| w.clone().downcast::<gtk::ListBox>().ok()).unwrap();
+    assert!(list.row_at_index(2).is_none());
+    search.set_text("BE");
+    until(|| !list.row_at_index(0).unwrap().is_visible());
+    assert!(list.row_at_index(1).unwrap().is_visible());
+    list.emit_by_name::<()>("row-activated", &[&list.row_at_index(1).unwrap()]);
+    until(|| {
+        runtime.block_on(state.work_tree(space)).unwrap().items[&project].parent == Some(beta)
+    });
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
 }
 
 fn undo(widget: &EditorWidget) {
@@ -403,13 +1506,15 @@ fn note_metadata_shows_the_note_id_and_populated_fields_without_selecting_them()
     let values = detail_values(details);
     assert_eq!(
         values.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
-        ["authors", "captured-at", "note-id", "published-on", "url"],
+        ["authors", "captured-at", "created-at", "id", "published-on", "updated-at", "url"],
     );
     assert_eq!(values[0].1.text(), "Test Author");
     assert!(!values[1].1.text().is_empty());
-    assert_eq!(values[2].1.text(), article.to_string());
-    assert_eq!(values[3].1.text(), "2023-02-28");
-    let source = &values[4].1;
+    assert!(!values[2].1.text().is_empty());
+    assert_eq!(values[3].1.text(), article.to_string());
+    assert_eq!(values[4].1.text(), "2023-02-28");
+    assert!(!values[5].1.text().is_empty());
+    let source = &values[6].1;
     assert_eq!(source.text(), url);
     assert!(source.label().starts_with("<a href=\"https://example.org/article?a=1&amp;b=2\">"));
     assert_eq!(source.xalign().to_bits(), values[0].1.xalign().to_bits());
@@ -434,21 +1539,60 @@ fn note_metadata_shows_the_note_id_and_populated_fields_without_selecting_them()
     until(|| window.inner().widget.text().is_some_and(|body| body.starts_with("Example file")));
     assert!(details.get_visible());
     let values = detail_values(details);
-    assert_eq!(values.len(), 2);
-    assert_eq!(values[0].0, "file");
-    assert_eq!(values[1].0, "note-id");
+    assert_eq!(values.len(), 3);
+    assert_eq!(values[0].0, "created-at");
+    assert_eq!(values[1].0, "id");
     assert_eq!(values[1].1.text(), file.to_string());
-    let hash = values[0].1.text();
-    assert_eq!(hash, FileHash::of(bytes).to_string());
+    assert_eq!(values[2].0, "updated-at");
+    let (stored, mut fields) = runtime.block_on(state.note_with_fields(space, file)).unwrap();
+    assert_eq!(
+        stored.fields["file"].as_string().unwrap().as_str(),
+        FileHash::of(bytes).to_string()
+    );
+    for name in ["text", "thumbnail"] {
+        fields.push((name.into(), Value::File(FileHash::of(bytes))));
+    }
+    window.show_note_metadata(fields);
+    assert_eq!(
+        detail_values(details).iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+        ["created-at", "id", "updated-at"]
+    );
 
     window.open_note(space, other);
     until(|| window.inner().widget.text().as_deref() == Some("Other note"));
     assert!(details.get_visible());
     let values = detail_values(details);
-    assert_eq!(values.len(), 1);
-    assert_eq!(values[0].0, "note-id");
-    assert_eq!(values[0].1.text(), other.to_string());
-    assert!(values[0].1.is_selectable());
+    assert_eq!(values.len(), 3);
+    assert_eq!(values[1].0, "id");
+    assert_eq!(values[1].1.text(), other.to_string());
+    assert!(values[1].1.is_selectable());
+    let metadata = runtime.block_on(state.note(space, other)).unwrap().meta;
+    assert_eq!(values[0].1.text(), field_text(&Value::Timestamp(metadata.created_at)));
+    assert_eq!(values[2].1.text(), field_text(&Value::Timestamp(metadata.updated_at)));
+    let search = &window.inner().search;
+    search.grab_focus();
+    for name in ["created-at", "updated-at"] {
+        search.buffer().set_text(&format!("@{}", &name[..3]));
+        search.buffer().place_cursor(&search.buffer().end_iter());
+        until(|| {
+            descendants(search).iter().any(|widget| {
+                widget.downcast_ref::<gtk::Label>().is_some_and(|label| label.text() == name)
+            })
+        });
+    }
+    search.buffer().set_text("@created-at? @updated-at?");
+    until(|| window.inner().rows.borrow().len() == 3);
+    window.inner().widget.grab_focus();
+    input(&window.inner().widget).emit_by_name::<()>("commit", &[&"Changed "]);
+    window.report_body_edited();
+    until(|| {
+        window.inner().editor.borrow().as_ref().is_some_and(|editor| {
+            editor.fields.iter().any(|(name, value)| {
+                name == "updated-at"
+                    && matches!(value, Value::Timestamp(time) if *time > metadata.updated_at)
+            })
+        })
+    });
     window.close_editor();
     runtime.block_on(state.finish());
     window.inner().window.destroy();

@@ -64,7 +64,32 @@ note and scroll position when possible. If the open note stops matching, its edi
 The Rust core reads and writes the same format for every platform. The Linux app provides the
 sidebar described here.
 
+## Due-date sort
+
+The `sort` value also accepts `due` as the [projects and tasks specification][work] defines. It
+orders effective due dates first and keeps undated items last. Older readers that don't recognize
+this value preserve the saved search but omit it from their picker.
+
+## Query wrapping
+
+The search definition wraps without inserting display hyphens. Literal hyphens in field names and
+values remain visible as part of the query.
+
+## Sidebar layout on the machine
+
+Resize the search sidebar by dragging its divider. Its width and visibility belong to this machine
+and don't sync with saved searches. The optional `search-sidebar` object in `machine.json` holds
+`visible`, a boolean, and `width`, a positive integer in logical pixels. Without the object, show
+the sidebar at 320 logical pixels. A stored width of 100 or less, or greater than the largest signed
+32-bit integer, falls back to 320.
+
+Dragging the divider to 100 logical pixels or less hides the sidebar. Keep its last saved usable
+width so the toggle button restores it. Save width changes 500 milliseconds after the latest
+movement, and flush pending layout writes when closing the window or quitting. Hiding the sidebar
+preserves the query, drafts, results, and open note.
+
 [decision]: ../decisions/ZIB0022-saved-searches.md
 [document]: space-document.md
 [identifiers]: identifiers.md
 [ranges]: search-ranges.md
+[work]: projects-and-tasks.md

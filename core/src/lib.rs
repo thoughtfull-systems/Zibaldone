@@ -33,6 +33,7 @@ pub mod store;
 pub mod sync;
 pub mod time;
 pub mod web_clip;
+pub mod work;
 
 pub use channel::Channel;
 pub use error::{Error, Result};

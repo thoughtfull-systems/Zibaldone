@@ -9,20 +9,22 @@ use rusqlite::types::Value;
 use crate::{Error, Id, Result};
 
 use super::query::{Clause, Operator, Query};
-use super::{Hit, Index, MATCH_END, MATCH_START, NOTE_ID_FIELD, TYPE_FIELD, fts_query};
+use super::{Hit, ID_FIELD, Index, MATCH_END, MATCH_START, TYPE_FIELD, fts_query};
 
 /// How to order search results. Field-only searches use last modified by default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Sort {
+    Due,
+    Modified,
     #[default]
     Relevance,
-    Modified,
     Title,
 }
 
 impl Sort {
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Due => "due",
             Self::Modified => "modified",
             Self::Relevance => "relevance",
             Self::Title => "title",
@@ -31,6 +33,7 @@ impl Sort {
 
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
+            "due" => Some(Self::Due),
             "modified" => Some(Self::Modified),
             "relevance" => Some(Self::Relevance),
             "title" => Some(Self::Title),
@@ -40,6 +43,7 @@ impl Sort {
 
     const fn sql(self) -> &'static str {
         match self {
+            Self::Due => "(due IS NULL), due, n.title COLLATE NOCASE, n.id",
             Self::Relevance => "score, n.updated DESC, n.id",
             Self::Modified => "n.updated DESC, n.id",
             Self::Title => "n.title COLLATE NOCASE, n.id",
@@ -54,6 +58,7 @@ impl Sort {
 /// A result with the values needed to merge ordered lists from different spaces.
 struct RankedHit {
     hit: Hit,
+    due: Option<String>,
     modified: i64,
     score: f64,
 }
@@ -63,6 +68,12 @@ impl RankedHit {
         let modified = || Reverse(self.modified).cmp(&Reverse(other.modified));
         match sort {
             Sort::Relevance => self.score.total_cmp(&other.score).then_with(modified),
+            Sort::Due => self
+                .due
+                .is_none()
+                .cmp(&other.due.is_none())
+                .then_with(|| self.due.cmp(&other.due))
+                .then_with(|| Sort::compare_titles(&self.hit.title, &other.hit.title)),
             Sort::Modified => modified(),
             Sort::Title => Sort::compare_titles(&self.hit.title, &other.hit.title),
         }
@@ -78,9 +89,12 @@ pub fn search_indexes<'a>(
     limit: usize,
 ) -> Result<Vec<(Id, Hit)>> {
     let indexes: Vec<_> = indexes.into_iter().collect();
-    let Some(query) = Query::parse(text)? else { return Ok(Vec::new()) };
+    let query = Query::parse(text)?;
     let mut statement = Statement::default();
-    let predicate = statement.predicate(&indexes, &query, true, true)?;
+    let predicate = match query {
+        Some(query) => statement.predicate(&indexes, &query, true, true)?,
+        None => "1".into(),
+    };
     statement.finish(&predicate, sort, limit);
     let mut hits = Vec::new();
     for (space, index) in indexes {
@@ -197,7 +211,7 @@ impl Statement {
         positive: bool,
     ) -> Result<String> {
         match clause.field {
-            NOTE_ID_FIELD => {
+            ID_FIELD => {
                 let id = self.bind(clause.note_id()?.to_string().into());
                 return Ok(format!("n.id = {id}"));
             }
@@ -207,11 +221,25 @@ impl Statement {
             }
             _ => {}
         }
-        let defs: Vec<_> = indexes
+        let virtual_def = match clause.field {
+            "created-at" | "updated-at" => Some(crate::schema::FieldDef::new(
+                crate::schema::Kind::Timestamp,
+                crate::schema::SearchMode::Filter,
+            )),
+            "project" => Some(crate::schema::FieldDef::new(
+                crate::schema::Kind::Link,
+                crate::schema::SearchMode::Filter,
+            )),
+            _ => None,
+        };
+        let mut defs: Vec<_> = indexes
             .iter()
             .flat_map(|(_, index)| &index.types)
             .filter_map(|ty| ty.fields.get(clause.field))
             .collect();
+        if let Some(ref def) = virtual_def {
+            defs = vec![def];
+        }
         clause.validate(&defs)?;
         if matches!(clause.op, Operator::Contains) {
             return self.text_match(clause.text_query()?, Some(clause.field), required, positive);
@@ -258,8 +286,13 @@ impl Statement {
         } else {
             (format!("coalesce({}, '')", excerpts.join(", ")), scores.join(" + "))
         };
-        write!(sql, "SELECT n.id, n.title, {excerpt}, n.updated, {score} AS score FROM notes n")
-            .unwrap();
+        write!(
+            sql,
+            "SELECT n.id, n.title, {excerpt}, n.updated, {score} AS score, \
+            (SELECT text FROM filters WHERE note = n.id AND field = 'due-on' LIMIT 1) AS due \
+            FROM notes n"
+        )
+        .unwrap();
         for (n, m) in self.matches.iter().enumerate() {
             let join = if m.required { "JOIN" } else { "LEFT JOIN" };
             write!(sql, " {join} m{n} ON m{n}.note = n.id").unwrap();
@@ -272,13 +305,21 @@ impl Statement {
     fn run(&self, index: &Index) -> Result<Vec<RankedHit>> {
         let mut statement = index.db.prepare(&self.sql)?;
         let rows = statement.query_map(params_from_iter(&self.args), |row| {
-            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
         })?;
         let mut hits = Vec::new();
         for row in rows {
-            let (id, title, snippet, modified, score) = row?;
+            let (id, title, snippet, modified, score, due) = row?;
             hits.push(RankedHit {
                 hit: Hit { id: Id::parse(&id)?, title, snippet },
+                due,
                 modified,
                 score,
             });
@@ -292,6 +333,198 @@ mod tests {
     use crate::{Error, Space, schema};
 
     use super::*;
+
+    #[test]
+    fn timestamp_metadata_searches_all_types_and_refreshes_on_updates() {
+        use chrono::{TimeZone, Utc};
+
+        let instant = |day| Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 0).unwrap().timestamp_millis();
+        let mut space = Space::create(Id::generate()).unwrap();
+        let mut ids = Vec::new();
+        // Calendar order makes expected prefixes describe the timestamp ranges.
+        for (title, kind, day) in [
+            ("A note", schema::NOTE, 1),
+            ("B task", schema::TASK, 2),
+            ("C project", schema::PROJECT, 3),
+        ] {
+            let id = space.create_note(kind, title).unwrap();
+            let note = schema::child_map(&space.doc().get_map("notes"), &id.to_string()).unwrap();
+            let meta = schema::child_map(&note, "meta").unwrap();
+            meta.insert("created-at", instant(day)).unwrap();
+            meta.insert("updated-at", instant(day + 1)).unwrap();
+            ids.push(id);
+        }
+        let mut index = Index::in_memory().unwrap();
+        index.rebuild(&space, &|_| None).unwrap();
+        let space_id = space.id().unwrap();
+        let find = |index: &Index, query: &str| {
+            search_indexes([(space_id, index)], query, Sort::Title, 20)
+                .unwrap()
+                .into_iter()
+                .map(|(_, hit)| hit.id)
+                .collect::<Vec<_>>()
+        };
+        for (query, expected) in [
+            ("@created-at=2026-01-02Z", &ids[1..2]),
+            ("@created-at=2026-01-01Z...2026-01-02Z", &ids[..2]),
+            ("@created-at=2026-01-01Z..2026-01-02Z", &ids[..1]),
+            ("@updated-at>=2026-01-03Z", &ids[1..]),
+            ("@created-at>=2026-01-02Z @updated-at<2026-01-04Z", &ids[1..2]),
+            ("@created-at? @updated-at?", &ids[..]),
+            ("@created-at!?", &ids[..0]),
+        ] {
+            assert_eq!(find(&index, query), expected, "{query}");
+        }
+        let names = super::super::field_names([&index]);
+        for field in ["created-at", "updated-at"] {
+            assert!(names.iter().any(|name| name == field));
+            assert!(
+                search_indexes(
+                    [(space.id().unwrap(), &index)],
+                    &format!("@type=note OR @{field}>=2026-02-30"),
+                    Sort::Title,
+                    20,
+                )
+                .is_err()
+            );
+        }
+        let note = schema::child_map(&space.doc().get_map("notes"), &ids[0].to_string()).unwrap();
+        let meta = schema::child_map(&note, "meta").unwrap();
+        meta.delete("created-at").unwrap();
+        meta.insert("created", instant(1)).unwrap();
+        meta.insert("updated-at", instant(5)).unwrap();
+        index.update_note(&space, ids[0], &|_| None).unwrap();
+        assert_eq!(find(&index, "@updated-at=2026-01-05Z"), [ids[0]]);
+        assert!(find(&index, "@updated-at=2026-01-02Z").is_empty());
+        assert_eq!(find(&index, "@created-at=2026-01-01Z"), [ids[0]]);
+        space.delete_note(ids[0]).unwrap();
+        index.update_note(&space, ids[0], &|_| None).unwrap();
+        assert!(find(&index, "@updated-at=2026-01-05Z").is_empty());
+    }
+
+    // Checks relative calendar date comparisons and ranges through the search index.
+    #[test]
+    fn relative_calendar_dates_work_in_comparisons_and_ranges() {
+        let today = chrono::Local::now().date_naive();
+        let mut space = Space::create(Id::generate()).unwrap();
+        let mut ids = Vec::new();
+        // Keep calendar order so expected result prefixes describe inclusive comparisons.
+        for (title, date) in [
+            ("A yesterday", Some(today.pred_opt().unwrap())),
+            ("B today", Some(today)),
+            ("C tomorrow", Some(today.succ_opt().unwrap())),
+            ("D no date", None),
+        ] {
+            let id = space.create_work(schema::TASK, title, None).unwrap();
+            if let Some(date) = date {
+                space
+                    .set_field(id, "scheduled-on", &schema::Value::Date(date.to_string()))
+                    .unwrap();
+                let due = date.checked_add_days(chrono::Days::new(6)).unwrap();
+                space.set_field(id, "due-on", &schema::Value::Date(due.to_string())).unwrap();
+            }
+            ids.push(id);
+        }
+        let mut index = Index::in_memory().unwrap();
+        index.rebuild(&space, &|_| None).unwrap();
+        let search =
+            |query: &str| search_indexes([(space.id().unwrap(), &index)], query, Sort::Title, 20);
+        for (query, expected) in [
+            ("@scheduled-on<=-1d", &ids[..1]),
+            ("@scheduled-on<=today", &ids[..2]),
+            ("@scheduled-on<=+1d", &ids[..3]),
+            ("@scheduled-on=-1d...+1d", &ids[..3]),
+            ("@scheduled-on=-1d..today+1d", &ids[..2]),
+            ("@scheduled-on=+1d", &ids[2..3]),
+            ("@scheduled-on<=today-1d", &ids[..1]),
+            ("@scheduled-on<=today+1d", &ids[..3]),
+            ("@scheduled-on=today-1w...+2w", &ids[..3]),
+            ("@scheduled-on=-0d...today+0d", &ids[1..2]),
+            ("@scheduled-on=today+0w", &ids[1..2]),
+            ("@due-on=+6d", &ids[1..2]),
+            ("@due-on=today+6d", &ids[1..2]),
+        ] {
+            let found: Vec<_> = search(query).unwrap().into_iter().map(|(_, hit)| hit.id).collect();
+            assert_eq!(found, expected, "{query}");
+        }
+        for query in [
+            "@scheduled-on<=today+1m",
+            "@scheduled-on<=tomorrow",
+            "@scheduled-on<=yesterday",
+            "@scheduled-on=+1m",
+            "@scheduled-on=today...today+1",
+            "@scheduled-on=today...tomorrow",
+            "@captured-at<=+6d",
+            "@captured-at<=tomorrow",
+            "@captured-at<=today+1d",
+        ] {
+            assert!(search(query).is_err(), "{query}");
+        }
+    }
+
+    #[test]
+    fn task_search_uses_inheritance_and_reindexes_descendants() {
+        use crate::schema::Value;
+
+        let mut space = Space::create(Id::generate()).unwrap();
+        let project = space.create_work(schema::PROJECT, "Project", None).unwrap();
+        let task = space.create_work(schema::TASK, "Task", Some(project)).unwrap();
+        let child = space.create_work(schema::TASK, "Subtask", Some(task)).unwrap();
+        let standalone = space.create_work(schema::TASK, "Standalone", None).unwrap();
+        space.set_field(project, "due-on", &Value::Date("2026-11-30".into())).unwrap();
+        space.set_field(project, "scheduled-on", &Value::Date("9999-01-01".into())).unwrap();
+        let mut index = Index::in_memory().unwrap();
+        index.rebuild(&space, &|_| None).unwrap();
+        let find = |index: &Index, query: &str| {
+            search_indexes([(space.id().unwrap(), index)], query, Sort::Due, 20)
+                .unwrap()
+                .into_iter()
+                .map(|(_, hit)| hit.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(find(&index, crate::work::WORK_QUERY), [standalone]);
+        assert_eq!(find(&index, &format!("@project={project} @type=task")), [child, task]);
+        assert_eq!(find(&index, &format!("@parent-id={project} @type=task")), [task]);
+        assert_eq!(find(&index, &format!("@parent-id={task}")), [child]);
+        assert_eq!(find(&index, "@type=task @parent-id!?"), [standalone]);
+        let names = super::super::field_names([&index]);
+        assert!(names.iter().any(|name| name == "parent-id"));
+        assert!(!names.iter().any(|name| name == "parent"));
+        assert_eq!(find(&index, "@type=task @due-on=2026-11-30"), [child, task]);
+        space.set_field(task, "scheduled-on", &Value::Date("0001-01-01".into())).unwrap();
+        index.update_note(&space, task, &|_| None).unwrap();
+        // The closure above holds an immutable reference, so use a fresh query after edits.
+        let matches = |space: &Space, index: &Index, query: &str| {
+            search_indexes([(space.id().unwrap(), index)], query, Sort::Due, 20)
+                .unwrap()
+                .into_iter()
+                .map(|(_, hit)| hit.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matches(&space, &index, crate::work::WORK_QUERY), [child, task, standalone]);
+        space.set_field(task, "completed-on", &Value::Date(crate::work::today())).unwrap();
+        index.update_note(&space, task, &|_| None).unwrap();
+        assert_eq!(matches(&space, &index, crate::work::WORK_QUERY), [child, standalone]);
+        assert_eq!(matches(&space, &index, "@completed-on=today"), [task]);
+        assert_eq!(matches(&space, &index, "@completed-on=-1d...+1d"), [task]);
+        assert_eq!(matches(&space, &index, "@completed-on?"), [task]);
+        assert!(
+            search_indexes([(space.id().unwrap(), &index)], "@completed-on=true", Sort::Due, 20)
+                .is_err()
+        );
+        space.set_field(project, "due-on", &Value::Date("2026-12-02".into())).unwrap();
+        index.update_note(&space, project, &|_| None).unwrap();
+        assert!(matches(&space, &index, "@due-on=2026-11-30").is_empty());
+        assert_eq!(matches(&space, &index, "@type=task @due-on=2026-12-02"), [child, task]);
+        space.delete_note(project).unwrap();
+        index.update_note(&space, project, &|_| None).unwrap();
+        assert!(matches(&space, &index, &format!("@project={project}")).is_empty());
+        assert!(matches(&space, &index, "@due-on?").is_empty());
+        assert_eq!(matches(&space, &index, "@type=task"), [standalone]);
+        for id in [child, project, task] {
+            assert!(matches(&space, &index, &format!("@id={id}")).is_empty());
+        }
+    }
 
     // Checks the search ranges specification's timestamp inputs section through the search index.
     #[test]
@@ -617,15 +850,18 @@ mod tests {
         space.create_note(schema::NOTE, "Garden plans").unwrap();
         let mut index = Index::in_memory().unwrap();
         index.rebuild(&space, &|_| None).unwrap();
+        let names = super::super::field_names([&index]);
+        assert!(names.iter().any(|name| name == "id"));
+        assert!(!names.iter().any(|name| name == "note-id"));
         let search =
             |query: &str| search_indexes([(space.id().unwrap(), &index)], query, Sort::Title, 10);
 
         let upper_id = note.to_string().to_ascii_uppercase();
-        let hits = search(&format!("garden @note-id=\"{upper_id}\"")).unwrap();
+        let hits = search(&format!("garden @id=\"{upper_id}\"")).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1.id, note);
-        assert!(search("@note-id=\"01m7mpqsqre0b8y1y7gff6bv88\"").unwrap().is_empty());
-        assert!(matches!(search("@note-id=invalid"), Err(Error::SearchQuery(_))));
+        assert!(search("@id=\"01m7mpqsqre0b8y1y7gff6bv88\"").unwrap().is_empty());
+        assert!(matches!(search("@id=invalid"), Err(Error::SearchQuery(_))));
     }
 
     #[test]

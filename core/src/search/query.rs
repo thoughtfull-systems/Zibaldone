@@ -276,7 +276,7 @@ fn error(message: impl Into<String>) -> Error {
 impl Clause<'_> {
     pub fn note_id(&self) -> Result<Id> {
         if !matches!(self.op, Operator::Equal) {
-            return Err(error("Use @note-id= followed by a note ID"));
+            return Err(error("Use @id= followed by a note ID"));
         }
         Id::parse(&self.value).map_err(|_| error(format!("Invalid note ID {:?}", self.value)))
     }
@@ -394,7 +394,10 @@ impl Clause<'_> {
         let invalid = || {
             let expected = match kind {
                 Kind::Boolean => "true or false",
-                Kind::Date => "a date in YYYY-MM-DD format",
+                Kind::Date => concat!(
+                    "a YYYY-MM-DD date, today, or a signed day/week offset ",
+                    "such as +6d, today+6d, or -2w"
+                ),
                 Kind::Decimal => "a decimal number",
                 Kind::Integer => "an integer",
                 Kind::Link => "a note ID",
@@ -406,7 +409,10 @@ impl Clause<'_> {
         };
         let value = match kind {
             Kind::Boolean => i64::from(raw.parse::<bool>().map_err(|_| invalid())?).into(),
-            Kind::Date if schema::is_date(raw) => raw.to_owned().into(),
+            Kind::Date => relative_date(raw, chrono::Local::now().date_naive())
+                .or_else(|| schema::is_date(raw).then(|| raw.to_owned()))
+                .ok_or_else(invalid)?
+                .into(),
             Kind::Decimal if schema::is_decimal(raw) => decimal_key(raw).into(),
             Kind::Integer => raw.parse::<i64>().map_err(|_| invalid())?.into(),
             Kind::Link => Id::parse(raw).map_err(|_| invalid())?.to_string().into(),
@@ -421,6 +427,34 @@ impl Clause<'_> {
         };
         Ok(value)
     }
+}
+
+fn relative_date(raw: &str, today: chrono::NaiveDate) -> Option<String> {
+    let offset = match raw.strip_prefix("today") {
+        Some(offset) => offset,
+        None if raw.starts_with(['+', '-']) => raw,
+        None => return None,
+    };
+    let mut date = today;
+    if !offset.is_empty() {
+        let (amount, advance) = if let Some(amount) = offset.strip_prefix('+') {
+            (amount, true)
+        } else {
+            (offset.strip_prefix('-')?, false)
+        };
+        let (count, scale) = if let Some(count) = amount.strip_suffix('d') {
+            (count, 1)
+        } else {
+            (amount.strip_suffix('w')?, 7)
+        };
+        if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let days = chrono::Days::new(count.parse::<u64>().ok()?.checked_mul(scale)?);
+        date = if advance { date.checked_add_days(days)? } else { date.checked_sub_days(days)? };
+    }
+    let value = date.format("%Y-%m-%d").to_string();
+    schema::is_date(&value).then_some(value)
 }
 
 fn comparable_choice(def: &FieldDef, value: &str) -> bool {
@@ -448,5 +482,85 @@ pub(super) fn decimal_key(value: &str) -> String {
         format!("0{}", key.bytes().map(|b| char::from(b'~' - b)).collect::<String>())
     } else {
         format!("1{key}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_date;
+
+    // Checks the search ranges specification's relative calendar dates at date boundaries.
+    #[test]
+    fn relative_calendar_dates_cross_month_year_leap_and_daylight_saving_boundaries() {
+        for (date, previous, next) in [
+            ("2026-01-01", "2025-12-31", "2026-01-02"),
+            ("2026-03-08", "2026-03-07", "2026-03-09"),
+            ("2026-11-01", "2026-10-31", "2026-11-02"),
+            ("2028-03-01", "2028-02-29", "2028-03-02"),
+        ] {
+            let today = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+            assert_eq!(relative_date("today", today).as_deref(), Some(date));
+            for prefix in ["", "today"] {
+                assert_eq!(relative_date(&format!("{prefix}+1d"), today).as_deref(), Some(next));
+                assert_eq!(
+                    relative_date(&format!("{prefix}-1d"), today).as_deref(),
+                    Some(previous)
+                );
+            }
+            assert_eq!(relative_date("today+7m", today), None);
+        }
+    }
+
+    // Checks the search ranges specification's relative date offsets and their validation.
+    #[test]
+    fn relative_date_offsets_use_calendar_days_and_weeks() {
+        for (date, query, expected) in [
+            ("2026-01-01", "today+002d", "2026-01-03"),
+            ("2026-01-01", "today+0d", "2026-01-01"),
+            ("2026-01-01", "today+2w", "2026-01-15"),
+            ("2026-01-01", "today+3d", "2026-01-04"),
+            ("2026-01-01", "today+6d", "2026-01-07"),
+            ("2026-01-01", "today-0w", "2026-01-01"),
+            ("2026-01-01", "today-2w", "2025-12-18"),
+            ("2026-01-01", "today-3d", "2025-12-29"),
+            ("2026-03-07", "today+2d", "2026-03-09"),
+            ("2026-11-02", "today-1w", "2026-10-26"),
+            ("2028-03-01", "today-1d", "2028-02-29"),
+        ] {
+            let today = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+            assert_eq!(relative_date(query, today).as_deref(), Some(expected), "{query}");
+            let short = query.strip_prefix("today").unwrap();
+            assert_eq!(relative_date(short, today).as_deref(), Some(expected), "{short}");
+        }
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        for query in [
+            "",
+            "+",
+            "+1",
+            "+1.5w",
+            "+é1d",
+            "-1m",
+            "6d",
+            "todayx1d",
+            "today+",
+            "today+1",
+            "today+1D",
+            "today+1m",
+            "today+1.5w",
+            "today+-1d",
+            "today+1d-1w",
+            "today+ 1d",
+            "today+18446744073709551616d",
+            "today+18446744073709551615w",
+            "today-18446744073709551615d",
+            "today+9999999d",
+            "today-999999d",
+            "tomorrow",
+            "tomorrow+1d",
+            "yesterday",
+            "yesterday-1w",
+        ] {
+            assert_eq!(relative_date(query, today), None, "{query}");
+        }
     }
 }

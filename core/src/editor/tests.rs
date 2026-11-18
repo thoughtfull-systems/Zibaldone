@@ -127,11 +127,11 @@ fn undo_leaves_other_changes_alone() {
     let mut e = editor("one|");
     e.insert(" two");
     // A change the core makes for itself, such as to a note's metadata.
-    e.doc.get_map("meta").insert("updated", 1).unwrap();
+    e.doc.get_map("meta").insert("updated-at", 1).unwrap();
     e.doc.commit_with(CommitOptions::new().origin(ORIGIN));
     assert!(e.undo());
     assert_eq!(e.text(), "one");
-    assert!(e.doc.get_map("meta").get("updated").is_some());
+    assert!(e.doc.get_map("meta").get("updated-at").is_some());
 }
 
 #[test]

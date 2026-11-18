@@ -27,9 +27,11 @@ editor keeps its draft and offers a copy. Concurrent offline saves still merge a
 They don't combine one device's query with another device's scope or sort order.
 
 Definitions describe searches, not result membership. Each machine runs the query against its local
-indexes. The desktop keeps its open definition, unsaved drafts, sidebar visibility, selection, and
-scroll position in the window's session. Closing and reopening the window within the running
-instance retains that session. Restarting the instance opens a new search.
+indexes. The desktop keeps its open definition, unsaved drafts, selection, and scroll position in
+the window's session. Closing and reopening the window within the running instance retains that
+session. Restarting the instance opens a new search. Store the sidebar's width and visibility in the
+machine configuration, apart from synced search definitions. Use a divider for resizing and hide the
+sidebar at 100 logical pixels or less, retaining its last usable width for the toggle button.
 
 ## Rejected alternatives
 

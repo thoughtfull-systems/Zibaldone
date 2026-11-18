@@ -49,11 +49,13 @@ pub fn run(state: Arc<State>, runtime: tokio::runtime::Handle) -> glib::ExitCode
 fn startup(app: &adw::Application, state: Arc<State>) {
     // Keep running with no window open, until the owner quits.
     std::mem::forget(app.hold());
+    let window: std::rc::Rc<std::cell::RefCell<Option<Window>>> = std::rc::Rc::default();
     let quit = gio::SimpleAction::new("quit", None);
     let quitting = app.downgrade();
+    let closing = window.clone();
     quit.connect_activate(move |_, _| {
         if let Some(app) = quitting.upgrade() {
-            app.quit();
+            request_quit(app, closing.borrow().clone());
         }
     });
     app.add_action(&quit);
@@ -61,7 +63,6 @@ fn startup(app: &adw::Application, state: Arc<State>) {
 
     let (sender, receiver) = async_channel::unbounded();
     state.set_ui(sender);
-    let window: std::rc::Rc<std::cell::RefCell<Option<Window>>> = std::rc::Rc::default();
     let app = app.clone();
     glib::spawn_future_local(async move {
         while let Ok(event) = receiver.recv().await {
@@ -89,7 +90,7 @@ fn startup(app: &adw::Application, state: Arc<State>) {
                         shown.restore_last_note();
                     }
                 }
-                UiEvent::Quit => app.quit(),
+                UiEvent::Quit => request_quit(app.clone(), window.borrow().clone()),
                 UiEvent::Changed(space) => {
                     if let Some(shown) = window.borrow().clone() {
                         shown.space_changed(space);
@@ -117,5 +118,20 @@ fn startup(app: &adw::Application, state: Arc<State>) {
                 }
             }
         }
+    });
+}
+
+fn request_quit(app: adw::Application, window: Option<Window>) {
+    glib::spawn_future_local(async move {
+        if let Some(window) = window {
+            if !window.finish_task_titles().await {
+                window.present();
+                window.toast("Finish or cancel the task title edit before quitting");
+                return;
+            }
+            window.finish_search_pane().await;
+            window.finish_project_pane().await;
+        }
+        app.quit();
     });
 }
