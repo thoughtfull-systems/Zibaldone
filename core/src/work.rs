@@ -212,12 +212,12 @@ pub(crate) fn validate(space: &Space, id: Id, field: &str, value: Option<&Value>
 }
 
 impl Space {
-    /// Changes only the task's title line, preserving other body edits made since it was loaded.
-    pub fn rename_task(&mut self, id: Id, expected: &str, title: &str) -> Result<String> {
+    /// Changes only a work item's title line, preserving other body edits since it was loaded.
+    pub fn rename_work_title(&mut self, id: Id, expected: &str, title: &str) -> Result<String> {
         let note = self.note(id)?;
         let title = title.trim();
-        if note.type_name != schema::TASK || title.is_empty() || title.contains(['\n', '\r']) {
-            return Err(Error::Space("Enter a task title on one line".into()));
+        if !is_work(&note.type_name) || title.is_empty() || title.contains(['\n', '\r']) {
+            return Err(Error::Space("Enter a title on one line".into()));
         }
         let range = title_range(&note.body);
         let current = &note.body[range.clone()];
@@ -239,6 +239,14 @@ impl Space {
         self.insert_text(id, at, &replacement)?;
         self.commit();
         Ok(replacement)
+    }
+
+    /// Retains the task-only entry point for callers that don't edit project titles.
+    pub fn rename_task(&mut self, id: Id, expected: &str, title: &str) -> Result<String> {
+        if self.note(id)?.type_name != schema::TASK {
+            return Err(Error::Space("Enter a task title on one line".into()));
+        }
+        self.rename_work_title(id, expected, title)
     }
 
     pub fn create_work(&mut self, type_name: &str, body: &str, parent: Option<Id>) -> Result<Id> {
@@ -358,6 +366,19 @@ mod tests {
         assert!(space.rename_task(task, &title, "One\nTwo").is_err());
         let ordinary = space.create_note(schema::NOTE, "Ordinary note").unwrap();
         assert!(space.rename_task(ordinary, "Ordinary note", "Task").is_err());
+    }
+
+    #[test]
+    fn editing_a_project_title_preserves_its_design_notes() {
+        let mut space = Space::create(Id::generate()).unwrap();
+        let project =
+            space.create_work(schema::PROJECT, "# Original\n\nDesign notes", None).unwrap();
+        space.rename_work_title(project, "# Original", "New project").unwrap();
+        assert_eq!(space.note(project).unwrap().body, "# New project\n\nDesign notes");
+        assert!(matches!(
+            space.rename_work_title(project, "# Original", "Stale"),
+            Err(Error::NoteChanged(_))
+        ));
     }
 
     #[test]

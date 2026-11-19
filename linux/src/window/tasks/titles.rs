@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gdk, glib};
+use zib_core::schema;
 use zib_core::work::{Item, raw_title};
 use zib_core::{Error, Id};
 
@@ -19,11 +20,66 @@ pub(super) struct TitleEdit {
     conflicted: Cell<bool>,
     entry: gtk::Entry,
     expected: RefCell<String>,
+    finish: Cell<bool>,
+    label: gtk::Label,
     saved: RefCell<String>,
+    view: gtk::Stack,
     timer: RefCell<Option<glib::SourceId>>,
 }
 
 impl TitleEdit {
+    fn new(item: &Item) -> Rc<Self> {
+        let entry = gtk::Entry::builder()
+            .text(&item.title)
+            .hexpand(true)
+            .width_chars(8)
+            .max_width_chars(40)
+            .valign(gtk::Align::Center)
+            .build();
+        entry.add_css_class("zib-work-title-entry");
+        entry.set_enable_undo(true);
+        let name =
+            if item.note.type_name == schema::PROJECT { "Project title" } else { "Task title" };
+        entry.update_property(&[gtk::accessible::Property::Label(name)]);
+        entry.set_tooltip_text(Some("Title · Enter or leave the field to save"));
+        let label = gtk::Label::builder()
+            .label(&item.title)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        label.add_css_class("zib-work-title-text");
+        let button = gtk::Button::builder().child(&label).hexpand(true).build();
+        button.add_css_class("flat");
+        button.add_css_class("zib-work-title");
+        button.set_tooltip_text(Some("Edit title"));
+        let view =
+            gtk::Stack::builder().hexpand(true).hhomogeneous(false).vhomogeneous(false).build();
+        view.add_named(&button, Some("label"));
+        view.add_named(&entry, Some("entry"));
+        view.set_visible_child_name("label");
+        let edit = Rc::new(TitleEdit {
+            busy: Cell::new(false),
+            changing: Cell::new(false),
+            conflicted: Cell::new(false),
+            entry: entry.clone(),
+            expected: RefCell::new(raw_title(&item.note.body).into()),
+            finish: Cell::new(false),
+            label,
+            view,
+            saved: RefCell::new(item.title.clone()),
+            timer: RefCell::default(),
+        });
+        let opening = Rc::downgrade(&edit);
+        button.connect_clicked(move |_| {
+            if let Some(edit) = opening.upgrade() {
+                edit.finish.set(false);
+                edit.view.set_visible_child_name("entry");
+                edit.entry.grab_focus();
+            }
+        });
+        edit
+    }
+
     fn dirty(&self) -> bool {
         self.entry.text().trim() != *self.saved.borrow()
     }
@@ -35,14 +91,26 @@ impl TitleEdit {
         if self.entry.text().as_str() != item.title {
             self.entry.set_text(&item.title);
         }
+        self.label.set_text(&item.title);
         self.entry.remove_css_class("error");
-        self.entry.set_tooltip_text(Some("Task title · Enter or leave the field to save"));
+        self.entry.set_tooltip_text(Some("Title · Enter or leave the field to save"));
         self.conflicted.set(false);
         self.changing.set(false);
+    }
+    fn finish_if_saved(&self) {
+        if self.finish.get() && !self.dirty() && !self.busy.get() && !self.conflicted.get() {
+            self.view.set_visible_child_name("label");
+            self.finish.set(false);
+        }
     }
 }
 
 impl Window {
+    pub(super) fn work_title_view(&self, space: Id, item: &Item) -> gtk::Stack {
+        self.task_title_entry(space, item);
+        self.inner().work.titles.borrow()[&(space, item.note.id)].view.clone()
+    }
+
     pub(super) fn task_title_entry(&self, space: Id, item: &Item) -> gtk::Entry {
         let id = item.note.id;
         if let Some(edit) = self.inner().work.titles.borrow().get(&(space, id)) {
@@ -51,30 +119,14 @@ impl Window {
             }
             return edit.entry.clone();
         }
-        let entry = gtk::Entry::builder()
-            .text(&item.title)
-            .hexpand(true)
-            .width_chars(8)
-            .max_width_chars(40)
-            .valign(gtk::Align::Center)
-            .build();
-        entry.set_enable_undo(true);
-        entry.update_property(&[gtk::accessible::Property::Label("Task title")]);
-        entry.set_tooltip_text(Some("Task title · Enter or leave the field to save"));
-        let edit = Rc::new(TitleEdit {
-            busy: Cell::new(false),
-            changing: Cell::new(false),
-            conflicted: Cell::new(false),
-            entry: entry.clone(),
-            expected: RefCell::new(raw_title(&item.note.body).into()),
-            saved: RefCell::new(item.title.clone()),
-            timer: RefCell::default(),
-        });
+        let edit = TitleEdit::new(item);
+        let entry = edit.entry.clone();
         self.inner().work.titles.borrow_mut().insert((space, id), edit.clone());
         let w = self.clone();
         let editing = Rc::downgrade(&edit);
         entry.connect_changed(move |_| {
             let Some(edit) = editing.upgrade().filter(|e| !e.changing.get()) else { return };
+            edit.finish.set(false);
             if let Some(timer) = edit.timer.take() {
                 timer.remove();
             }
@@ -87,13 +139,31 @@ impl Window {
                     next.save_task_title(space, id);
                 }));
         });
-        let w = self.clone();
-        entry.connect_activate(move |_| w.save_task_title(space, id));
+        let (w, finishing) = (self.clone(), Rc::downgrade(&edit));
+        entry.connect_activate(move |_| {
+            if let Some(edit) = finishing.upgrade() {
+                edit.finish.set(true);
+            }
+            w.save_task_title(space, id);
+        });
         let focus = gtk::EventControllerFocus::new();
-        let w = self.clone();
-        focus.connect_enter(move |_| w.inner().work.selected.set(Some(id)));
-        let w = self.clone();
-        focus.connect_leave(move |_| w.save_task_title(space, id));
+        let (w, opening) = (self.clone(), Rc::downgrade(&edit));
+        let task = item.note.type_name == schema::TASK;
+        focus.connect_enter(move |_| {
+            if let Some(edit) = opening.upgrade() {
+                edit.finish.set(false);
+            }
+            if task {
+                w.inner().work.selected.set(Some(id));
+            }
+        });
+        let (w, finishing) = (self.clone(), Rc::downgrade(&edit));
+        focus.connect_leave(move |_| {
+            if let Some(edit) = finishing.upgrade() {
+                edit.finish.set(true);
+            }
+            w.save_task_title(space, id);
+        });
         entry.add_controller(focus);
         let keys = gtk::EventControllerKey::new();
         let w = self.clone();
@@ -105,6 +175,8 @@ impl Window {
                 && let Some(item) = w.inner().work.tree.borrow().items.get(&id)
             {
                 edit.load(item);
+                edit.finish.set(true);
+                edit.finish_if_saved();
             }
             glib::Propagation::Stop
         });
@@ -120,6 +192,7 @@ impl Window {
             timer.remove();
         }
         if edit.busy.get() || edit.conflicted.get() || !edit.dirty() {
+            edit.finish_if_saved();
             return;
         }
         let title = edit.entry.text().trim().to_owned();
@@ -142,13 +215,17 @@ impl Window {
             match result {
                 Ok(line) => {
                     *edit.expected.borrow_mut() = line;
+                    edit.label.set_text(&title);
                     *edit.saved.borrow_mut() = title;
                     edit.entry.remove_css_class("error");
+                    edit.finish_if_saved();
                     if edit.dirty() {
                         w.save_task_title(space, note);
                     }
                 }
                 Err(error) => {
+                    edit.finish.set(false);
+                    edit.view.set_visible_child_name("entry");
                     edit.conflicted.set(true);
                     edit.entry.add_css_class("error");
                     let message = if matches!(error, Error::NoteChanged(_)) {
@@ -209,7 +286,7 @@ impl Window {
         let Some(key) = space.zip(work.selected.get()) else { return };
         let Some(edit) = work.titles.borrow().get(&key).cloned() else { return };
         let w = self.clone();
-        edit.entry.add_tick_callback(move |entry, _| {
+        edit.view.add_tick_callback(move |view, _| {
             let inner = w.inner();
             let (content, scroll) = if inner.project_pane.is_project() {
                 (&inner.project_pane.content, &inner.project_pane.scroll)
@@ -217,7 +294,7 @@ impl Window {
                 (&inner.editor_content, &inner.editor_scroll)
             };
             if w.inner().work.selected.get() == Some(key.1)
-                && let Some(bounds) = entry.compute_bounds(content)
+                && let Some(bounds) = view.compute_bounds(content)
             {
                 let adjustment = scroll.vadjustment();
                 let top = (f64::from(bounds.y()) - 30.0).max(0.0);

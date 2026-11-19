@@ -17,6 +17,7 @@ use super::Window;
 
 mod controls;
 mod drag;
+mod flow;
 mod quick_add;
 mod status;
 mod titles;
@@ -30,9 +31,10 @@ pub(super) struct WorkPanel {
     expanded: RefCell<HashSet<Id>>,
     generation: Cell<u64>,
     pub header: gtk::Box,
-    popovers: Cell<usize>,
+    pub(super) popovers: Cell<usize>,
     project_prefix: gtk::SizeGroup,
     refresh_pending: Cell<bool>,
+    pub(super) results_pending: Cell<bool>,
     reveal: Cell<bool>,
     pub selected: Cell<Option<Id>>,
     task_prefix: gtk::SizeGroup,
@@ -62,12 +64,28 @@ impl WorkPanel {
             popovers: Cell::new(0),
             project_prefix: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
             refresh_pending: Cell::new(false),
+            results_pending: Cell::new(false),
             reveal: Cell::new(false),
             selected: Cell::new(None),
             task_prefix: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
             titles: RefCell::default(),
             tree: RefCell::default(),
             widget,
+        }
+    }
+}
+
+pub(super) fn style_work_row(row: &impl IsA<gtk::Widget>, item: &Item, tree: &Tree) {
+    row.add_css_class("zib-work-emphasis");
+    if item.completed() {
+        row.add_css_class("dim-label");
+    } else {
+        let due = tree.date(item.note.id, "due-on");
+        let (_, class) = zib_core::work::urgency(due.as_ref().map(|date| date.value.as_str()));
+        match class {
+            "error" => row.add_css_class("zib-work-overdue"),
+            "warning" => row.add_css_class("zib-work-warning"),
+            _ => {}
         }
     }
 }
@@ -198,7 +216,13 @@ impl Window {
         work.generation.set(generation);
         let (w, state) = (self.clone(), self.inner().state.clone());
         glib::spawn_future_local(async move {
-            let Ok(tree) = core(async move { state.work_tree(space).await }).await else { return };
+            let loaded = core(async move {
+                let tree = state.work_tree(space).await?;
+                let completed = state.show_completed(space, note).await?;
+                Ok::<_, zib_core::Error>((tree, completed))
+            })
+            .await;
+            let Ok((tree, completed)) = loaded else { return };
             if w.inner().work.generation.get() != generation
                 || !w
                     .inner()
@@ -217,6 +241,7 @@ impl Window {
             if selected.is_some_and(|id| tree.context(id) != note) {
                 w.inner().work.selected.set(None);
             }
+            w.inner().work.completed.set(completed);
             *w.inner().work.tree.borrow_mut() = tree;
             w.draw_work(space, note);
         });
@@ -246,22 +271,12 @@ impl Window {
             .into_iter()
             .filter(|id| tree.items[id].note.type_name == schema::PROJECT)
         {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             let item = &tree.items[&child];
             let prefix = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             self.work_drag_handle(&prefix, space, item);
             prefix.append(&gtk::Label::new(Some("▧")));
             work.project_prefix.add_widget(&prefix);
-            row.append(&prefix);
-            let button = gtk::Button::with_label(&format!("{} →", tree.items[&child].title));
-            button.set_halign(gtk::Align::Start);
-            button.add_css_class("flat");
-            button.add_css_class("zib-subproject-link");
-            let w = self.clone();
-            button.connect_clicked(move |_| w.open_note(space, child));
-            row.append(&button);
-            self.work_drop_target(&row, space, item);
-            work.widget.append(&row);
+            work.widget.append(&self.work_row(space, item, 0, &tree, &prefix));
         }
         if item.note.type_name == schema::PROJECT {
             self.work_addition(space, note, schema::PROJECT);
@@ -274,8 +289,18 @@ impl Window {
         completed.set_active(work.completed.get());
         let w = self.clone();
         completed.connect_toggled(move |button| {
-            w.inner().work.completed.set(button.is_active());
-            w.refresh_work();
+            button.set_sensitive(false);
+            let completed = button.is_active();
+            let (w, state) = (w.clone(), w.inner().state.clone());
+            glib::spawn_future_local(async move {
+                let saved =
+                    core(async move { state.set_show_completed(space, note, completed).await })
+                        .await;
+                if let Err(error) = saved {
+                    w.toast(&format!("Couldn't save Show completed: {error}"));
+                }
+                w.refresh_work();
+            });
         });
         heading.append(&completed);
         work.widget.append(&heading);
@@ -338,8 +363,6 @@ impl Window {
     fn task_row(&self, space: Id, item: &Item, depth: i32, tree: &Tree) {
         let work = &self.inner().work;
         let id = item.note.id;
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        row.set_margin_start(depth.min(8) * 14);
         let handles = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         self.work_drag_handle(&handles, space, item);
         let children = tree.children(id);
@@ -360,15 +383,45 @@ impl Window {
         completion.add_css_class("zib-task-completion");
         handles.append(&completion);
         work.task_prefix.add_widget(&handles);
-        row.append(&handles);
-        let title = self.task_title_entry(space, item);
-        if let Some(parent) = title.parent().and_downcast::<gtk::Box>() {
+        work.widget.append(&self.work_row(space, item, depth, tree, &handles));
+    }
+
+    fn work_row(
+        &self,
+        space: Id,
+        item: &Item,
+        depth: i32,
+        tree: &Tree,
+        prefix: &gtk::Box,
+    ) -> gtk::Box {
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        row.add_css_class("zib-work-row");
+        style_work_row(&row, item, tree);
+        row.set_margin_start(depth.min(8) * 14);
+        let grid = gtk::Grid::builder().column_spacing(4).row_spacing(0).build();
+        prefix.set_valign(gtk::Align::Center);
+        grid.attach(prefix, 0, 0, 1, 1);
+        let title = self.work_title_view(space, item);
+        if let Some(parent) = title.parent().and_downcast::<gtk::Grid>() {
             parent.remove(&title);
         }
-        row.append(&title);
-        self.work_controls(&row, space, item, tree);
+        grid.attach(&title, 1, 0, 1, 1);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        actions.set_halign(gtk::Align::End);
+        if item.note.type_name == schema::PROJECT {
+            let open = gtk::Button::from_icon_name("go-next-symbolic");
+            open.add_css_class("flat");
+            open.set_tooltip_text(Some("Open subproject"));
+            let (w, id) = (self.clone(), item.note.id);
+            open.connect_clicked(move |_| w.open_note(space, id));
+            actions.append(&open);
+        }
+        actions.append(&self.task_actions(space, item, tree));
+        grid.attach(&actions, 2, 0, 1, 1);
+        grid.attach(&self.work_details(space, item, tree), 1, 1, 2, 1);
+        row.append(&grid);
         self.work_drop_target(&row, space, item);
-        work.widget.append(&row);
+        row
     }
 
     fn completion(&self, space: Id, item: &Item) -> gtk::CheckButton {

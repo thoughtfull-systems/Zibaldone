@@ -24,6 +24,7 @@ use crate::state::State;
 use crate::tables;
 
 mod project_pane;
+mod results;
 mod search_completion;
 mod search_pane;
 mod search_sidebar;
@@ -714,109 +715,6 @@ impl Window {
         });
     }
 
-    /// Fills the note list with the notes or search results from the spaces that show.
-    fn reload_notes(&self) {
-        let generation = self.inner().generation.get() + 1;
-        self.inner().generation.set(generation);
-        let w = self.clone();
-        let state = self.inner().state.clone();
-        let query = self.search_definition().query;
-        let sort = self.inner().sort.get();
-        let spaces = self.search_spaces();
-        let names: HashMap<Id, String> = spaces.iter().cloned().collect();
-        let several = spaces.len() > 1;
-        glib::spawn_future_local(async move {
-            // Each row: its space, its note, its title, and its subtitle, as Pango markup.
-            let mut rows: Vec<(Id, Id, String, String)> = Vec::new();
-            let work_state = state.clone();
-            let work_spaces: Vec<_> = spaces.iter().map(|(id, _)| *id).collect();
-
-            if query.trim().is_empty() && sort != Sort::Due {
-                let notes = core(async move {
-                    let mut all = Vec::new();
-                    for (space, _) in spaces {
-                        let notes = state.notes(space).await.unwrap_or_default();
-                        all.extend(notes.into_iter().map(|note| (space, note)));
-                    }
-                    all.sort_by(|(a_space, a), (b_space, b)| {
-                        let order = if sort == Sort::Title {
-                            Sort::compare_titles(&a.plain, &b.plain)
-                        } else {
-                            b.updated.cmp(&a.updated)
-                        };
-                        order.then_with(|| a.id.cmp(&b.id)).then_with(|| a_space.cmp(b_space))
-                    });
-                    all
-                })
-                .await;
-                for (space, note) in notes {
-                    let title = if note.plain.trim().is_empty() { "Untitled" } else { &note.plain };
-                    let mut subtitle = Vec::new();
-                    if several {
-                        subtitle.extend(names.get(&space).cloned());
-                    }
-                    if note.type_name != "note" {
-                        subtitle.push(note.type_name.clone());
-                    }
-                    let subtitle = glib::markup_escape_text(&subtitle.join(" · ")).to_string();
-                    rows.push((space, note.id, escape(title), subtitle));
-                }
-            } else {
-                let ids: Vec<_> = spaces.into_iter().map(|(id, _)| id).collect();
-                match core(async move { state.search_shown(&ids, &query, sort, 50) }).await {
-                    Ok(hits) => {
-                        for (space, hit) in hits {
-                            rows.push((
-                                space,
-                                hit.id,
-                                escape(&hit.title),
-                                snippet_markup(&hit.snippet),
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        if w.inner().generation.get() == generation {
-                            w.search_error(&error);
-                        }
-                        return;
-                    }
-                }
-            }
-            let styles = Self::work_result_context(work_state, work_spaces, &mut rows).await;
-            // A later reload started while this one waited, and fills the list instead.
-            if w.inner().generation.get() != generation {
-                return;
-            }
-            w.search_validated(true);
-            let list = &w.inner().list;
-            let selected = list
-                .selected_row()
-                .and_then(|row| usize::try_from(row.index()).ok())
-                .and_then(|index| w.inner().rows.borrow().get(index).copied());
-            let adjustment = w.inner().results_scroll.vadjustment();
-            let scroll = adjustment.value();
-            list.remove_all();
-            for (space, note, title, subtitle) in &rows {
-                let row = adw::ActionRow::builder()
-                    .title(title.as_str())
-                    .subtitle(subtitle.as_str())
-                    .subtitle_lines(2)
-                    .activatable(true)
-                    .build();
-                if let Some(class) = styles.get(&(*space, *note)) {
-                    row.add_css_class(class);
-                }
-                list.append(&row);
-                if Some((*space, *note)) == selected {
-                    list.select_row(Some(&row));
-                }
-            }
-            *w.inner().rows.borrow_mut() =
-                rows.into_iter().map(|(space, note, _, _)| (space, note)).collect();
-            glib::idle_add_local_once(move || adjustment.set_value(scroll));
-        });
-    }
-
     fn search_error(&self, error: &zib_core::Error) {
         self.search_validated(false);
         self.inner().rows.borrow_mut().clear();
@@ -827,48 +725,6 @@ impl Window {
             .selectable(false)
             .build();
         self.inner().list.append(&row);
-    }
-
-    async fn work_result_context(
-        state: Arc<State>,
-        spaces: Vec<Id>,
-        rows: &mut [(Id, Id, String, String)],
-    ) -> HashMap<(Id, Id), &'static str> {
-        let trees = core(async move {
-            let mut trees = HashMap::new();
-            for space in spaces {
-                if let Ok(tree) = state.work_tree(space).await {
-                    trees.insert(space, tree);
-                }
-            }
-            trees
-        })
-        .await;
-        let mut styles = HashMap::new();
-        for (space, note, _, subtitle) in rows {
-            let Some(tree) = trees.get(space) else { continue };
-            let Some(item) = tree.items.get(note) else { continue };
-            let mut path = tree.path(*note);
-            if path.is_empty() {
-                path = if item.note.type_name == zib_core::schema::TASK {
-                    "Standalone task".into()
-                } else {
-                    "Project".into()
-                };
-            }
-            let due = tree.date(*note, "due-on");
-            let (label, class) = zib_core::work::urgency(due.as_ref().map(|d| d.value.as_str()));
-            let label = if item.completed() { "Completed".into() } else { label };
-            let context = escape(&format!("{path} · {label}"));
-            *subtitle =
-                if subtitle.is_empty() { context } else { format!("{context}\n{subtitle}") };
-            if item.completed() {
-                styles.insert((*space, *note), "dim-label");
-            } else if matches!(class, "error" | "warning") {
-                styles.insert((*space, *note), class);
-            }
-        }
-        styles
     }
 
     /// Something in a space changed through sync or a derivation.
@@ -1106,10 +962,16 @@ impl Window {
         }
         editor.fields = fields;
         let fields = &editor.fields;
+        let work = matches!(editor.type_name.as_str(), "project" | "task");
         let note_id = Value::Text(editor.note.to_string());
         let mut entries: Vec<_> = fields
             .iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "file" | "text" | "thumbnail"))
+            .filter(|(name, value)| {
+                !(matches!(name.as_str(), "file" | "text" | "thumbnail")
+                    || (work
+                        && name == "status"
+                        && matches!(value, Value::Choice(status) if status == "none")))
+            })
             .map(|(name, value)| (name.as_str(), value))
             .collect();
         entries.push(("id", &note_id));

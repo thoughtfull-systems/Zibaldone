@@ -13,6 +13,7 @@ use crate::{Id, Result, Space};
 
 mod query;
 pub mod saved;
+mod snippets;
 mod structured;
 mod timestamp;
 
@@ -77,6 +78,9 @@ pub struct Hit {
     pub id: Id,
     /// The note's title as plain text.
     pub title: String,
+    pub type_name: String,
+    /// Every matching passage, preserving match markers.
+    pub snippets: Vec<String>,
     /// Words around the matches, with each match between `MATCH_START` and `MATCH_END`.
     pub snippet: String,
 }
@@ -290,10 +294,12 @@ impl Index {
     /// Notes that match every word of `query`, each as a prefix, best matches first.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>> {
         let Some(query) = fts_query(query) else { return Ok(Vec::new()) };
-        let mut statement = self.db.prepare(
-            "SELECT id, title, snippet(text, -1, ?2, ?3, '…', 12) FROM text \
-            WHERE text MATCH ?1 ORDER BY bm25(text, 0.0, 10.0, 1.0, 1.0) LIMIT ?4",
-        )?;
+        let excerpt = snippets::highlight("text", &[1, 2, 3], "?2", "?3");
+        let sql = format!(
+            "SELECT id, title, {excerpt}, (SELECT type FROM notes WHERE notes.id = text.id) \
+              FROM text WHERE text MATCH ?1 ORDER BY bm25(text, 0.0, 10.0, 1.0, 1.0) LIMIT ?4"
+        );
+        let mut statement = self.db.prepare(&sql)?;
         let hits = statement
             .query_map(
                 params![
@@ -307,12 +313,15 @@ impl Index {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )?
             .filter_map(|row| {
-                let (id, title, snippet) = row.ok()?;
-                Some(Hit { id: Id::parse(&id).ok()?, title, snippet })
+                let (id, title, highlighted, type_name) = row.ok()?;
+                let snippets = snippets::collect([highlighted]);
+                let snippet = snippets.first().cloned().unwrap_or_default();
+                Some(Hit { id: Id::parse(&id).ok()?, title, type_name, snippets, snippet })
             })
             .collect();
         Ok(hits)

@@ -88,6 +88,15 @@ width so the toggle button restores it. Save width changes 500 milliseconds afte
 movement, and flush pending layout writes when closing the window or quitting. Hiding the sidebar
 preserves the query, drafts, results, and open note.
 
+## Result presentation
+
+Every result shows its title with a small note-type pill beside it, including ordinary notes. The
+next row shows applicable status, scheduled date, and due date. Breadcrumbs follow, including the
+space when results span spaces. Show all matching passages beneath the breadcrumbs, indented from
+the title. Preserve match highlighting, escape markup in source text, and avoid a fixed subtitle
+line limit. Keep distant matches and matches from different fields or search clauses. Date and
+status controls open their pickers directly without navigating away from results.
+
 [decision]: ../decisions/ZIB0022-saved-searches.md
 [document]: space-document.md
 [identifiers]: identifiers.md

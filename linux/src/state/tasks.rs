@@ -10,7 +10,31 @@ use zib_core::{Id, Result};
 
 use super::{State, UiEvent};
 
+const SHOW_COMPLETED: &str = "zib.show-completed";
+
 impl State {
+    pub(crate) async fn show_completed(&self, space: Id, note: Id) -> Result<bool> {
+        let space = self.space(space).await?;
+        let space = space.lock().await;
+        Ok(space.setting(Some(note), SHOW_COMPLETED)? == Some(true.into()))
+    }
+
+    pub(crate) async fn set_show_completed(
+        &self,
+        space_id: Id,
+        note: Id,
+        completed: bool,
+    ) -> Result<()> {
+        let store = self.store.lock().await;
+        let space = self.space(space_id).await?;
+        let mut space = space.lock().await;
+        space.set_setting(Some(note), SHOW_COMPLETED, completed)?;
+        let saved = store.save_space(&space);
+        self.changed_here(space_id);
+        self.send_ui(UiEvent::Changed(space_id));
+        saved
+    }
+
     pub(crate) async fn set_work_status(
         &self,
         space_id: Id,
@@ -87,7 +111,7 @@ impl State {
         let store = self.store.lock().await;
         let space = self.space(space_id).await?;
         let mut space = space.lock().await;
-        let line = space.rename_task(note, expected, title)?;
+        let line = space.rename_work_title(note, expected, title)?;
         let saved = store.save_space(&space);
         self.reindex_note(space_id, &space, note);
         self.changed_here(space_id);

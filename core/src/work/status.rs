@@ -29,7 +29,7 @@ impl Status {
     pub fn label(&self) -> String {
         match self.value.as_str() {
             "maybe" => "Maybe".into(),
-            "none" => "None".into(),
+            "none" => String::new(),
             "someday" => "Someday".into(),
             _ => self
                 .waiting_for
@@ -72,7 +72,7 @@ impl Space {
     pub fn set_work_status(&mut self, id: Id, status: Option<&str>, reason: &str) -> Result<()> {
         let note = self.note(id)?;
         if !is_work(&note.type_name) || status.is_some_and(|status| !Status::valid(status)) {
-            return Err(Error::Space("Choose Maybe, None, Someday, Waiting, or Inherit".into()));
+            return Err(Error::Space("Choose a valid work status".into()));
         }
         let fields = child_map(&note_map(self.doc(), id)?, "fields")?;
         if let Some(status) = status {
@@ -172,6 +172,7 @@ mod tests {
             assert!(Tree::read(&space).status(id).is_none());
             let resolved = Tree::read(&space).resolved_status(id).unwrap();
             assert_eq!(resolved.value, "none");
+            assert!(resolved.label().is_empty());
             assert_eq!(resolved.source, task);
             assert_eq!(resolved.waiting_for, None);
         }

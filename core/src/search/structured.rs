@@ -159,7 +159,15 @@ impl Statement {
         let (excerpt, score) = if scored {
             let start = self.bind(MATCH_START.to_string().into());
             let end = self.bind(MATCH_END.to_string().into());
-            (format!("snippet({table}, {column}, {start}, {end}, '…', 12)"), rank)
+            (
+                super::snippets::highlight(
+                    table,
+                    if column == -1 { &[1, 2, 3] } else { &[2] },
+                    &start,
+                    &end,
+                ),
+                rank,
+            )
         } else {
             ("''".to_owned(), "0.0")
         };
@@ -281,16 +289,14 @@ impl Statement {
                 format!("coalesce(m{n}.score, 0.0)")
             });
         }
-        let (excerpt, score) = if excerpts.is_empty() {
-            ("''".to_owned(), "0.0".to_owned())
-        } else {
-            (format!("coalesce({}, '')", excerpts.join(", ")), scores.join(" + "))
-        };
+        let score = if scores.is_empty() { "0.0".into() } else { scores.join(" + ") };
+        let excerpts =
+            if excerpts.is_empty() { String::new() } else { format!(", {}", excerpts.join(", ")) };
         write!(
             sql,
-            "SELECT n.id, n.title, {excerpt}, n.updated, {score} AS score, \
-            (SELECT text FROM filters WHERE note = n.id AND field = 'due-on' LIMIT 1) AS due \
-            FROM notes n"
+            "SELECT n.id, n.title, n.updated, {score} AS score, \
+            (SELECT text FROM filters WHERE note = n.id AND field = 'due-on' LIMIT 1) AS due, \
+            n.type{excerpts} FROM notes n"
         )
         .unwrap();
         for (n, m) in self.matches.iter().enumerate() {
@@ -304,21 +310,28 @@ impl Statement {
 
     fn run(&self, index: &Index) -> Result<Vec<RankedHit>> {
         let mut statement = index.db.prepare(&self.sql)?;
+        let count = self.matches.iter().filter(|m| m.scored).count();
         let rows = statement.query_map(params_from_iter(&self.args), |row| {
+            let highlighted = (0..count)
+                .map(|index| row.get::<_, Option<String>>(index + 6))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get(1)?,
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get(5)?,
+                highlighted,
             ))
         })?;
         let mut hits = Vec::new();
         for row in rows {
-            let (id, title, snippet, modified, score, due) = row?;
+            let (id, title, modified, score, due, type_name, highlighted) = row?;
+            let snippets = super::snippets::collect(highlighted.into_iter().flatten());
+            let snippet = snippets.first().cloned().unwrap_or_default();
             hits.push(RankedHit {
-                hit: Hit { id: Id::parse(&id)?, title, snippet },
+                hit: Hit { id: Id::parse(&id)?, title, type_name, snippets, snippet },
                 due,
                 modified,
                 score,
@@ -460,6 +473,44 @@ mod tests {
         ] {
             assert!(search(query).is_err(), "{query}");
         }
+    }
+
+    #[test]
+    fn results_include_all_distant_and_field_snippets_with_the_note_type() {
+        use crate::schema::Value;
+
+        let mut space = Space::create(Id::generate()).unwrap();
+        let body =
+            format!("# Article\n\nneedle first passage {} needle last passage", "gap ".repeat(40));
+        let id = space.create_note(schema::ARTICLE, &body).unwrap();
+        space
+            .set_field(id, "authors", &Value::List(vec![Value::Text("needle author".into())]))
+            .unwrap();
+        let mut index = Index::in_memory().unwrap();
+        index.rebuild(&space, &|_| None).unwrap();
+        let hits =
+            search_indexes([(space.id().unwrap(), &index)], "needle", Sort::Relevance, 20).unwrap();
+        let hit = &hits[0].1;
+        assert_eq!(hit.type_name, "article");
+        assert!(hit.snippets.len() >= 3);
+        for text in ["first passage", "last passage", "author"] {
+            assert!(hit.snippets.iter().any(|snippet| snippet.contains(text)), "{text}");
+        }
+        assert!(
+            hit.snippets
+                .iter()
+                .all(|snippet| snippet.contains(MATCH_START) && snippet.contains(MATCH_END))
+        );
+        let field = search_indexes(
+            [(space.id().unwrap(), &index)],
+            "@authors:needle OR needle",
+            Sort::Relevance,
+            20,
+        )
+        .unwrap();
+        assert!(field[0].1.snippets.iter().any(|snippet| snippet.contains("author")));
+        assert!(field[0].1.snippets.iter().any(|snippet| snippet.contains("last passage")));
+        assert_eq!(hit.snippet, hit.snippets[0]);
     }
 
     #[test]

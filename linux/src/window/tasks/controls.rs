@@ -14,8 +14,8 @@ use super::{Window, panel};
 struct DatePicker {
     explicit: bool,
     field: &'static str,
-    hint: String,
     note: Id,
+    source: Option<String>,
     value: Option<String>,
 }
 
@@ -28,7 +28,7 @@ impl Window {
             .into_iter()
             .filter(|field| !task || tree.date(item.note.id, field).is_some())
             .collect();
-        let status = !task || tree.resolved_status(item.note.id).is_some();
+        let status = !task || tree.status(item.note.id).is_some();
         let columns =
             u32::try_from(dates.len() + 1 + usize::from(status)).expect("at most four controls");
         let controls = gtk::FlowBox::builder()
@@ -42,11 +42,11 @@ impl Window {
         if task {
             controls.add_css_class("zib-task-controls");
         }
-        for field in dates {
-            insert_control(&controls, &self.date_control(space, item, tree, field));
-        }
         if status {
             insert_control(&controls, &self.work_status_button(space, item.note.id, tree));
+        }
+        for field in dates {
+            insert_control(&controls, &self.date_control(space, item, tree, field));
         }
         if task {
             insert_control(&controls, &self.task_actions(space, item, tree));
@@ -56,29 +56,46 @@ impl Window {
         parent.append(&controls);
     }
 
-    fn date_control(&self, space: Id, item: &Item, tree: &Tree, field: &'static str) -> gtk::Box {
-        let date = tree.date(item.note.id, field);
-        let name = if field == "due-on" { "Due" } else { "Scheduled" };
-        let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let heading = gtk::Label::builder().label(name).xalign(0.0).build();
-        heading.add_css_class("caption");
-        heading.add_css_class("dim-label");
-        labels.append(&heading);
-        let value = date.as_ref().map_or("No date", |d| d.value.as_str());
-        let label = gtk::Label::builder().label(value).xalign(0.0).build();
-        label.add_css_class("caption");
-        if field == "due-on" && !item.completed() {
-            let (urgency, class) = zib_core::work::urgency(date.as_ref().map(|d| d.value.as_str()));
-            label.add_css_class(class);
-            if matches!(class, "error" | "warning") {
-                heading.set_text(urgency.split('·').next().unwrap().trim());
+    pub(in crate::window) fn work_details(&self, space: Id, item: &Item, tree: &Tree) -> gtk::Box {
+        style();
+        let controls = super::flow::container();
+        controls.add_css_class("zib-task-controls");
+        controls.add_css_class("zib-work-details");
+        let mut visible = false;
+        if tree.status(item.note.id).is_some() {
+            controls.append(&self.work_status_button(space, item.note.id, tree));
+            visible = true;
+        }
+        // Status precedes availability and deadline in every details row.
+        for field in ["scheduled-on", "due-on"] {
+            if tree.date(item.note.id, field).is_some() {
+                controls.append(&self.date_control(space, item, tree, field));
+                visible = true;
             }
         }
-        labels.append(&label);
-        let button = gtk::MenuButton::builder()
-            .icon_name("x-office-calendar-symbolic")
-            .valign(gtk::Align::Center)
+        controls.set_visible(visible);
+        controls
+    }
+
+    fn date_control(
+        &self,
+        space: Id,
+        item: &Item,
+        tree: &Tree,
+        field: &'static str,
+    ) -> gtk::MenuButton {
+        let date = tree.date(item.note.id, field);
+        let name = if field == "due-on" { "Due" } else { "Scheduled" };
+        let value = date.as_ref().map_or("No date", |d| d.value.as_str());
+        let label = gtk::Label::builder()
+            .label(format!("{name} {value}"))
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(24)
             .build();
+        label.add_css_class("caption");
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        content.append(&label);
+        let button = gtk::MenuButton::builder().child(&content).valign(gtk::Align::Center).build();
         button.add_css_class("flat");
         button.add_css_class("zib-work-quiet");
         button.set_tooltip_text(Some(&format!("{name} date · {value}")));
@@ -90,10 +107,7 @@ impl Window {
                 button.set_popover(Some(&w.date_popover(space, &picker)));
             }
         });
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        row.append(&labels);
-        row.append(&button);
-        row
+        button
     }
 
     fn date_popover(&self, space: Id, picker: &DatePicker) -> gtk::Popover {
@@ -108,22 +122,31 @@ impl Window {
         let content = panel();
         let entry = gtk::Entry::builder().placeholder_text("YYYY-MM-DD").width_chars(12).build();
         entry.update_property(&[gtk::accessible::Property::Label("Date")]);
+        entry.set_tooltip_text(Some("Enter a date and press Enter to save"));
         if let Some(date) = &picker.value {
             entry.set_text(date);
         }
-        content.append(&entry);
+        entry.set_hexpand(true);
+        let inherited = gtk::Button::with_label("Inherited");
+        inherited.set_sensitive(picker.explicit);
+        let input_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        input_row.append(&entry);
+        input_row.append(&inherited);
+        content.append(&input_row);
         let calendar = gtk::Calendar::new();
         select_date(&calendar, entry.text().as_str());
         content.append(&calendar);
-        let hint = gtk::Label::builder()
-            .label(&picker.hint)
-            .wrap(true)
-            .max_width_chars(32)
-            .xalign(0.0)
-            .build();
-        hint.add_css_class("caption");
-        hint.add_css_class("dim-label");
-        content.append(&hint);
+        if let Some(source) = &picker.source {
+            let hint = gtk::Label::builder()
+                .label(format!("Inherited from {source}"))
+                .wrap(true)
+                .max_width_chars(32)
+                .xalign(0.0)
+                .build();
+            hint.add_css_class("caption");
+            hint.add_css_class("dim-label");
+            content.append(&hint);
+        }
         let error = gtk::Label::builder()
             .label("Use a valid date in YYYY-MM-DD format.")
             .wrap(true)
@@ -132,24 +155,13 @@ impl Window {
             .build();
         error.add_css_class("error");
         content.append(&error);
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let apply = gtk::Button::with_label("Apply");
-        apply.add_css_class("suggested-action");
-        apply.set_sensitive(schema::is_date(entry.text().as_str()));
-        let clear = gtk::Button::with_label("Clear date");
-        clear.set_sensitive(picker.explicit);
-        clear.set_tooltip_text(Some("Remove the override and inherit from the parent"));
-        actions.append(&clear);
-        actions.append(&apply);
-        content.append(&actions);
         let changing = Rc::new(Cell::new(false));
-        let (calendar_ref, apply_ref, error_ref) =
-            (calendar.downgrade(), apply.downgrade(), error.downgrade());
+        let (calendar_ref, error_ref) = (calendar.downgrade(), error.downgrade());
         let syncing = changing.clone();
         entry.connect_changed(move |entry| {
             let valid = schema::is_date(entry.text().trim());
-            if let Some(apply) = apply_ref.upgrade() {
-                apply.set_sensitive(valid);
+            if valid {
+                entry.remove_css_class("error");
             }
             if let Some(error) = error_ref.upgrade() {
                 error.set_visible(!valid && !entry.text().is_empty());
@@ -172,9 +184,10 @@ impl Window {
                 changing.set(false);
             }
         });
-        self.connect_date_save(popup, &entry, &apply, space, note, field);
+        self.connect_date_save(popup, &entry, space, note, field);
+        connect_calendar_pick(&calendar, &entry);
         let (w, popover, id) = (self.clone(), popup.downgrade(), note);
-        clear.connect_clicked(move |_| {
+        inherited.connect_clicked(move |_| {
             if let Some(popup) = popover.upgrade() {
                 popup.popdown();
             }
@@ -187,14 +200,12 @@ impl Window {
         &self,
         popup: &gtk::Popover,
         entry: &gtk::Entry,
-        apply: &gtk::Button,
         space: Id,
         note: Id,
         field: &'static str,
     ) {
-        let (w, popup, input) = (self.clone(), popup.downgrade(), entry.downgrade());
-        let save = Rc::new(move || {
-            let Some(entry) = input.upgrade() else { return };
+        let (w, popup) = (self.clone(), popup.downgrade());
+        entry.connect_activate(move |entry| {
             let date = entry.text().trim().to_owned();
             if !schema::is_date(&date) {
                 entry.add_css_class("error");
@@ -205,9 +216,6 @@ impl Window {
             }
             w.save_work_field(space, note, field, Some(Value::Date(date)));
         });
-        let saving = save.clone();
-        apply.connect_clicked(move |_| saving());
-        entry.connect_activate(move |_| save());
     }
 
     fn parent_picker(&self, space: Id, item: &Item, tree: &Tree) -> gtk::MenuButton {
@@ -240,8 +248,15 @@ impl Window {
         let search =
             gtk::SearchEntry::builder().placeholder_text("Search projects").search_delay(0).build();
         search.update_property(&[gtk::accessible::Property::Label("Search projects")]);
+        let popover = popup.downgrade();
+        search.connect_stop_search(move |_| {
+            if let Some(popup) = popover.upgrade() {
+                popup.popdown();
+            }
+        });
         content.append(&search);
         let list = gtk::ListBox::new();
+        list.add_css_class("zib-work-picker-list");
         list.set_selection_mode(gtk::SelectionMode::None);
         for (_, title) in &candidates {
             let label = gtk::Label::builder()
@@ -303,24 +318,36 @@ impl Window {
         content
     }
 
-    fn task_actions(&self, space: Id, item: &Item, tree: &Tree) -> gtk::MenuButton {
+    pub(super) fn task_actions(&self, space: Id, item: &Item, tree: &Tree) -> gtk::MenuButton {
         let note = item.note.id;
         let button = gtk::MenuButton::builder().icon_name("view-more-symbolic").build();
         button.add_css_class("flat");
-        button.set_tooltip_text(Some("Task actions"));
+        let task = item.note.type_name == schema::TASK;
+        button.set_tooltip_text(Some(if task { "Task actions" } else { "Project actions" }));
         let menu = gio::Menu::new();
         let popup = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
-        let dates: Vec<_> = [("Add due date", "due-on"), ("Add schedule date", "scheduled-on")]
+        // Follow the owner's action order: schedule, due, status, parent, and delete.
+        let dates: Vec<_> = [("Add schedule date", "scheduled-on"), ("Add due date", "due-on")]
             .into_iter()
             .filter(|(_, field)| tree.date(note, field).is_none())
             .collect();
         for (label, field) in &dates {
             append_picker_menu(&menu, label, field);
         }
-        append_picker_menu(&menu, "Choose parent…", "parent-id");
-        menu.append(Some("Delete task…"), Some("task.delete"));
         let status = self.work_status_menu(&popup, space, note, tree);
-        menu.append_submenu(Some("Set status…"), &status.model);
+        if task {
+            for index in 0..status.model.n_items() {
+                menu.append_item(&gio::MenuItem::from_model(&status.model, index));
+            }
+        }
+        append_picker_menu(&menu, "Choose parent…", "parent-id");
+        menu.append(
+            Some(if task { "Delete task…" } else { "Delete project…" }),
+            Some("task.delete"),
+        );
+        if !task {
+            menu.append_submenu(Some("Set status…"), &status.model);
+        }
         popup.set_menu_model(Some(&menu));
         status.attach(&popup);
         self.track_work_popover(popup.upcast_ref());
@@ -369,15 +396,7 @@ impl Window {
                 };
                 page.append(&content);
             }
-            if let Some(focus) = page.first_child().and_then(|content| content.first_child()) {
-                let focus = focus.downgrade();
-                // Let the native menu finish focusing its navigation row before focusing the input.
-                glib::idle_add_local_once(move || {
-                    if let Some(focus) = focus.upgrade().filter(gtk::Widget::is_mapped) {
-                        focus.grab_focus();
-                    }
-                });
-            }
+            focus_picker(page);
         });
         page
     }
@@ -396,11 +415,71 @@ impl Window {
             if counted.replace(false) {
                 work.popovers.set(work.popovers.get().saturating_sub(1));
             }
-            if work.popovers.get() == 0 && work.refresh_pending.replace(false) {
-                w.refresh_work();
+            if work.popovers.get() == 0 {
+                if work.refresh_pending.replace(false) {
+                    w.refresh_work();
+                }
+                if work.results_pending.replace(false) {
+                    w.reload_notes();
+                }
             }
         });
     }
+}
+
+pub(super) fn focus_picker(page: &gtk::Box) {
+    let Some(input) = page.first_child().and_then(|content| content.first_child()) else { return };
+    let input = input.downgrade();
+    page.add_tick_callback(move |page, _| {
+        let stack = page.ancestor(gtk::Stack::static_type()).and_downcast::<gtk::Stack>();
+        if stack.is_some_and(|stack| stack.is_transition_running()) {
+            return glib::ControlFlow::Continue;
+        }
+        let input = input.clone();
+        // Focus after the frame's layout and the native menu's queued focus changes.
+        glib::idle_add_local_full(glib::Priority::LOW, move || {
+            if let Some(input) = input.upgrade().filter(gtk::Widget::is_mapped) {
+                let visible = input
+                    .ancestor(gtk::Stack::static_type())
+                    .and_downcast::<gtk::Stack>()
+                    .and_then(|stack| stack.visible_child());
+                if visible.is_none_or(|child| input.is_ancestor(&child)) && !input.grab_focus() {
+                    input.child_focus(gtk::DirectionType::TabForward);
+                }
+            }
+            glib::ControlFlow::Break
+        });
+        glib::ControlFlow::Break
+    });
+}
+
+fn connect_calendar_pick(calendar: &gtk::Calendar, entry: &gtk::Entry) {
+    let click = gtk::GestureClick::builder()
+        .button(gdk::BUTTON_PRIMARY)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    let pressed = Rc::new(Cell::new(false));
+    let started = pressed.clone();
+    click.connect_pressed(move |gesture, _, x, y| {
+        started.set(gesture.widget().is_some_and(|widget| calendar_day_at(&widget, x, y)));
+    });
+    let input = entry.downgrade();
+    click.connect_released(move |gesture, _, x, y| {
+        let Some(calendar) = gesture.widget().and_downcast::<gtk::Calendar>() else { return };
+        if !pressed.replace(false) || !calendar_day_at(calendar.upcast_ref(), x, y) {
+            return;
+        }
+        if let Some(entry) = input.upgrade() {
+            // GTK selects on press, but doesn't emit day-selected for the existing selection.
+            entry.set_text(&calendar.date().format("%Y-%m-%d").unwrap());
+            entry.emit_activate();
+        }
+    });
+    calendar.add_controller(click);
+}
+
+fn calendar_day_at(widget: &gtk::Widget, x: f64, y: f64) -> bool {
+    widget.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|hit| hit.has_css_class("day-number"))
 }
 
 fn date_picker(item: &Item, tree: &Tree, field: &'static str) -> DatePicker {
@@ -408,16 +487,11 @@ fn date_picker(item: &Item, tree: &Tree, field: &'static str) -> DatePicker {
     DatePicker {
         explicit: item.explicit_date(field).is_some(),
         field,
-        hint: date.as_ref().filter(|date| date.source != item.note.id).map_or(
-            "Clearing an override resumes inheritance.".into(),
-            |date| {
-                format!(
-                    "Inherited from {}. Clearing an override resumes inheritance.",
-                    tree.items[&date.source].title
-                )
-            },
-        ),
         note: item.note.id,
+        source: date
+            .as_ref()
+            .filter(|date| date.source != item.note.id)
+            .map(|date| tree.items[&date.source].title.clone()),
         value: date.map(|date| date.value),
     }
 }
@@ -438,6 +512,21 @@ fn insert_control(controls: &gtk::FlowBox, widget: &impl IsA<gtk::Widget>) {
 }
 
 const CSS: &str = "
+list.zib-work-picker-list > row {
+    margin: 0;
+    min-height: 0;
+    padding: 2px;
+}
+.zib-work-emphasis.zib-work-overdue {
+    color: @error_color;
+}
+.zib-work-emphasis.zib-work-warning {
+    color: @zib_due_warning;
+}
+.zib-work-emphasis.zib-work-overdue .zib-work-title-text,
+.zib-work-emphasis.zib-work-warning .zib-work-title-text {
+    font-weight: bold;
+}
 flowboxchild.zib-work-control:hover,
 menubutton.zib-work-quiet > button:hover {
     background-color: transparent;
@@ -447,9 +536,14 @@ menubutton.zib-work-quiet > button:hover {
 menubutton.zib-work-parent > button image {
     -gtk-icon-transform: scaleX(-1);
 }
-button.zib-subproject-link {
+button.zib-subproject-link,
+button.zib-work-title {
     padding-left: 0;
     padding-right: 0;
+}
+button.zib-work-title,
+button.zib-work-title label {
+    font-weight: normal;
 }
 button.zib-task-expander {
     min-width: 16px;
@@ -462,6 +556,17 @@ checkbutton.zib-task-completion {
 }
 flowbox.zib-task-controls > flowboxchild {
     padding: 0;
+}
+flowbox.zib-task-controls > flowboxchild > menubutton > button,
+box.zib-work-details > menubutton > button {
+    padding-left: 0;
+    padding-right: 4px;
+}
+box.zib-work-details > menubutton > button {
+    font-weight: normal;
+    min-height: 18px;
+    padding-bottom: 0;
+    padding-top: 0;
 }
 box.zib-task-after {
     box-shadow: inset 0 -2px @accent_color;
@@ -485,12 +590,19 @@ fn style() {
     }
     let Some(display) = gdk::Display::default() else { return };
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(CSS);
+    let manager = adw::StyleManager::default();
+    load_style(&provider, manager.is_dark());
     gtk::style_context_add_provider_for_display(
         &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    manager.connect_dark_notify(move |manager| load_style(&provider, manager.is_dark()));
+}
+
+fn load_style(provider: &gtk::CssProvider, dark: bool) {
+    let warning = if dark { "#ffc300" } else { "#d6a400" };
+    provider.load_from_string(&format!("@define-color zib_due_warning {warning};\n{CSS}"));
 }
 
 fn project_candidates(tree: &Tree, note: Id) -> Vec<(Id, String)> {

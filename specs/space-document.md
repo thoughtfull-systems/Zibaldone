@@ -248,4 +248,12 @@ a project or task. Writers never remove these entries when changing status or de
 Readers ignore malformed entries. Concurrent additions merge as map keys. The
 [work specification](projects-and-tasks.md#work-status) defines completion and inheritance.
 
+## Completed task visibility
+
+The note setting `zib.show-completed` holds a boolean. True shows completed tasks in that note's
+work view; false hides them under the normal visibility rules. An absent or non-boolean value
+defaults to false. Store the setting on the project or root task whose hierarchy the view displays.
+Each note has its own value, independent of its ancestors. It syncs and moves with the note. Writing
+the setting doesn't change the note body, fields, or metadata.
+
 [blake3]: https://github.com/BLAKE3-team/BLAKE3

@@ -7,13 +7,30 @@ use zib_core::work::{Status, Tree};
 
 use crate::app::core;
 
-use super::controls::append_picker_menu;
+use super::controls::{append_picker_menu, focus_picker};
 use super::{Window, panel};
 
 pub(super) struct StatusMenu {
     pub model: gio::Menu,
     content: gtk::Box,
     slot: &'static str,
+}
+
+#[derive(Clone)]
+struct StatusOptions {
+    explicit: Option<Status>,
+    inherited: Option<Status>,
+    reason: String,
+}
+
+impl StatusOptions {
+    fn read(note: Id, tree: &Tree) -> Self {
+        Self {
+            explicit: tree.resolved_status(note).filter(|status| status.source == note),
+            inherited: tree.inherited_status(note),
+            reason: tree.status(note).and_then(|status| status.waiting_for).unwrap_or_default(),
+        }
+    }
 }
 
 impl StatusMenu {
@@ -24,13 +41,15 @@ impl StatusMenu {
 
 impl Window {
     pub(super) fn work_status_button(&self, space: Id, note: Id, tree: &Tree) -> gtk::MenuButton {
-        let status = tree.resolved_status(note);
+        let status = tree.status(note);
         let label = status.as_ref().map_or_else(|| "Status".into(), Status::label);
         let text = gtk::Label::builder()
             .label(&label)
+            .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(18)
             .build();
+        text.add_css_class("caption");
         let button = gtk::MenuButton::builder().child(&text).build();
         button.add_css_class("flat");
         let hint = status.filter(|status| status.source != note).map_or_else(
@@ -40,12 +59,13 @@ impl Window {
         button.set_tooltip_text(Some(&format!("Work status · {hint}")));
         button.update_property(&[gtk::accessible::Property::Label("Work status")]);
         let w = self.clone();
+        let options = StatusOptions::read(note, tree);
         button.set_create_popup_func(move |button| {
             if button.popover().is_some() {
                 return;
             }
             let popup = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
-            let status = w.work_status_menu(&popup, space, note, &w.inner().work.tree.borrow());
+            let status = w.status_menu(&popup, space, note, &options);
             popup.set_menu_model(Some(&status.model));
             status.attach(&popup);
             w.track_work_popover(popup.upcast_ref());
@@ -62,14 +82,34 @@ impl Window {
         note: Id,
         tree: &Tree,
     ) -> StatusMenu {
+        self.status_menu(popup, space, note, &StatusOptions::read(note, tree))
+    }
+
+    fn status_menu(
+        &self,
+        popup: &gtk::PopoverMenu,
+        space: Id,
+        note: Id,
+        options: &StatusOptions,
+    ) -> StatusMenu {
         let model = gio::Menu::new();
-        let inherited = tree.inherited_status(note);
-        let explicit = tree.resolved_status(note).filter(|status| status.source == note);
+        let (explicit, inherited) = (&options.explicit, &options.inherited);
         let actions = gio::SimpleActionGroup::new();
-        for (label, value) in
-            [("Inherit", "inherit"), ("Maybe", "maybe"), ("None", "none"), ("Someday", "someday")]
-        {
+        // Follow the owner's status-menu order, placing Waiting before Clear.
+        for (label, value) in [
+            ("Inherited", "inherit"),
+            ("Someday", "someday"),
+            ("Maybe", "maybe"),
+            ("Waiting…", "waiting"),
+            ("Clear", "none"),
+        ] {
+            if value == "waiting" {
+                append_picker_menu(&model, label, "waiting-value");
+                continue;
+            }
             if (value == "inherit" && inherited.is_none() && explicit.is_none())
+                || (value == "none"
+                    && inherited.as_ref().is_none_or(|status| status.value == "none"))
                 || explicit.as_ref().is_some_and(|status| status.value == value)
             {
                 continue;
@@ -84,8 +124,7 @@ impl Window {
             model.append(Some(label), Some(&format!("work-status.{value}")));
         }
         popup.insert_action_group("work-status", Some(&actions));
-        append_picker_menu(&model, "Waiting…", "waiting-value");
-        let reason = tree.status(note).and_then(|status| status.waiting_for).unwrap_or_default();
+        let reason = options.reason.clone();
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let (w, popover) = (self.clone(), popup.downgrade());
         content.connect_map(move |page| {
@@ -93,14 +132,7 @@ impl Window {
                 let Some(popup) = popover.upgrade() else { return };
                 page.append(&w.waiting_content(&popup, space, note, &reason));
             }
-            let focus =
-                page.first_child().and_then(|content| content.first_child()).map(|w| w.downgrade());
-            glib::idle_add_local_once(move || {
-                if let Some(focus) = focus.and_then(|w| w.upgrade()).filter(gtk::Widget::is_mapped)
-                {
-                    focus.grab_focus();
-                }
-            });
+            focus_picker(page);
         });
         StatusMenu { model, content, slot: "waiting-value" }
     }
@@ -121,6 +153,7 @@ impl Window {
         entry.update_property(&[gtk::accessible::Property::Label("Waiting for")]);
         content.append(&entry);
         let list = gtk::ListBox::new();
+        list.add_css_class("zib-work-picker-list");
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.set_activate_on_single_click(true);
         let empty = gtk::Label::new(Some("No previous matches"));
@@ -136,24 +169,17 @@ impl Window {
                 .build(),
         );
         self.waiting_completion(&entry, &list);
-        let apply = gtk::Button::with_label("Apply");
-        apply.add_css_class("suggested-action");
-        content.append(&apply);
-        let (w, popover, input) = (self.clone(), popup.downgrade(), entry.downgrade());
-        let save = std::rc::Rc::new(move || {
-            if let Some(entry) = input.upgrade() {
-                w.save_work_status(
-                    popover.upgrade(),
-                    space,
-                    note,
-                    Some("waiting".into()),
-                    entry.text().into(),
-                );
-            }
+        entry.set_tooltip_text(Some("Press Enter to save"));
+        let (w, popover) = (self.clone(), popup.downgrade());
+        entry.connect_activate(move |entry| {
+            w.save_work_status(
+                popover.upgrade(),
+                space,
+                note,
+                Some("waiting".into()),
+                entry.text().into(),
+            );
         });
-        let saving = save.clone();
-        apply.connect_clicked(move |_| saving());
-        entry.connect_activate(move |_| save());
         content
     }
 
@@ -192,10 +218,10 @@ impl Window {
                     .xalign(0.0)
                     .ellipsize(gtk::pango::EllipsizeMode::End)
                     .max_width_chars(32)
-                    .margin_start(6)
-                    .margin_end(6)
-                    .margin_top(4)
-                    .margin_bottom(4)
+                    .margin_start(8)
+                    .margin_end(8)
+                    .margin_top(6)
+                    .margin_bottom(6)
                     .build();
                 label.set_tooltip_text(Some(&value));
                 list.append(&gtk::ListBoxRow::builder().child(&label).build());

@@ -335,6 +335,113 @@ write succeeds. Selection doesn't require an Apply click. Enter on a highlighted
 saves it. Tab only fills the text box, allowing further edits; typed values still support Enter and
 Apply.
 
+## Title rows and details
+
+This section replaces the single-row compact controls. Subproject and subtask rows show a plain
+clickable title on the first row, with the overflow menu at its right edge. Align the drag handle,
+subtask expander, and completion checkbox vertically with that title. Completed tasks dim only the
+title. Clicking a title opens its inline editor. Enter or leaving the editor saves and returns to
+the title display; Escape restores the current stored title. Keep invalid or conflicting drafts
+editable. Preserve the existing save, refresh, and title-line conflict rules. Apply these title
+edits to projects too, preserving their other body content. A separate arrow opens a subproject.
+
+Place effective status, scheduled date, and due date beneath the title, in that order. Align the
+details' left edge with the title rather than the drag handle. Omit absent values. Clicking any part
+of a date control opens its calendar picker. Clicking status opens its menu. Keep title and metadata
+controls independent, including in search results. Preserve open popovers while results or work rows
+refresh.
+
+Status menus offer Inherited, Someday, Maybe, Waiting, and None in that order. This presentation
+order replaces the earlier alphabetical order. Inherited removes an explicit override. Keep the
+existing relevance rules: hide the current explicit fixed status, retain Waiting to edit its text,
+and offer Inherited when an explicit or ancestor value exists.
+
+Wrap status and date controls using their individual natural widths with 4-pixel gaps. Don't share
+column widths between wrapped lines: a due date on the next line never widens a status control on
+the first line. Apply this rule to search results and work-row details.
+
+Date controls show text without a calendar icon; the text still opens the calendar picker. Work-row
+titles use normal font weight, including during inline editing.
+
+## Consistent task emphasis
+
+Apply completion and due-date emphasis to each entire task row in search results and project task
+lists. Completed tasks dim their title, status, dates, and controls together, with no additional
+emphasis on the title alone. Completion takes precedence over urgency. Incomplete tasks due today or
+within three days use warning emphasis throughout the row; overdue tasks use error emphasis. Use
+effective inherited due dates, and keep other incomplete tasks at normal emphasis. Style each row
+independently so a parent task's appearance doesn't affect its subtasks.
+
+Due-soon and overdue rows also use bold text for their titles and details in both views. This
+urgency rule replaces normal title weight while the task is urgent. Completed tasks keep normal
+weight and dimming, even after their due date. Use the same bright amber-yellow warning color in
+light and dark themes.
+
+Only the title uses bold weight for due-soon and overdue tasks. This replaces the preceding rule for
+bold details. Keep status, dates, type pills, and breadcrumbs at normal weight while preserving
+their row's color and completion styling.
+
+Use a slightly darker amber-yellow in light mode and keep the bright amber-yellow in dark mode. This
+replaces the shared warning color across themes. Update existing rows when the theme changes.
+
+## Picker activation and menu accents
+
+Urgency changes row text color and title weight without changing menu accents, selection highlights,
+or picker controls. Due-soon and overdue tasks use the same menu styling as ordinary tasks.
+
+Clicking any calendar day saves that date and dismisses the picker. This includes the already
+selected date and today's initial selection in an undated picker. Month and year navigation don't
+save or close the picker. Typing a date keeps the picker open until Enter or Apply; Clear date keeps
+its existing inheritance behavior.
+
+Calendar pickers omit the Apply button. Save typed dates with Enter. Invalid input keeps the picker
+open for correction. Keep calendar-click saving and Clear date behavior unchanged.
+
+Place the date text box and Inherited button together on the picker's first row, with the button on
+the right. Inherited replaces Clear date and keeps its behavior and sensitivity rules. Omit the
+explanation that clearing resumes inheritance; retain the source name for an inherited date.
+
+## Remember completed visibility
+
+Show completed reads and writes the displayed note's `zib.show-completed` setting, as the
+[space document specification][document] defines it. Restore it when opening or refreshing a project
+or standalone task view. Preserve the choice after restart and sync. A subproject has its own
+choice. Selecting a task search result uses the enclosing work view's setting. Preserve the existing
+exception that reveals a selected task or an unfinished task's completed ancestors without changing
+the checkbox.
+
+## Task overflow order
+
+Task overflow menus place status choices directly in the main menu. Order the actions as Add
+schedule date, Add due date, status choices, Choose parent, and Delete task. Keep the existing
+relevance rules for date and status actions. Within the status choices, keep Inherited, Someday,
+Maybe, Waiting, and None in that order. Waiting opens its existing text and completion picker.
+
+## Compact picker lists
+
+Choose parent and Waiting use the same compact list spacing in menu subpages and standalone
+popovers. Apply 2-pixel row padding without extra menu-specific row margins or minimum heights. Keep
+labels inset by 8 pixels horizontally and 6 vertically.
+
+Waiting omits the Apply button. Enter saves typed text, and activating a suggestion saves that
+value. Both actions close the picker after a successful save. Tab only fills the entry.
+
+## Clearing inherited status
+
+Clear is an action, not a displayed status. It replaces the None menu item and appears only when an
+ancestor supplies Someday, Maybe, or Waiting and the item hasn't already cleared that value.
+Selecting Clear writes `none` to block inheritance, keeping the existing storage format. Retain
+Inherited to remove an explicit declaration and resume inheritance.
+
+An explicit or inherited clearing declaration displays as no status in task rows, search results,
+and note metadata. Project controls use the same generic Status trigger as an unrestricted project.
+Don't show a None chip, value label, or menu choice. Search continues to treat these items as having
+no effective status. Keep the menu order Inherited, Someday, Maybe, Waiting, and Clear, omitting
+irrelevant actions.
+
+Waiting focuses its text box after the submenu opens, including when editing an existing value or
+returning to the picker. Keep its current text and suggestion behavior.
+
 [decision]: ../decisions/ZIB0025-projects-and-tasks.md
 [document]: space-document.md
 [saved]: saved-searches.md

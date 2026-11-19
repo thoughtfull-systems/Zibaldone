@@ -30,9 +30,11 @@ status in search, so it remains eligible for work. Add `@status!?` to the initia
 Upgrade an existing untouched default work search once per space, preserving customized definitions.
 
 Expose status in the project controls and task overflow menu. Show an effective status beside task
-dates. Identify inherited sources. Offer Maybe, None, Someday, and Waiting; add Inherit when an
-ancestor supplies a status or any explicit status needs clearing. Omit the current explicit fixed
-choice, keeping Waiting available to edit its text.
+dates. Identify inherited sources. Offer Someday, Maybe, and Waiting. Clear suppresses an inherited
+status and appears only when such a status exists and the owner hasn't cleared it. Keep `none` as
+the stored inheritance barrier, and display it as no status. Inherited removes an explicit
+declaration and resumes inheritance. Show the menu in the order Inherited, Someday, Maybe, Waiting,
+Clear. Omit the current explicit fixed choice, keeping Waiting available to edit its text.
 
 ## Rejected alternatives
 
