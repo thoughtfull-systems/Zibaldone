@@ -18,6 +18,7 @@ use super::Window;
 mod controls;
 mod drag;
 mod quick_add;
+mod status;
 mod titles;
 
 type AdditionKey = (Id, Id, &'static str);

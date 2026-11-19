@@ -240,4 +240,12 @@ the affected set. Record the same `deleted-at` and `deleted-by` values on every 
 operation. Keep existing work-order entries and unrelated notes. Sync imports the written removals
 and tombstones without walking the receiving replica's hierarchy again.
 
+## Waiting values
+
+The optional `waiting-values` root map retains Waiting completion candidates. Each key is nonempty
+trimmed text, and each value is boolean true. Writers add a value in the same commit that sets it on
+a project or task. Writers never remove these entries when changing status or deleting notes.
+Readers ignore malformed entries. Concurrent additions merge as map keys. The
+[work specification](projects-and-tasks.md#work-status) defines completion and inheritance.
+
 [blake3]: https://github.com/BLAKE3-team/BLAKE3

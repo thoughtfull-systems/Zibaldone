@@ -7,9 +7,16 @@ use crate::space::Note;
 use crate::{Error, Id, Result, Space};
 
 mod order;
+mod status;
 
-pub const WORK_QUERY: &str =
+pub const PRE_STATUS_WORK_QUERY: &str =
     "@type=task AND @completed-on!? AND (@scheduled-on!? OR @scheduled-on<=today)";
+pub const WORK_QUERY: &str = concat!(
+    "@type=task AND @completed-on!? AND (@scheduled-on!? OR @scheduled-on<=today)",
+    " AND @status!?"
+);
+
+pub use status::Status;
 
 pub fn is_work(type_name: &str) -> bool {
     matches!(type_name, schema::PROJECT | schema::TASK)
@@ -189,7 +196,12 @@ pub(crate) fn validate(space: &Space, id: Id, field: &str, value: Option<&Value>
                     && (note.type_name == schema::TASK || p.note.type_name == schema::PROJECT)
             })
         }
-        ("completed-on" | "due-on" | "parent-id" | "scheduled-on", _) => false,
+        ("status", Value::Choice(value)) => Status::valid(value),
+        ("waiting-for", Value::Text(_)) => true,
+        (
+            "completed-on" | "due-on" | "parent-id" | "scheduled-on" | "status" | "waiting-for",
+            _,
+        ) => false,
         _ => true,
     };
     if valid {

@@ -1,5 +1,7 @@
 //! Persistent project and task operations, with derived hierarchy snapshots for the desktop.
 
+use std::collections::BTreeSet;
+
 use zib_core::schema::Value;
 use zib_core::search::Sort;
 use zib_core::search::saved::Definition;
@@ -9,6 +11,36 @@ use zib_core::{Id, Result};
 use super::{State, UiEvent};
 
 impl State {
+    pub(crate) async fn set_work_status(
+        &self,
+        space_id: Id,
+        note: Id,
+        status: Option<String>,
+        reason: String,
+    ) -> Result<()> {
+        let store = self.store.lock().await;
+        let space = self.space(space_id).await?;
+        let mut space = space.lock().await;
+        space.set_work_status(note, status.as_deref(), &reason)?;
+        let saved = store.save_space(&space);
+        self.reindex_note(space_id, &space, note);
+        self.changed_here(space_id);
+        self.send_ui(UiEvent::Changed(space_id));
+        saved?;
+        Ok(())
+    }
+
+    pub(crate) async fn waiting_values(&self) -> Vec<String> {
+        let spaces: Vec<_> = self.node.spaces().lock().await.values().cloned().collect();
+        let mut values = BTreeSet::new();
+        for space in spaces {
+            values.extend(space.lock().await.waiting_values());
+        }
+        let mut values: Vec<_> = values.into_iter().collect();
+        values.sort_by_key(|value| (value.to_lowercase(), value.clone()));
+        values
+    }
+
     pub(crate) async fn reorder_project(
         &self,
         space_id: Id,

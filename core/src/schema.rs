@@ -178,6 +178,14 @@ pub fn built_in() -> Vec<TypeDef> {
             ("due-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
             ("parent-id", FieldDef::new(Kind::Link, SearchMode::Filter)),
             ("scheduled-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
+            (
+                "status",
+                FieldDef {
+                    choices: ["maybe", "none", "someday", "waiting"].map(str::to_owned).to_vec(),
+                    ..FieldDef::new(Kind::Choice, SearchMode::Filter)
+                },
+            ),
+            ("waiting-for", FieldDef::new(Kind::Text, SearchMode::Filter)),
         ]
         .into_iter()
         .map(|(name, def)| (name.into(), def))

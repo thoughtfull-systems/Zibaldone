@@ -175,7 +175,8 @@ impl Index {
     fn work_signature(&self, id: Id) -> Result<Vec<(String, String)>> {
         let mut statement = self.db.prepare(
             "SELECT field, text FROM filters WHERE note = ?1 AND \
-            field IN ('due-on', 'parent-id', 'project', 'scheduled-on') AND text IS NOT NULL \
+            field IN ('due-on', 'parent-id', 'project', 'scheduled-on', \
+            'status', 'waiting-for') AND text IS NOT NULL \
             ORDER BY field, text",
         )?;
         Ok(statement
@@ -219,6 +220,11 @@ impl Index {
                                 tree.date(id, name).map(|d| Value::Date(d.value))
                             }
                             "parent-id" => item.parent.map(Value::Link),
+                            "status" => tree.status(id).map(|status| Value::Choice(status.value)),
+                            "waiting-for" => tree
+                                .status(id)
+                                .and_then(|status| status.waiting_for)
+                                .map(Value::Text),
                             _ => note.fields.get(name).and_then(|v| Value::from_loro(def, v)),
                         }
                     } else {

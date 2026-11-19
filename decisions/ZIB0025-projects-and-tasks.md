@@ -40,7 +40,7 @@ item's entries. Narrower invalidation can follow without changing the format.
 The work view selects unfinished tasks whose effective scheduled date is absent or has arrived. It
 includes parent tasks alongside their subtasks. It sorts by effective due date with undated items
 last. The owner can edit the saved query. Completing a parent doesn't complete or block its
-subtasks. Waiting and inactive project states remain later work.
+subtasks. [ZIB0027](ZIB0027-work-status.md) adds inherited work status.
 
 Store manual sibling order in a space-wide Loro movable list of work-item identifiers. Filter that
 sequence by the derived parent when showing subtasks and subprojects. Keep hierarchy links

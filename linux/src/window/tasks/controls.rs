@@ -28,7 +28,9 @@ impl Window {
             .into_iter()
             .filter(|field| !task || tree.date(item.note.id, field).is_some())
             .collect();
-        let columns = u32::try_from(dates.len() + 1).expect("at most three controls");
+        let status = !task || tree.resolved_status(item.note.id).is_some();
+        let columns =
+            u32::try_from(dates.len() + 1 + usize::from(status)).expect("at most four controls");
         let controls = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .column_spacing(4)
@@ -42,6 +44,9 @@ impl Window {
         }
         for field in dates {
             insert_control(&controls, &self.date_control(space, item, tree, field));
+        }
+        if status {
+            insert_control(&controls, &self.work_status_button(space, item.note.id, tree));
         }
         if task {
             insert_control(&controls, &self.task_actions(space, item, tree));
@@ -304,6 +309,7 @@ impl Window {
         button.add_css_class("flat");
         button.set_tooltip_text(Some("Task actions"));
         let menu = gio::Menu::new();
+        let popup = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
         let dates: Vec<_> = [("Add due date", "due-on"), ("Add schedule date", "scheduled-on")]
             .into_iter()
             .filter(|(_, field)| tree.date(note, field).is_none())
@@ -313,7 +319,10 @@ impl Window {
         }
         append_picker_menu(&menu, "Choose parent…", "parent-id");
         menu.append(Some("Delete task…"), Some("task.delete"));
-        let popup = gtk::PopoverMenu::from_model(Some(&menu));
+        let status = self.work_status_menu(&popup, space, note, tree);
+        menu.append_submenu(Some("Set status…"), &status.model);
+        popup.set_menu_model(Some(&menu));
+        status.attach(&popup);
         self.track_work_popover(popup.upcast_ref());
         popup.connect_show(|popup| popup.set_visible_submenu(Some("main")));
         for field in dates.into_iter().map(|(_, field)| field).chain(["parent-id"]) {
@@ -373,7 +382,7 @@ impl Window {
         page
     }
 
-    fn track_work_popover(&self, popup: &gtk::Popover) {
+    pub(super) fn track_work_popover(&self, popup: &gtk::Popover) {
         let counted = Rc::new(Cell::new(false));
         let (w, shown) = (self.clone(), counted.clone());
         popup.connect_show(move |_| {
@@ -413,7 +422,7 @@ fn date_picker(item: &Item, tree: &Tree, field: &'static str) -> DatePicker {
     }
 }
 
-fn append_picker_menu(menu: &gio::Menu, label: &str, name: &str) {
+pub(super) fn append_picker_menu(menu: &gio::Menu, label: &str, name: &str) {
     let submenu = gio::Menu::new();
     let item = gio::MenuItem::new(None, None);
     item.set_attribute_value("custom", Some(&name.to_variant()));

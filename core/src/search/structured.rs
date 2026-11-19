@@ -463,6 +463,65 @@ mod tests {
     }
 
     #[test]
+    fn status_search_uses_the_ancestor_source_and_refreshes_work_results() {
+        use crate::schema::Value;
+
+        let mut space = Space::create(Id::generate()).unwrap();
+        let project = space.create_work(schema::PROJECT, "Project", None).unwrap();
+        let task = space.create_work(schema::TASK, "Task", Some(project)).unwrap();
+        let subtask = space.create_work(schema::TASK, "Subtask", Some(task)).unwrap();
+        let standalone = space.create_work(schema::TASK, "Standalone", None).unwrap();
+        space.set_field(task, "due-on", &Value::Date("2000-01-01".into())).unwrap();
+        let mut index = Index::in_memory().unwrap();
+        index.rebuild(&space, &|_| None).unwrap();
+        let space_id = space.id().unwrap();
+        let matches = |index: &Index, query: &str| {
+            search_indexes([(space_id, index)], query, Sort::Title, 20)
+                .unwrap()
+                .into_iter()
+                .map(|(_, hit)| hit.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matches(&index, crate::work::WORK_QUERY).len(), 3);
+        for status in ["maybe", "someday", "waiting"] {
+            space.set_work_status(project, Some(status), "Alex").unwrap();
+            index.update_note(&space, project, &|_| None).unwrap();
+            assert_eq!(matches(&index, crate::work::WORK_QUERY), [standalone]);
+            assert_eq!(matches(&index, &format!("@type=task @status={status}")).len(), 2);
+        }
+        assert_eq!(matches(&index, "@type=task @waiting-for=Alex").len(), 2);
+        space.set_work_status(project, Some("waiting"), "Bea").unwrap();
+        index.update_note(&space, project, &|_| None).unwrap();
+        assert!(matches(&index, "@waiting-for=Alex").is_empty());
+        assert_eq!(matches(&index, "@type=task @waiting-for=Bea").len(), 2);
+        space.set_work_status(task, Some("none"), "").unwrap();
+        index.update_note(&space, task, &|_| None).unwrap();
+        assert_eq!(matches(&index, crate::work::WORK_QUERY).len(), 3);
+        assert_eq!(matches(&index, "@type=task @status!?").len(), 3);
+        assert!(matches(&index, "@type=task @waiting-for?").is_empty());
+        space.set_work_status(project, Some("waiting"), "Casey").unwrap();
+        index.update_note(&space, project, &|_| None).unwrap();
+        assert_eq!(matches(&index, crate::work::WORK_QUERY).len(), 3);
+        space.set_work_status(task, None, "").unwrap();
+        index.update_note(&space, task, &|_| None).unwrap();
+        assert_eq!(matches(&index, crate::work::WORK_QUERY), [standalone]);
+        assert_eq!(matches(&index, "@type=task @waiting-for=Casey").len(), 2);
+        space.set_work_status(project, None, "").unwrap();
+        index.update_note(&space, project, &|_| None).unwrap();
+        assert_eq!(matches(&index, crate::work::WORK_QUERY).len(), 3);
+        assert!(matches(&index, "@waiting-for?").is_empty());
+        space.set_work_status(task, Some("maybe"), "").unwrap();
+        index.update_note(&space, task, &|_| None).unwrap();
+        assert_eq!(matches(&index, crate::work::WORK_QUERY), [standalone]);
+        assert_eq!(matches(&index, "@status=maybe").len(), 2);
+        assert!(matches(&index, "@status=someday").is_empty());
+        let fields = super::super::field_names([&index]);
+        assert!(fields.iter().any(|name| name == "status"));
+        assert!(fields.iter().any(|name| name == "waiting-for"));
+        assert!(space.note(subtask).unwrap().fields.get("status").is_none());
+    }
+
+    #[test]
     fn task_search_uses_inheritance_and_reindexes_descendants() {
         use crate::schema::Value;
 

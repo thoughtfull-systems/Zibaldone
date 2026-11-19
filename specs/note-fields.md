@@ -56,6 +56,16 @@ stores sibling presentation order. Neither value lives in a note's `fields` map.
 A deletion record in `tombstones` holds `title` as markdown, `deleted-at` as a timestamp, and
 `deleted-by` as a machine identifier. These records preserve deleted notes' link labels.
 
+## Work status additions
+
+Projects and tasks also store optional `status` and `waiting-for` fields. Status is a choice with
+values `maybe`, `someday`, and `waiting`; Waiting detail is text. Both are searchable using
+effective inherited values. The `waiting-values` space root map holds earlier Waiting text for
+completion. The [work specification][work] defines precedence and work-view filtering.
+
+The `status` choice also accepts explicit `none`, which stops inheritance. An absent field resumes
+inheritance. Search treats None as no effective status, so `@status!?` includes these items.
+
 [decision]: ../decisions/ZIB0026-name-date-and-timestamp-fields.md
 [types]: built-in-types.md
 [work]: projects-and-tasks.md

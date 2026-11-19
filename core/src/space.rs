@@ -176,12 +176,13 @@ impl Space {
 
     /// Opens a space from a snapshot or updates, and adds any built-in schemas it lacks.
     pub fn open(bytes: &[u8], machine: Id) -> Result<Self> {
-        let space = Self::empty(machine);
+        let mut space = Self::empty(machine);
         space.doc.import(bytes)?;
         space.id()?;
         if schema::write_schemas(&space.doc, &schema::built_in())? {
             commit(&space.doc);
         }
+        space.upgrade_work_search()?;
         Ok(space)
     }
 
@@ -429,6 +430,12 @@ impl Space {
         }
         let fields = child_map(&self.note_map(id)?, "fields")?;
         fields.insert(name, value.to_loro())?;
+        if name == "waiting-for"
+            && crate::work::is_work(&self.note(id)?.type_name)
+            && let Value::Text(value) = value
+        {
+            self.record_waiting_value(value)?;
+        }
         self.clear_derived(id, name)?;
         self.touch(id)?;
         commit(&self.doc);

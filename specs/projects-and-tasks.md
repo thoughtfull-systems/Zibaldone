@@ -270,6 +270,71 @@ Clamp previously saved narrow widths to the new minimum for display. Invalid sto
 to the equal split. Automatic layout changes don't replace the owner's saved width. Resizing a
 window without a saved choice keeps the equal split.
 
+## Work status
+
+This section adds the status model in [ZIB0027](../decisions/ZIB0027-work-status.md). Projects and
+tasks have optional `status` and `waiting-for` fields. The status is a choice: `maybe`, `someday`,
+or `waiting`. Waiting text is a string with outer whitespace removed. An empty string means no
+detail. Invalid status values have no effect on inheritance and remain stored.
+
+Resolve status by walking the derived forest from the root toward the item and taking the first
+valid explicit status. For Waiting, read text from that same source; don't inherit text separately.
+An absent status inherits. Without any status in the path, the item is available. Projects and tasks
+follow the same rule. Inherited values can't be overridden. Local status edits reject an item with
+an inherited status. Preserve masked explicit values after parent edits or sync; they become
+effective again when no ancestor supplies a status. Completion and dates remain independent.
+
+A local status change writes both fields and any new Waiting history in one commit. Clearing status
+removes both fields and resumes inheritance. Non-Waiting status removes Waiting text. Waiting
+without text remains valid after concurrent field edits. Historical Waiting values remain stored.
+
+Search indexes effective `status` and `waiting-for`. Index Waiting text only when effective status
+is `waiting`. Refresh dependent rows after ancestor status, reason, or parent changes. Field-name
+completion offers both names. The work query now includes `AND @status!?`, excluding all three
+states even when a task is overdue. All tasks and Projects remain unrestricted saved searches.
+
+On opening a space, upgrade saved searches named What should I work on? only when their query is the
+earlier exact default, their scope is that space, and their sort is due. Add `AND @status!?` and
+record `zib.work-status-search` as boolean true in space settings. Mark the setting even when no
+search qualifies. Preserve customized queries, names, scope, and sort. New default searches include
+the status condition from creation.
+
+Projects offer a Status menu beside their date and parent controls. Task overflow menus offer Set
+status, and rows with an effective status show a compact control. Unrestricted items offer Inherit,
+Maybe, Someday, and Waiting. Waiting opens a focused text box with matching earlier values, Apply,
+and Enter submission. Tab completes a matching value; selecting a suggestion fills the text box.
+Match incrementally without case sensitivity. Retain earlier values after clearing or deleting the
+last note that uses them. Combine values from all held spaces. Inherited controls name the source
+and offer Open source, without status editing actions. Preserve open picker input during refreshes.
+
+## Status overrides
+
+This section replaces the ancestor-first status and read-only inherited controls in Work status. Add
+`none` to the `status` choices. Resolve the nearest valid explicit status by walking from the item
+toward the root. An absent field means Inherit. Maybe, Someday, and Waiting override an ancestor's
+value. Explicit None stops inheritance and leaves the item available. Subtasks and subprojects
+inherit that None unless they set their own status. Changing or moving a parent keeps explicit
+overrides. Selecting Inherit removes the item's fields and resumes inheritance.
+
+Search treats explicit or inherited None as missing effective `status` and `waiting-for`. The
+existing work query therefore includes these available tasks with `@status!?`. Deferred overrides
+still exclude tasks, and Waiting text comes from the source of the effective Waiting value.
+
+All status menus offer Maybe, None, Someday, and Waiting. When a parent supplies a status, including
+None, also offer Inherit. Keep Inherit available for an explicit None after the parent's status
+clears, so the owner can remove the inheritance barrier. Retain inherited-source tooltips and
+Waiting completion. Show a compact None control for explicit and inherited None values.
+
+Offer Inherit for any explicit status, including Maybe, Someday, and Waiting, even when no ancestor
+currently supplies a status. Selecting it directly removes the override. Omit the current explicit
+Maybe, None, or Someday option from the menu. Keep Waiting available so its text can still change.
+Inherited values remain selectable as explicit overrides.
+
+Clicking or activating a Waiting suggestion saves that value and closes the status menu after the
+write succeeds. Selection doesn't require an Apply click. Enter on a highlighted suggestion also
+saves it. Tab only fills the text box, allowing further edits; typed values still support Enter and
+Apply.
+
 [decision]: ../decisions/ZIB0025-projects-and-tasks.md
 [document]: space-document.md
 [saved]: saved-searches.md

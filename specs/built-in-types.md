@@ -122,3 +122,13 @@ The `task` type also defines **`completed-on`**, a date with search mode `filter
 means completed; an absent or invalid value means incomplete. Neither type has a preview. The
 [projects and tasks specification](projects-and-tasks.md) defines parent validation, inheritance,
 completion, and their search behavior.
+
+## Work status fields
+
+Projects and tasks also define `status` as a choice with values `maybe`, `someday`, and `waiting`,
+and `waiting-for` as text. Both use search mode `filter`. The
+[work specification](projects-and-tasks.md#work-status) defines their effective values.
+
+The `status` choice also accepts `none`. It stops status inheritance while leaving the item
+available. The [status overrides rules](projects-and-tasks.md#status-overrides) define search and
+menu behavior.

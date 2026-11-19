@@ -483,13 +483,21 @@ fn remote_title_changes_preserve_dirty_inline_drafts() {
 
 #[track_caller]
 fn work_popup(parent: &impl IsA<gtk::Widget>, tooltip: &str) -> gtk::Popover {
-    let button = descendants(parent)
-        .into_iter()
-        .filter_map(|widget| widget.downcast::<gtk::MenuButton>().ok())
-        .find(|button| button.tooltip_text().is_some_and(|text| text.starts_with(tooltip)))
-        .unwrap();
-    // Hierarchy refreshes create controls before GTK maps and allocates their rows.
-    until(|| button.is_mapped() && button.width() > 0 && button.height() > 0);
+    let mut button = None;
+    // A second refresh can replace a row before its first allocation. Follow the mapped control.
+    until(|| {
+        button = descendants(parent)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::MenuButton>().ok())
+            .find(|button| {
+                button.tooltip_text().is_some_and(|text| text.starts_with(tooltip))
+                    && button.is_mapped()
+                    && button.width() > 0
+                    && button.height() > 0
+            });
+        button.is_some()
+    });
+    let button = button.unwrap();
     button.popup();
     let popup = button.popover().unwrap();
     until(|| popup.is_mapped());
@@ -910,6 +918,190 @@ fn calendar_popovers_sync_typed_dates_selection_and_clear_to_inherit() {
     window.close_editor();
     runtime.block_on(state.finish());
     window.inner().window.destroy();
+}
+
+#[test]
+fn work_status_menus_override_inherit_and_complete_previous_waiting_values() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(root.path());
+    let state = runtime.block_on(State::for_test(dirs.clone())).unwrap();
+    let (space, project, task, subtask) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Project", None).await.unwrap();
+        let task = state.create_work(space, "task", "Task", Some(project)).await.unwrap();
+        let subtask = state.create_work(space, "task", "Subtask", Some(task)).await.unwrap();
+        let other = state.create_space("Other").await.unwrap();
+        let old = state.create_work(other, "task", "Old", None).await.unwrap();
+        state
+            .set_work_status(other, old, Some("waiting".into()), "Alex reply".into())
+            .await
+            .unwrap();
+        state.delete_note(other, old).await.unwrap();
+        (space, project, task, subtask)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.WorkStatusTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    window.open_note(space, subtask);
+    until(|| task_title(&window, "Subtask").is_some());
+    window.inner().search.buffer().set_text(zib_core::work::WORK_QUERY);
+    until(|| window.inner().rows.borrow().iter().any(|(_, id)| *id == task));
+    let task_status = || {
+        let row = task_title(&window, "Task").unwrap().parent().unwrap();
+        let popup = work_popup(&row, "Task actions");
+        assert!(menu_item(&popup, "Set status…").unwrap().activate());
+        popup
+    };
+    for label in ["Maybe", "Someday"] {
+        let popup = task_status();
+        assert!(menu_item(&popup, label).unwrap().activate());
+        until(|| {
+            window
+                .inner()
+                .work
+                .tree
+                .borrow()
+                .status(task)
+                .is_some_and(|status| status.label() == label)
+        });
+        until(|| !window.inner().rows.borrow().iter().any(|(_, id)| [subtask, task].contains(id)));
+        let popup = task_status();
+        assert!(menu_item(&popup, label).is_none());
+        assert!(menu_item(&popup, "Inherit").unwrap().activate());
+        until(|| window.inner().work.tree.borrow().resolved_status(task).is_none());
+    }
+    let popup = task_status();
+    assert!(menu_item(&popup, "Someday").unwrap().activate());
+    until(|| window.inner().work.tree.borrow().status(task).is_some());
+    let inherited =
+        work_popup(&task_title(&window, "Subtask").unwrap().parent().unwrap(), "Work status");
+    for label in ["Inherit", "Maybe", "None", "Someday", "Waiting…"] {
+        assert!(menu_item(&inherited, label).is_some());
+    }
+    assert!(menu_item(&inherited, "None").unwrap().activate());
+    until(|| window.inner().work.tree.borrow().status(subtask).is_none());
+    until(|| window.inner().rows.borrow().iter().any(|(_, id)| *id == subtask));
+    let popup =
+        work_popup(&task_title(&window, "Subtask").unwrap().parent().unwrap(), "Work status");
+    assert!(menu_item(&popup, "Inherit").unwrap().activate());
+    until(|| window.inner().work.tree.borrow().status(subtask).is_some());
+    let popup = task_status();
+    assert!(menu_item(&popup, "Someday").is_none());
+    assert!(menu_item(&popup, "Inherit").unwrap().activate());
+    until(|| window.inner().work.tree.borrow().resolved_status(task).is_none());
+    let popup = work_popup(&window.inner().work.header, "Work status");
+    assert!(menu_item(&popup, "Waiting…").unwrap().activate());
+    let entry = descendants(&popup)
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::Entry>().ok())
+        .unwrap();
+    until(|| {
+        gtk::prelude::RootExt::focus(&window.inner().window)
+            .is_some_and(|focus| focus == entry || focus.is_ancestor(&entry))
+    });
+    entry.set_text("aLe");
+    until(|| {
+        descendants(&popup).iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.text() == "Alex reply" && label.is_visible())
+        })
+    });
+    let controllers = entry.observe_controllers();
+    let keys = (0..controllers.n_items())
+        .find_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerKey>().ok())
+        .unwrap();
+    assert!(keys.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::Tab, &0u32, &gdk::ModifierType::empty()]
+    ));
+    assert_eq!(entry.text(), "Alex reply");
+    entry.emit_by_name::<()>("activate", &[]);
+    until(|| {
+        window
+            .inner()
+            .work
+            .tree
+            .borrow()
+            .status(task)
+            .is_some_and(|status| status.source == project)
+    });
+    let status = window.inner().work.tree.borrow().status(subtask).unwrap();
+    assert_eq!(status.waiting_for.as_deref(), Some("Alex reply"));
+    let popup = task_status();
+    assert!(menu_item(&popup, "Maybe").unwrap().activate());
+    until(|| {
+        window.inner().work.tree.borrow().status(task).is_some_and(|status| status.value == "maybe")
+    });
+    assert_eq!(window.inner().work.tree.borrow().status(subtask).unwrap().waiting_for, None);
+    let popup = work_popup(&window.inner().work.header, "Work status");
+    assert!(menu_item(&popup, "None").unwrap().activate());
+    until(|| window.inner().work.tree.borrow().status(project).is_none());
+    assert_eq!(window.inner().work.tree.borrow().status(task).unwrap().value, "maybe");
+    let popup = task_status();
+    assert!(menu_item(&popup, "Inherit").unwrap().activate());
+    until(|| window.inner().rows.borrow().iter().any(|(_, id)| *id == task));
+    let popup = task_status();
+    assert!(menu_item(&popup, "Waiting…").unwrap().activate());
+    let entry = descendants(&popup)
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::Entry>().ok())
+        .unwrap();
+    entry.set_text("New reason");
+    entry.emit_by_name::<()>("activate", &[]);
+    until(|| {
+        window
+            .inner()
+            .work
+            .tree
+            .borrow()
+            .status(task)
+            .is_some_and(|status| status.waiting_for.as_deref() == Some("New reason"))
+    });
+    let popup = task_status();
+    assert!(menu_item(&popup, "Waiting…").unwrap().activate());
+    let entry = descendants(&popup)
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::Entry>().ok())
+        .unwrap();
+    entry.set_text("aLe");
+    let list = descendants(&popup)
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::ListBox>().ok())
+        .unwrap();
+    until(|| list.row_at_index(0).is_some_and(|row| row.is_mapped()));
+    let selected = list.row_at_index(0).unwrap();
+    assert_eq!(selected.child().and_downcast::<gtk::Label>().unwrap().text(), "Alex reply");
+    assert!(list.activates_on_single_click());
+    list.emit_by_name::<()>("row-activated", &[&selected]);
+    until(|| {
+        window
+            .inner()
+            .work
+            .tree
+            .borrow()
+            .status(task)
+            .is_some_and(|status| status.waiting_for.as_deref() == Some("Alex reply"))
+    });
+    until(|| !popup.is_mapped());
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+    let reopened = runtime.block_on(State::for_test(dirs)).unwrap();
+    assert_eq!(runtime.block_on(reopened.waiting_values()), ["Alex reply", "New reason"]);
+    assert_eq!(
+        runtime.block_on(reopened.work_tree(space)).unwrap().status(subtask).unwrap().value,
+        "waiting"
+    );
+    runtime.block_on(reopened.finish());
 }
 
 #[test]
