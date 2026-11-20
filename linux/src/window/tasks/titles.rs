@@ -12,7 +12,7 @@ use zib_core::{Error, Id};
 
 use crate::app::core;
 
-use super::Window;
+use super::{Window, display_title};
 
 pub(super) struct TitleEdit {
     busy: Cell<bool>,
@@ -29,8 +29,10 @@ pub(super) struct TitleEdit {
 
 impl TitleEdit {
     fn new(item: &Item) -> Rc<Self> {
+        let title = entry_title(item);
         let entry = gtk::Entry::builder()
-            .text(&item.title)
+            .text(title)
+            .placeholder_text("Title")
             .hexpand(true)
             .width_chars(8)
             .max_width_chars(40)
@@ -43,7 +45,7 @@ impl TitleEdit {
         entry.update_property(&[gtk::accessible::Property::Label(name)]);
         entry.set_tooltip_text(Some("Title · Enter or leave the field to save"));
         let label = gtk::Label::builder()
-            .label(&item.title)
+            .label(display_title(&item.title))
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
@@ -66,7 +68,7 @@ impl TitleEdit {
             finish: Cell::new(false),
             label,
             view,
-            saved: RefCell::new(item.title.clone()),
+            saved: RefCell::new(title.into()),
             timer: RefCell::default(),
         });
         let opening = Rc::downgrade(&edit);
@@ -87,11 +89,12 @@ impl TitleEdit {
     fn load(&self, item: &Item) {
         self.changing.set(true);
         raw_title(&item.note.body).clone_into(&mut self.expected.borrow_mut());
-        self.saved.borrow_mut().clone_from(&item.title);
-        if self.entry.text().as_str() != item.title {
-            self.entry.set_text(&item.title);
+        let title = entry_title(item);
+        title.clone_into(&mut self.saved.borrow_mut());
+        if self.entry.text().as_str() != title {
+            self.entry.set_text(title);
         }
-        self.label.set_text(&item.title);
+        self.label.set_text(display_title(&item.title));
         self.entry.remove_css_class("error");
         self.entry.set_tooltip_text(Some("Title · Enter or leave the field to save"));
         self.conflicted.set(false);
@@ -103,6 +106,10 @@ impl TitleEdit {
             self.finish.set(false);
         }
     }
+}
+
+fn entry_title(item: &Item) -> &str {
+    if raw_title(&item.note.body).is_empty() { "" } else { &item.title }
 }
 
 impl Window {
@@ -287,16 +294,11 @@ impl Window {
         let Some(edit) = work.titles.borrow().get(&key).cloned() else { return };
         let w = self.clone();
         edit.view.add_tick_callback(move |view, _| {
-            let inner = w.inner();
-            let (content, scroll) = if inner.project_pane.is_project() {
-                (&inner.project_pane.content, &inner.project_pane.scroll)
-            } else {
-                (&inner.editor_content, &inner.editor_scroll)
-            };
+            let pane = &w.inner().project_pane;
             if w.inner().work.selected.get() == Some(key.1)
-                && let Some(bounds) = view.compute_bounds(content)
+                && let Some(bounds) = view.compute_bounds(&pane.content)
             {
-                let adjustment = scroll.vadjustment();
+                let adjustment = pane.scroll.vadjustment();
                 let top = (f64::from(bounds.y()) - 30.0).max(0.0);
                 if top < adjustment.value() || top > adjustment.value() + adjustment.page_size() {
                     adjustment

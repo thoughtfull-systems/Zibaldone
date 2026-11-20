@@ -109,6 +109,11 @@ pub struct Note {
 }
 
 impl Note {
+    /// Occurrence tasks carry a series link written by the recurrence engine.
+    pub fn is_task_occurrence(&self) -> bool {
+        self.type_name == schema::TASK && self.fields.contains_key("series-id")
+    }
+
     /// The field's value, read against the space's schema, or `None` for no value or a value
     /// that doesn't match its kind.
     pub fn field(&self, space: &Space, name: &str) -> Option<Value> {
@@ -179,7 +184,8 @@ impl Space {
         let mut space = Self::empty(machine);
         space.doc.import(bytes)?;
         space.id()?;
-        if schema::write_schemas(&space.doc, &schema::built_in())? {
+        let upgraded = schema::upgrade_draft_work_schema(&space.doc)?;
+        if schema::write_schemas(&space.doc, &schema::built_in())? || upgraded {
             commit(&space.doc);
         }
         space.upgrade_work_search()?;
@@ -271,7 +277,7 @@ impl Space {
         self.doc.get_map(NOTES)
     }
 
-    fn note_map(&self, id: Id) -> Result<LoroMap> {
+    pub(crate) fn note_map(&self, id: Id) -> Result<LoroMap> {
         note_map(&self.doc, id)
     }
 
@@ -307,26 +313,20 @@ impl Space {
         body: &str,
         fields: &[(&str, schema::Value)],
     ) -> Result<()> {
-        if !schema::is_name(type_name) {
-            return Err(Error::invalid("type name", type_name));
-        }
-        let note = self.notes().insert_container(&id.to_string(), LoroMap::new())?;
-        note.insert("type", type_name)?;
-        let text = note.insert_container("body", LoroText::new())?;
-        text.insert(0, body)?;
-        let field_map = note.insert_container("fields", LoroMap::new())?;
-        for (name, value) in fields {
-            field_map.insert(name, value.to_loro())?;
-        }
-        let meta = note.insert_container("meta", LoroMap::new())?;
         let now = time::now();
-        let machine = self.machine.to_string();
-        meta.insert("created-at", now)?;
-        meta.insert("created-by", machine.as_str())?;
-        meta.insert("updated-at", now)?;
-        meta.insert("updated-by", machine.as_str())?;
-        note.insert_container("settings", LoroMap::new())?;
-        Ok(())
+        insert_note(
+            &self.doc,
+            id,
+            type_name,
+            body,
+            fields,
+            &NoteMeta {
+                created_at: now,
+                created_by: Some(self.machine),
+                updated_at: now,
+                updated_by: Some(self.machine),
+            },
+        )
     }
 
     /// Stages a local import with a peer separate from the editors that hold the live document.
@@ -444,6 +444,7 @@ impl Space {
 
     /// Clears a field, in one commit.
     pub fn clear_field(&mut self, id: Id, name: &str) -> Result<()> {
+        crate::work::validate(self, id, name, None)?;
         let fields = child_map(&self.note_map(id)?, "fields")?;
         fields.delete(name)?;
         self.clear_derived(id, name)?;
@@ -525,6 +526,9 @@ impl Space {
     /// Returns every deleted identifier, including the requested note.
     pub fn delete_note(&mut self, id: Id) -> Result<Vec<Id>> {
         let note = self.note(id)?;
+        if note.is_task_occurrence() {
+            return Err(Error::Space("Skip the occurrence to remove it from open work".into()));
+        }
         let mut deleted = vec![(id, self.title_of(&note.body).markdown)];
         if crate::work::is_work(&note.type_name) {
             let tree = crate::work::Tree::read(self);
@@ -575,6 +579,11 @@ impl Space {
     /// tombstone, as decision ZIB0005 describes moving a note. Files go with it separately.
     pub fn move_note_to(&mut self, id: Id, target: &mut Self) -> Result<()> {
         let note = self.note(id)?;
+        if note.is_task_occurrence() || self.has_recurrence_history(id) {
+            return Err(Error::Space(
+                "Recurring tasks and their notes stay in the same space".into(),
+            ));
+        }
         target.insert_note(id, &note.type_name, &note.body, &[])?;
         let destination = target.note_map(id)?;
         let fields = child_map(&destination, "fields")?;
@@ -785,6 +794,38 @@ impl Space {
     pub fn members(&self) -> Vec<Machine> {
         self.machines().into_iter().filter(|m| m.removed.is_none()).collect()
     }
+}
+
+pub(crate) fn insert_note(
+    doc: &LoroDoc,
+    id: Id,
+    type_name: &str,
+    body: &str,
+    fields: &[(&str, Value)],
+    metadata: &NoteMeta,
+) -> Result<()> {
+    if !schema::is_name(type_name) {
+        return Err(Error::invalid("type name", type_name));
+    }
+    let note = doc.get_map(NOTES).insert_container(&id.to_string(), LoroMap::new())?;
+    note.insert("type", type_name)?;
+    let text = note.insert_container("body", LoroText::new())?;
+    text.insert(0, body)?;
+    let field_map = note.insert_container("fields", LoroMap::new())?;
+    for (name, value) in fields {
+        field_map.insert(name, value.to_loro())?;
+    }
+    let meta = note.insert_container("meta", LoroMap::new())?;
+    meta.insert("created-at", metadata.created_at)?;
+    if let Some(machine) = metadata.created_by {
+        meta.insert("created-by", machine.to_string())?;
+    }
+    meta.insert("updated-at", metadata.updated_at)?;
+    if let Some(machine) = metadata.updated_by {
+        meta.insert("updated-by", machine.to_string())?;
+    }
+    note.insert_container("settings", LoroMap::new())?;
+    Ok(())
 }
 
 pub(crate) fn note_map(doc: &LoroDoc, id: Id) -> Result<LoroMap> {

@@ -34,7 +34,7 @@ impl Window {
             let names: HashMap<_, _> = spaces.iter().cloned().collect();
             let loaded = core(async move {
                 let mut rows = Vec::new();
-                if query.trim().is_empty() && sort != Sort::Due {
+                if query.trim().is_empty() && !matches!(sort, Sort::Due | Sort::Recurrence) {
                     let mut notes = Vec::new();
                     for (space, _) in &spaces {
                         notes.extend(
@@ -149,6 +149,9 @@ impl Window {
         pill.add_css_class("caption");
         pill.add_css_class("zib-type-pill");
         heading.append(&pill);
+        if tree.is_some_and(|tree| tree.recurrence_rules.contains_key(&item.hit.id)) {
+            heading.append(&super::tasks::recurrence_indicator());
+        }
         content.append(&heading);
         let mut breadcrumbs = Vec::new();
         if names.len() > 1

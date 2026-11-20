@@ -19,8 +19,11 @@ mod controls;
 mod drag;
 mod flow;
 mod quick_add;
+mod recurrence;
 mod status;
 mod titles;
+
+use quick_add::Section;
 
 type AdditionKey = (Id, Id, &'static str);
 
@@ -36,6 +39,7 @@ pub(super) struct WorkPanel {
     refresh_pending: Cell<bool>,
     pub(super) results_pending: Cell<bool>,
     reveal: Cell<bool>,
+    row_actions: gtk::SizeGroup,
     pub selected: Cell<Option<Id>>,
     task_prefix: gtk::SizeGroup,
     titles: RefCell<HashMap<(Id, Id), Rc<titles::TitleEdit>>>,
@@ -66,6 +70,7 @@ impl WorkPanel {
             refresh_pending: Cell::new(false),
             results_pending: Cell::new(false),
             reveal: Cell::new(false),
+            row_actions: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
             selected: Cell::new(None),
             task_prefix: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
             titles: RefCell::default(),
@@ -111,6 +116,25 @@ fn task_expander(expanded: bool) -> gtk::Button {
     button
 }
 
+fn link_button(icon: &str, label: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon);
+    button.add_css_class("flat");
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+    button
+}
+
+pub(super) fn recurrence_indicator() -> gtk::Image {
+    let icon = gtk::Image::from_icon_name("media-playlist-repeat-symbolic");
+    icon.set_tooltip_text(Some("Recurring task"));
+    icon.update_property(&[gtk::accessible::Property::Label("Recurring task")]);
+    icon
+}
+
+fn display_title(title: &str) -> &str {
+    if title.trim().is_empty() { "Untitled" } else { title }
+}
+
 fn clear(panel: &gtk::Box) {
     while let Some(child) = panel.first_child() {
         panel.remove(&child);
@@ -118,39 +142,6 @@ fn clear(panel: &gtk::Box) {
 }
 
 impl Window {
-    pub(super) fn work_layout(&self, type_name: &str) {
-        let inner = self.inner();
-        let inline = type_name == schema::TASK;
-        let panels = if inline { &inner.editor_content } else { &inner.project_pane.content };
-        for panel in [&inner.work.header, &inner.work.widget] {
-            if panel.parent().is_none_or(|parent| parent != *panels) {
-                if let Some(parent) = panel.parent().and_downcast::<gtk::Box>() {
-                    parent.remove(panel);
-                }
-                panels.append(panel);
-            }
-        }
-        let nested = inner.widget.parent().is_some_and(|p| p == inner.editor_content);
-        if inline != nested {
-            if nested {
-                inner.editor_content.remove(&inner.widget);
-            } else if let Some(viewport) = inner.widget.parent().and_downcast::<gtk::Viewport>() {
-                viewport.set_child(None::<&gtk::Widget>);
-            }
-            inner.editor_scroll.set_child(None::<&gtk::Widget>);
-            if inline {
-                inner.editor_content.insert_child_after(&inner.widget, Some(&inner.work.header));
-                inner.editor_scroll.set_child(Some(&inner.editor_content));
-            } else {
-                inner.editor_scroll.set_child(Some(&inner.widget));
-            }
-        }
-        if let Some(viewport) = inner.editor_scroll.child().and_downcast::<gtk::Viewport>() {
-            viewport.set_scroll_to_focus(false);
-        }
-        inner.project_pane.show(type_name == schema::PROJECT);
-    }
-
     pub(super) fn connect_work(&self) {
         let weak = std::rc::Rc::downgrade(&self.0);
         let mut date = zib_core::work::today();
@@ -168,8 +159,16 @@ impl Window {
         });
     }
 
-    /// A task opens its nearest project, or the root task for a standalone tree.
+    /// Opens an occurrence or reveals a task in its nearest work context.
     pub fn open_note(&self, space: Id, note: Id) {
+        self.open_work_context(space, note, false);
+    }
+
+    pub(super) fn open_search_result(&self, space: Id, note: Id) {
+        self.open_work_context(space, note, true);
+    }
+
+    fn open_work_context(&self, space: Id, note: Id, search_result: bool) {
         let opening = self.begin_open();
         let (w, state) = (self.clone(), self.inner().state.clone());
         glib::spawn_future_local(async move {
@@ -179,8 +178,15 @@ impl Window {
             }
             let mut context = note;
             if let Ok(tree) = tree {
-                context = tree.context(note);
-                if tree.items.get(&note).is_some_and(|i| i.note.type_name == schema::TASK) {
+                let open_series = search_result && tree.recurrence_rules.contains_key(&note);
+                if !open_series {
+                    context = tree.context(note);
+                }
+                if !open_series
+                    && tree.items.get(&note).is_some_and(|item| {
+                        item.note.type_name == schema::TASK && !item.note.is_task_occurrence()
+                    })
+                {
                     w.inner().work.selected.set(Some(note));
                     w.inner().work.reveal.set(true);
                     w.inner().work.expanded.borrow_mut().extend(tree.ancestors(note));
@@ -200,6 +206,11 @@ impl Window {
                 w.open_note_direct(space, context);
             }
         });
+    }
+
+    fn open_task(&self, space: Id, task: Id) {
+        self.inner().focus_body.set(true);
+        self.open_note_direct(space, task);
     }
 
     pub(super) fn refresh_work(&self) {
@@ -260,31 +271,64 @@ impl Window {
         };
         work.header.set_visible(true);
         work.widget.set_visible(true);
-        self.work_header(space, item, &tree);
-        if item.note.type_name == schema::PROJECT {
-            let heading = gtk::Label::builder().label("Subprojects").xalign(0.0).build();
-            heading.add_css_class("heading");
-            work.widget.append(&heading);
-        }
-        for child in tree
+        work.header.append(&self.work_controls(space, item, &tree));
+        let (projects, tasks): (Vec<_>, Vec<_>) = tree
             .children(note)
             .into_iter()
-            .filter(|id| tree.items[id].note.type_name == schema::PROJECT)
-        {
-            let item = &tree.items[&child];
-            let prefix = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            self.work_drag_handle(&prefix, space, item);
-            prefix.append(&gtk::Label::new(Some("▧")));
-            work.project_prefix.add_widget(&prefix);
-            work.widget.append(&self.work_row(space, item, 0, &tree, &prefix));
+            .partition(|id| tree.items[id].note.type_name == schema::PROJECT);
+        let project = item.note.type_name == schema::PROJECT;
+        if project {
+            self.draw_subprojects(space, note, &projects, &tree);
         }
-        if item.note.type_name == schema::PROJECT {
-            self.work_addition(space, note, schema::PROJECT);
+        if tree.series.contains(&note) {
+            self.draw_occurrence_history(space, note, &tree);
         }
+        let section = if project { Section::Tasks } else { Section::Subtasks };
+        let empty = tasks.is_empty();
+        if !empty || self.work_addition_revealed(space, note, section) {
+            self.draw_task_list(space, note, section, tasks, &tree);
+        }
+        self.work_addition(space, note, section, empty);
+        drop(tree);
+        if let Some(entry) = focused.filter(|entry| entry.is_ancestor(&work.widget)) {
+            if let Some(view) = entry.parent().and_downcast::<gtk::Stack>() {
+                view.set_visible_child_name("entry");
+            }
+            entry.grab_focus_without_selecting();
+        }
+        if work.reveal.replace(false) {
+            self.reveal_task_title();
+        }
+    }
+
+    fn draw_subprojects(&self, space: Id, note: Id, projects: &[Id], tree: &Tree) {
+        let work = &self.inner().work;
+        let section = Section::Subprojects;
+        if !projects.is_empty() || self.work_addition_revealed(space, note, section) {
+            let heading = gtk::Label::builder().label(section.title()).xalign(0.0).build();
+            heading.add_css_class("heading");
+            work.widget.append(&heading);
+            for id in projects {
+                let item = &tree.items[id];
+                let prefix = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                self.work_drag_handle(&prefix, space, item);
+                work.project_prefix.add_widget(&prefix);
+                work.widget.append(&self.work_row(space, item, 0, tree, &prefix));
+            }
+        }
+        self.work_addition(space, note, section, projects.is_empty());
+    }
+
+    fn draw_task_list(&self, space: Id, note: Id, section: Section, tasks: Vec<Id>, tree: &Tree) {
+        let work = &self.inner().work;
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        let label = gtk::Label::builder().label("Tasks").xalign(0.0).hexpand(true).build();
+        let label = gtk::Label::builder().label(section.title()).xalign(0.0).hexpand(true).build();
         label.add_css_class("heading");
         heading.append(&label);
+        work.widget.append(&heading);
+        if tasks.is_empty() {
+            return;
+        }
         let completed = gtk::CheckButton::with_label("Show completed");
         completed.set_active(work.completed.get());
         let w = self.clone();
@@ -303,8 +347,7 @@ impl Window {
             });
         });
         heading.append(&completed);
-        work.widget.append(&heading);
-        let mut pending: Vec<_> = tree.children(note).into_iter().rev().map(|id| (id, 0)).collect();
+        let mut pending: Vec<_> = tasks.into_iter().rev().map(|id| (id, 0)).collect();
         while let Some((id, depth)) = pending.pop() {
             let item = &tree.items[&id];
             if item.note.type_name != schema::TASK {
@@ -317,47 +360,11 @@ impl Window {
             {
                 continue;
             }
-            self.task_row(space, item, depth, &tree);
+            self.task_row(space, item, depth, tree);
             if work.expanded.borrow().contains(&id) {
                 pending.extend(tree.children(id).into_iter().rev().map(|id| (id, depth + 1)));
             }
         }
-        self.work_addition(space, note, schema::TASK);
-        drop(tree);
-        if let Some(entry) = focused {
-            entry.grab_focus_without_selecting();
-        }
-        if work.reveal.replace(false) {
-            self.reveal_task_title();
-        }
-    }
-
-    fn work_header(&self, space: Id, item: &Item, tree: &Tree) {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        if let Some(parent) = item.parent {
-            let title = format!("← {}", tree.items[&parent].title);
-            let label = gtk::Label::builder()
-                .label(&title)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .xalign(0.0)
-                .build();
-            let button = gtk::Button::builder()
-                .child(&label)
-                .hexpand(true)
-                .halign(gtk::Align::Start)
-                .valign(gtk::Align::Center)
-                .build();
-            button.set_tooltip_text(Some(&title));
-            button.add_css_class("flat");
-            let w = self.clone();
-            button.connect_clicked(move |_| w.open_note(space, parent));
-            row.append(&button);
-        }
-        self.work_controls(&row, space, item, tree);
-        if item.note.type_name == schema::TASK {
-            row.append(&self.completion(space, item));
-        }
-        self.inner().work.header.append(&row);
     }
 
     fn task_row(&self, space: Id, item: &Item, depth: i32, tree: &Tree) {
@@ -366,7 +373,7 @@ impl Window {
         let handles = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         self.work_drag_handle(&handles, space, item);
         let children = tree.children(id);
-        let expanded = work.expanded.borrow().contains(&id);
+        let expanded = !children.is_empty() && work.expanded.borrow().contains(&id);
         let toggle = task_expander(expanded);
         toggle.set_sensitive(!children.is_empty());
         let w = self.clone();
@@ -379,9 +386,13 @@ impl Window {
             w.refresh_work();
         });
         handles.append(&toggle);
-        let completion = self.completion(space, item);
-        completion.add_css_class("zib-task-completion");
-        handles.append(&completion);
+        if tree.series.contains(&id) {
+            handles.append(&recurrence_indicator());
+        } else {
+            let completion = self.completion(space, item);
+            completion.add_css_class("zib-task-completion");
+            handles.append(&completion);
+        }
         work.task_prefix.add_widget(&handles);
         work.widget.append(&self.work_row(space, item, depth, tree, &handles));
     }
@@ -408,15 +419,18 @@ impl Window {
         grid.attach(&title, 1, 0, 1, 1);
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         actions.set_halign(gtk::Align::End);
+        let (w, id) = (self.clone(), item.note.id);
         if item.note.type_name == schema::PROJECT {
-            let open = gtk::Button::from_icon_name("go-next-symbolic");
-            open.add_css_class("flat");
-            open.set_tooltip_text(Some("Open subproject"));
-            let (w, id) = (self.clone(), item.note.id);
+            let open = link_button("go-next-symbolic", "Open subproject");
             open.connect_clicked(move |_| w.open_note(space, id));
+            actions.append(&open);
+        } else if item.note.type_name == schema::TASK {
+            let open = link_button("go-next-symbolic", "Open task");
+            open.connect_clicked(move |_| w.open_task(space, id));
             actions.append(&open);
         }
         actions.append(&self.task_actions(space, item, tree));
+        self.inner().work.row_actions.add_widget(&actions);
         grid.attach(&actions, 2, 0, 1, 1);
         grid.attach(&self.work_details(space, item, tree), 1, 1, 2, 1);
         row.append(&grid);
@@ -426,14 +440,19 @@ impl Window {
 
     fn completion(&self, space: Id, item: &Item) -> gtk::CheckButton {
         let check = gtk::CheckButton::new();
-        check.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Complete {}",
-            item.title
-        ))]);
+        let label = format!("Complete {}", display_title(&item.title));
+        check.update_property(&[gtk::accessible::Property::Label(&label)]);
         check.set_active(item.completed());
-        check.set_tooltip_text(Some(&format!("Complete {}", item.title)));
+        check.set_tooltip_text(Some(&label));
         let (w, id) = (self.clone(), item.note.id);
+        let occurrence = item.note.is_task_occurrence();
         check.connect_toggled(move |check| {
+            if occurrence {
+                use zib_core::recurrence::Outcome;
+                let outcome = if check.is_active() { Outcome::Completed } else { Outcome::Open };
+                w.save_occurrence(space, id, outcome, String::new());
+                return;
+            }
             let date = check.is_active().then(|| Value::Date(zib_core::work::today()));
             w.save_work_field(space, id, "completed-on", date);
         });
@@ -489,51 +508,19 @@ impl Window {
         });
     }
 
-    pub(super) fn new_work(&self, kind: &'static str, parent: Option<Id>) {
-        let space = if parent.is_some() {
-            self.inner().editor.borrow().as_ref().map(|e| e.space)
-        } else {
-            self.current_space_id()
-        };
-        let Some(space) = space else {
+    pub(super) fn new_work(&self, kind: &'static str) {
+        let Some(space) = self.current_space_id() else {
             self.toast("Make a space first");
             return;
         };
-        let w = self.clone();
+        self.use_space(space);
+        let (w, state) = (self.clone(), self.inner().state.clone());
         glib::spawn_future_local(async move {
-            let entry =
-                gtk::Entry::builder().placeholder_text("Title").activates_default(true).build();
-            let title = if kind == schema::PROJECT { "New project" } else { "New task" };
-            let dialog = adw::AlertDialog::new(Some(title), None);
-            dialog.set_extra_child(Some(&entry));
-            dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
-            dialog.set_default_response(Some("create"));
-            dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
-            dialog.set_response_enabled("create", false);
-            let creating = dialog.downgrade();
-            entry.connect_changed(move |entry| {
-                if let Some(dialog) = creating.upgrade() {
-                    dialog.set_response_enabled("create", !entry.text().trim().is_empty());
-                }
-            });
-            if dialog.choose_future(Some(&w.inner().window)).await != "create" {
-                return;
-            }
-            let title = entry.text().trim().to_owned();
-            if title.is_empty() {
-                w.toast("Enter a title");
-                return;
-            }
-            let state = w.inner().state.clone();
-            match core(async move {
-                state.create_work(space, kind, &format!("# {title}\n\n"), parent).await
-            })
-            .await
-            {
+            match core(async move { state.create_work(space, kind, "", None).await }).await {
                 Ok(note) => {
                     w.reload_notes();
                     w.reload_saved_searches();
-                    w.open_note(space, note);
+                    w.open_task(space, note);
                 }
                 Err(error) => w.toast(&format!("Couldn't create {kind}: {error}")),
             }

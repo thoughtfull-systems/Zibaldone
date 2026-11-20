@@ -40,24 +40,38 @@ impl StatusMenu {
 }
 
 impl Window {
-    pub(super) fn work_status_button(&self, space: Id, note: Id, tree: &Tree) -> gtk::MenuButton {
+    pub(super) fn work_status_button(
+        &self,
+        space: Id,
+        note: Id,
+        tree: &Tree,
+        compact: bool,
+    ) -> gtk::MenuButton {
         let status = tree.status(note);
-        let label = status.as_ref().map_or_else(|| "Status".into(), Status::label);
+        let label = status.as_ref().map_or_else(|| "No status".into(), Status::label);
         let text = gtk::Label::builder()
             .label(&label)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(18)
             .build();
-        text.add_css_class("caption");
+        if compact {
+            text.add_css_class("caption");
+        }
         let button = gtk::MenuButton::builder().child(&text).build();
-        button.add_css_class("flat");
+        if compact {
+            button.add_css_class("flat");
+        }
         let hint = status.filter(|status| status.source != note).map_or_else(
             || label.clone(),
             |status| format!("{label} · Inherited from {}", tree.items[&status.source].title),
         );
         button.set_tooltip_text(Some(&format!("Work status · {hint}")));
         button.update_property(&[gtk::accessible::Property::Label("Work status")]);
+        if tree.items[&note].note.is_task_occurrence() {
+            button.set_sensitive(false);
+            return button;
+        }
         let w = self.clone();
         let options = StatusOptions::read(note, tree);
         button.set_create_popup_func(move |button| {

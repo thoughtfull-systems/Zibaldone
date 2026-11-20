@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use zib_core::schema::Value;
 use zib_core::search::Sort;
 use zib_core::search::saved::Definition;
-use zib_core::work::{Tree, WORK_QUERY};
+use zib_core::work::{ALL_TASKS_QUERY, Tree, WORK_QUERY};
 use zib_core::{Id, Result};
 
 use super::{State, UiEvent};
@@ -138,7 +138,7 @@ impl State {
         if space.setting(None, "zib.work-searches")?.is_none() {
             let searches = space.saved_searches();
             for (name, query, sort) in [
-                ("All tasks", "@type=task", Sort::Due),
+                ("All tasks", ALL_TASKS_QUERY, Sort::Due),
                 ("Projects", "@type=project", Sort::Title),
                 ("What should I work on?", WORK_QUERY, Sort::Due),
             ] {
@@ -180,5 +180,78 @@ impl State {
         self.send_ui(UiEvent::Changed(space_id));
         saved?;
         Ok(())
+    }
+}
+
+impl State {
+    pub(crate) async fn recurrence_rule(
+        &self,
+        space: Id,
+        note: Id,
+    ) -> Result<Option<zib_core::recurrence::Rule>> {
+        Ok(self.space(space).await?.lock().await.recurrence_rule(note))
+    }
+
+    pub(crate) async fn set_recurrence(
+        &self,
+        space_id: Id,
+        note: Id,
+        rule: Option<zib_core::recurrence::Rule>,
+    ) -> Result<()> {
+        let store = self.store.lock().await;
+        let space = self.space(space_id).await?;
+        let mut space = space.lock().await;
+        space.set_recurrence(note, rule, zib_core::recurrence::today())?;
+        self.save_recurrences(&store, space_id, &space)
+    }
+
+    pub(crate) async fn record_occurrence(
+        &self,
+        space_id: Id,
+        note: Id,
+        outcome: zib_core::recurrence::Outcome,
+        comment: String,
+    ) -> Result<()> {
+        let store = self.store.lock().await;
+        let space = self.space(space_id).await?;
+        let mut space = space.lock().await;
+        space.record_occurrence(note, outcome, zib_core::recurrence::today(), &comment)?;
+        self.save_recurrences(&store, space_id, &space)
+    }
+
+    pub(crate) async fn add_occurrence_comment(
+        &self,
+        id: Id,
+        note: Id,
+        comment: String,
+    ) -> Result<()> {
+        let store = self.store.lock().await;
+        let document = self.space(id).await?;
+        let mut space = document.lock().await;
+        space.add_occurrence_comment(note, zib_core::recurrence::today(), &comment)?;
+        self.save_recurrences(&store, id, &space)
+    }
+
+    pub(crate) async fn catch_up_recurrences(&self, id: Id) -> Result<()> {
+        let store = self.store.lock().await;
+        let space = self.space(id).await?;
+        let mut space = space.lock().await;
+        if space.realize_recurrences(zib_core::recurrence::today())? {
+            self.save_recurrences(&store, id, &space)?;
+        }
+        Ok(())
+    }
+
+    fn save_recurrences(
+        &self,
+        store: &zib_core::store::Store,
+        id: Id,
+        space: &zib_core::Space,
+    ) -> Result<()> {
+        let saved = store.save_space(space);
+        let indexed = self.index(id, space);
+        self.changed_here(id);
+        self.send_ui(UiEvent::Changed(id));
+        saved.and(indexed)
     }
 }

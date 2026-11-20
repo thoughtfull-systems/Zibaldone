@@ -132,3 +132,10 @@ and `waiting-for` as text. Both use search mode `filter`. The
 The `status` choice also accepts `none`. It stops status inheritance while leaving the item
 available. The [status overrides rules](projects-and-tasks.md#status-overrides) define search and
 menu behavior.
+
+## Task occurrence notes
+
+A recurring task occurrence uses the `task` type and stores its series link in `series-id`. Task
+fields include `recurrence` as a boolean, `recurrence-on`, `skipped-on`, and `superseded-on` as
+dates, and `series-id` as a link. These fields use search mode `filter`. The
+[recurring tasks specification](recurring-tasks.md) defines their storage and search behavior.

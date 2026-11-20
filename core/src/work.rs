@@ -9,17 +9,33 @@ use crate::{Error, Id, Result, Space};
 mod order;
 mod status;
 
+pub const ALL_TASKS_QUERY: &str = "@type=task";
 pub const PRE_STATUS_WORK_QUERY: &str =
     "@type=task AND @completed-on!? AND (@scheduled-on!? OR @scheduled-on<=today)";
-pub const WORK_QUERY: &str = concat!(
+pub const PRE_RECURRENCE_WORK_QUERY: &str = concat!(
     "@type=task AND @completed-on!? AND (@scheduled-on!? OR @scheduled-on<=today)",
     " AND @status!?"
 );
 
+const ACTIONABLE_WORK_QUERY: &str =
+    "@actionable=true AND (@scheduled-on!? OR @scheduled-on<=today) AND @status!?";
+pub const WORK_QUERY: &str = concat!(
+    "@type=task AND @recurrence!? AND @completed-on!? AND @skipped-on!? AND @superseded-on!?",
+    " AND (@scheduled-on!? OR @scheduled-on<=today) AND @status!?"
+);
+
 pub use status::Status;
 
+pub fn is_task(type_name: &str) -> bool {
+    type_name == schema::TASK
+}
+
 pub fn is_work(type_name: &str) -> bool {
-    matches!(type_name, schema::PROJECT | schema::TASK)
+    type_name == schema::PROJECT || is_task(type_name)
+}
+
+fn valid_parent(child: &str, parent: &str) -> bool {
+    parent == schema::PROJECT || child == schema::TASK && is_task(parent)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,7 +47,9 @@ pub struct Item {
 
 impl Item {
     pub fn completed(&self) -> bool {
-        self.note.type_name == schema::TASK && self.explicit_date("completed-on").is_some()
+        is_task(&self.note.type_name)
+            && (self.explicit_date("completed-on").is_some()
+                || self.explicit_date("skipped-on").is_some())
     }
 
     pub fn explicit_date(&self, field: &str) -> Option<String> {
@@ -49,43 +67,80 @@ pub struct Date {
 /// A deterministic forest derived from the stored links, without repairing synced content.
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
+    pub current_occurrences: BTreeMap<Id, Id>,
     pub items: BTreeMap<Id, Item>,
     order: BTreeMap<Id, usize>,
+    pub recurrence_rules: BTreeMap<Id, crate::recurrence::Rule>,
+    pub series: BTreeSet<Id>,
+    pub occurrences: BTreeMap<Id, crate::recurrence::Occurrence>,
 }
 
 impl Tree {
     pub fn read(space: &Space) -> Self {
+        Self::read_on(space, chrono::Local::now().date_naive())
+    }
+
+    pub(crate) fn read_on(space: &Space, today: chrono::NaiveDate) -> Self {
         let mut tree = Self { order: order::positions(space), ..Self::default() };
         for id in space.note_ids() {
             let Ok(note) = space.note(id) else { continue };
             if !is_work(&note.type_name) {
                 continue;
             }
-            let parent = note
-                .fields
-                .get("parent-id")
-                .and_then(|v| v.as_string())
-                .and_then(|v| Id::parse(v).ok());
+            let parent = (!note.is_task_occurrence())
+                .then(|| {
+                    note.fields
+                        .get("parent-id")
+                        .and_then(|v| v.as_string())
+                        .and_then(|v| Id::parse(v).ok())
+                })
+                .flatten();
             let title = space.title(id).map_or_else(|_| "Untitled".into(), |t| t.plain);
             tree.items.insert(id, Item { note, parent, title });
         }
-        let invalid: Vec<_> = tree
+        crate::recurrence::project(space, &mut tree, today);
+        tree
+    }
+
+    pub(crate) fn finish_hierarchy(&mut self) {
+        for id in &self.series {
+            self.items.get_mut(id).unwrap().note.fields.remove("completed-on");
+        }
+        for (id, occurrence) in &self.occurrences {
+            let item = self.items.get_mut(id).unwrap();
+            item.parent = Some(occurrence.series);
+            if occurrence.superseded_on.is_none() {
+                item.note.fields.remove("superseded-on");
+            }
+            let field = match occurrence.outcome {
+                crate::recurrence::Outcome::Completed => "completed-on",
+                crate::recurrence::Outcome::Skipped => "skipped-on",
+                crate::recurrence::Outcome::Open => continue,
+            };
+            if let Some(day) = &occurrence.closed {
+                item.note.fields.insert(field.into(), day.clone().into());
+            }
+        }
+        let invalid: Vec<_> = self
             .items
             .iter()
             .filter_map(|(id, item)| {
                 let parent = item.parent?;
-                let valid = tree.items.get(&parent).is_some_and(|p| {
-                    item.note.type_name == schema::TASK || p.note.type_name == schema::PROJECT
+                let valid = self.items.get(&parent).is_some_and(|p| {
+                    self.occurrences.contains_key(id)
+                        || (valid_parent(&item.note.type_name, &p.note.type_name)
+                            && (!p.note.is_task_occurrence()
+                                || self.occurrences.contains_key(&parent)))
                 });
                 (!valid).then_some(*id)
             })
             .collect();
         for id in invalid {
-            tree.items.get_mut(&id).unwrap().parent = None;
+            self.items.get_mut(&id).unwrap().parent = None;
         }
-        // Cutting the largest identifier in each cycle gives every replica the same forest.
+        // Cut the largest explicit edge in each cycle, keeping occurrence membership intact.
         let mut visited = BTreeSet::new();
-        for start in tree.items.keys().copied().collect::<Vec<_>>() {
+        for start in self.items.keys().copied().collect::<Vec<_>>() {
             let mut path = Vec::new();
             let mut positions = BTreeMap::new();
             let mut cursor = Some(start);
@@ -94,17 +149,20 @@ impl Tree {
                     break;
                 }
                 if let Some(at) = positions.get(&id).copied() {
-                    let cut = path[at..].iter().max().copied().unwrap();
-                    tree.items.get_mut(&cut).unwrap().parent = None;
+                    let cut =
+                        path[at..].iter().filter(|id| !self.occurrences.contains_key(id)).max();
+                    self.items
+                        .get_mut(cut.expect("a cycle has an explicit parent"))
+                        .unwrap()
+                        .parent = None;
                     break;
                 }
                 positions.insert(id, path.len());
                 path.push(id);
-                cursor = tree.items[&id].parent;
+                cursor = self.items[&id].parent;
             }
             visited.extend(path);
         }
-        tree
     }
 
     /// Nearest parent first; the item itself isn't included.
@@ -121,18 +179,36 @@ impl Tree {
     pub fn context(&self, id: Id) -> Id {
         let path = std::iter::once(id).chain(self.ancestors(id)).collect::<Vec<_>>();
         path.iter()
-            .find(|id| self.items.get(id).is_some_and(|i| i.note.type_name == schema::PROJECT))
+            .find(|id| {
+                self.occurrences.contains_key(id)
+                    || self.items.get(id).is_some_and(|i| i.note.type_name == schema::PROJECT)
+            })
             .copied()
             .unwrap_or_else(|| *path.last().unwrap())
     }
 
     pub fn date(&self, id: Id, field: &str) -> Option<Date> {
-        if field == "completed-on" {
+        if matches!(field, "completed-on" | "skipped-on" | "superseded-on") {
             return Some(Date { source: id, value: self.items.get(&id)?.explicit_date(field)? });
         }
-        std::iter::once(id).chain(self.ancestors(id)).find_map(|source| {
-            Some(Date { source, value: self.items.get(&source)?.explicit_date(field)? })
-        })
+        for source in std::iter::once(id).chain(self.ancestors(id)) {
+            let value = match (self.occurrences.get(&source), field) {
+                (Some(occurrence), "due-on") => occurrence.due.clone(),
+                (Some(occurrence), "scheduled-on") => occurrence.scheduled.clone(),
+                _ => self.items.get(&source)?.explicit_date(field),
+            };
+            if let Some(value) = value {
+                return Some(Date { source, value });
+            }
+            // An occurrence can close without a date. Preserve that captured absence.
+            if source == id
+                && matches!(field, "due-on" | "scheduled-on")
+                && self.occurrences.get(&source).is_some_and(|row| row.closed.is_some())
+            {
+                return None;
+            }
+        }
+        None
     }
 
     pub fn projects(&self, id: Id) -> Vec<Id> {
@@ -152,7 +228,9 @@ impl Tree {
         let mut children: Vec<_> = self
             .items
             .iter()
-            .filter_map(|(child, item)| (item.parent == Some(id)).then_some(*child))
+            .filter_map(|(child, item)| {
+                (item.parent == Some(id) && !item.note.is_task_occurrence()).then_some(*child)
+            })
             .collect();
         children.sort_by(|a, b| {
             self.order
@@ -170,6 +248,7 @@ impl Tree {
     pub fn unfinished_below(&self, id: Id) -> bool {
         self.items.iter().any(|(child, item)| {
             item.note.type_name == schema::TASK
+                && !item.note.is_task_occurrence()
                 && !item.completed()
                 && self.ancestors(*child).contains(&id)
         })
@@ -182,6 +261,21 @@ pub(crate) fn validate(space: &Space, id: Id, field: &str, value: Option<&Value>
     if !is_work(&note.type_name) {
         return Ok(());
     }
+    if matches!(
+        field,
+        "occurrence-slot"
+            | "original-on"
+            | "realized-on"
+            | "recurrence"
+            | "recurrence-on"
+            | "rule-id"
+            | "series-id"
+            | "skipped-on"
+            | "superseded-on"
+    ) || note.is_task_occurrence() && !matches!(field, "due-on" | "scheduled-on")
+    {
+        return Err(Error::Space(format!("{field} is read-only on this note")));
+    }
     let Some(value) = value else { return Ok(()) };
     let valid = match (field, value) {
         ("completed-on", Value::Date(date)) => {
@@ -193,7 +287,8 @@ pub(crate) fn validate(space: &Space, id: Id, field: &str, value: Option<&Value>
             tree.items.get(parent).is_some_and(|p| {
                 *parent != id
                     && !tree.ancestors(*parent).contains(&id)
-                    && (note.type_name == schema::TASK || p.note.type_name == schema::PROJECT)
+                    && valid_parent(&note.type_name, &p.note.type_name)
+                    && (!p.note.is_task_occurrence() || tree.occurrences.contains_key(parent))
             })
         }
         ("status", Value::Choice(value)) => Status::valid(value),
@@ -243,20 +338,22 @@ impl Space {
 
     /// Retains the task-only entry point for callers that don't edit project titles.
     pub fn rename_task(&mut self, id: Id, expected: &str, title: &str) -> Result<String> {
-        if self.note(id)?.type_name != schema::TASK {
+        let note = self.note(id)?;
+        if note.type_name != schema::TASK || note.is_task_occurrence() {
             return Err(Error::Space("Enter a task title on one line".into()));
         }
         self.rename_work_title(id, expected, title)
     }
 
     pub fn create_work(&mut self, type_name: &str, body: &str, parent: Option<Id>) -> Result<Id> {
-        if !is_work(type_name) {
+        if !matches!(type_name, schema::PROJECT | schema::TASK) {
             return Err(Error::Space("Choose a project or task".into()));
         }
         if let Some(parent) = parent {
             let target = self.note(parent)?;
-            if !is_work(&target.type_name)
-                || (type_name == schema::PROJECT && target.type_name != schema::PROJECT)
+            if !valid_parent(type_name, &target.type_name)
+                || (target.is_task_occurrence()
+                    && !Tree::read(self).occurrences.contains_key(&parent))
             {
                 return Err(Error::Space("Choose a valid parent in this space".into()));
             }

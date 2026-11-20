@@ -1,4 +1,4 @@
-//! Project notes beside independently scrolling details, with a machine-local divider width.
+//! Work notes beside independently scrolling details, with a machine-local divider width.
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -74,15 +74,11 @@ impl ProjectPane {
         }
     }
 
-    pub fn show(&self, project: bool) {
-        self.active.set(project);
-        self.note.set_width_request(if project { MIN_NOTE_WIDTH } else { -1 });
-        self.scroll.set_visible(project);
+    pub fn show(&self, visible: bool) {
+        self.active.set(visible);
+        self.note.set_width_request(if visible { MIN_NOTE_WIDTH } else { -1 });
+        self.scroll.set_visible(visible);
         self.apply();
-    }
-
-    pub fn is_project(&self) -> bool {
-        self.active.get()
     }
 
     fn bounds(&self) -> Option<(i32, i32, i32)> {

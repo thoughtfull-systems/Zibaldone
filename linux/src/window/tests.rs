@@ -32,12 +32,16 @@ fn present(window: &gtk::Window) {
     clock.disconnect(handler);
 }
 
-fn input(widget: &EditorWidget) -> gtk::IMContext {
+fn editor_keys(widget: &EditorWidget) -> gtk::EventControllerKey {
     let controllers = widget.observe_controllers();
     (0..controllers.n_items())
         .filter_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerKey>().ok())
-        .find_map(|keys| keys.im_context())
-        .expect("the editor's input method")
+        .find(|keys| keys.im_context().is_some())
+        .expect("the editor's key controller")
+}
+
+fn input(widget: &EditorWidget) -> gtk::IMContext {
+    editor_keys(widget).im_context().expect("the editor's input method")
 }
 
 fn descendants(root: &impl IsA<gtk::Widget>) -> Vec<gtk::Widget> {
@@ -77,6 +81,29 @@ fn edit_title(window: &Window, title: &str) -> gtk::Entry {
     let view = entry.parent().unwrap().downcast::<gtk::Stack>().unwrap();
     view.child_by_name("label").unwrap().downcast::<gtk::Button>().unwrap().emit_clicked();
     entry
+}
+
+fn work_button(window: &Window, label: &str) -> Option<gtk::Button> {
+    descendants(&window.inner().work.widget)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+        .find(|button| button.label().as_deref() == Some(label))
+}
+
+fn reveal_work_addition(window: &Window, button: &str, placeholder: &str) -> gtk::Entry {
+    until(|| work_button(window, button).is_some_and(|button| button.is_mapped()));
+    work_button(window, button).unwrap().emit_clicked();
+    let focused_title = || {
+        let focus = gtk::prelude::RootExt::focus(&window.inner().window)?;
+        focus
+            .clone()
+            .downcast::<gtk::Entry>()
+            .ok()
+            .or_else(|| focus.ancestor(gtk::Entry::static_type()).and_downcast::<gtk::Entry>())
+            .filter(|entry| entry.placeholder_text().as_deref() == Some(placeholder))
+    };
+    until(|| focused_title().is_some());
+    focused_title().unwrap()
 }
 
 #[test]
@@ -132,7 +159,7 @@ fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
     });
     assert_eq!(inner.work.header.parent(), Some(pane.content.clone().upcast()));
     assert_eq!(inner.work.widget.parent(), Some(pane.content.clone().upcast()));
-    assert!(!inner.work.widget.is_ancestor(&inner.editor_content));
+    assert!(!inner.work.widget.is_ancestor(&inner.editor_scroll));
     assert_eq!(runtime.block_on(state.project_sidebar_width()), None);
     assert_ne!(pane.scroll.vadjustment(), inner.editor_scroll.vadjustment());
     inner.editor_scroll.vadjustment().set_value(100.0);
@@ -177,8 +204,9 @@ fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
     until(|| {
         inner.work.widget.is_visible() && inner.widget.text().as_deref() == Some("Standalone")
     });
-    assert!(!pane.scroll.is_visible());
-    assert_eq!(inner.work.widget.parent(), Some(inner.editor_content.clone().upcast()));
+    until(|| pane.scroll.is_mapped() && pane.scroll.width() == 640);
+    assert_eq!(inner.work.header.parent(), Some(pane.content.clone().upcast()));
+    assert_eq!(inner.work.widget.parent(), Some(pane.content.clone().upcast()));
     window.open_note(space, project);
     until(|| pane.scroll.is_mapped() && pane.scroll.width() == 640);
     window.inner().window.close();
@@ -234,30 +262,30 @@ fn inline_additions_keep_focus_drafts_and_project_context() {
             .filter_map(|widget| widget.downcast::<gtk::Entry>().ok())
             .find(|entry| entry.placeholder_text().as_deref() == Some(placeholder))
     };
-    until(|| addition("New task").is_some());
-    assert!(descendants(&window.inner().work.widget).iter().any(|widget| {
-        widget.downcast_ref::<gtk::Label>().is_some_and(|label| label.text() == "Subprojects")
+    until(|| work_button(&window, "Add a task").is_some());
+    assert!(addition("New task").is_none() && addition("New subproject").is_none());
+    assert!(descendants(&window.inner().work.widget).iter().all(|widget| {
+        widget
+            .downcast_ref::<gtk::Label>()
+            .is_none_or(|label| label.text() != "Subprojects" && label.text() != "Tasks")
     }));
-    let entry = addition("New task").unwrap();
-    let project_entry = addition("New subproject").unwrap();
-    let start = |entry: &gtk::Entry| {
-        let row = entry.parent().unwrap();
-        (entry.width() > 0 && row.first_child().unwrap().width() > 0)
-            .then(|| entry.compute_bounds(&window.inner().work.widget).unwrap().x())
-    };
-    until(|| start(&entry).is_some() && start(&project_entry).is_some());
-    let task_start = start(&entry).unwrap();
-    let project_start = start(&project_entry).unwrap();
-    assert!(task_start > 4.0 && project_start > 4.0);
-    assert_eq!(entry.parent().unwrap().last_child().as_ref(), Some(entry.upcast_ref()));
-    entry.emit_by_name::<()>("activate", &[]);
+    let entry = reveal_work_addition(&window, "Add a task", "New task");
+    assert!(runtime.block_on(state.work_tree(space)).unwrap().children(project).is_empty());
+    assert!(descendants(&window.inner().work.widget).iter().any(|widget| {
+        widget.downcast_ref::<gtk::Label>().is_some_and(|label| label.text() == "Tasks")
+    }));
+    entry.emit_activate();
     assert!(runtime.block_on(state.work_tree(space)).unwrap().children(project).is_empty());
     entry.set_text("First task");
-    entry.emit_by_name::<()>("activate", &[]);
+    entry.emit_activate();
+    until(|| task_title(&window, "First task").is_some() && entry.text().is_empty());
+    assert_eq!(entry, addition("New task").unwrap());
     entry.set_text("Second task");
-    until(|| task_title(&window, "First task").is_some());
-    assert_eq!(entry.text(), "Second task");
     entry.emit_by_name::<()>("activate", &[]);
+    entry.set_text("Keep typing");
+    until(|| task_title(&window, "Second task").is_some());
+    assert_eq!(entry.text(), "Keep typing");
+    entry.set_text("");
     until(|| task_title(&window, "Second task").is_some() && entry.text().is_empty());
     assert!(
         gtk::prelude::RootExt::focus(&window.inner().window)
@@ -276,31 +304,35 @@ fn inline_additions_keep_focus_drafts_and_project_context() {
     until(|| window.inner().work.tree.borrow().date(project, "due-on").is_some());
     assert_eq!(entry, addition("New task").unwrap());
     assert_eq!(entry.text(), "Keep this draft");
-    let project_entry = addition("New subproject").unwrap();
-    project_entry.set_text("Subproject *title*");
-    project_entry.emit_by_name::<()>("activate", &[]);
-    until(|| subproject_row(&window, "Subproject *title*").is_some());
-    assert!(project_entry.text().is_empty());
-    assert_eq!(
-        project_entry.parent().unwrap().last_child().as_ref(),
-        Some(project_entry.upcast_ref())
+    let project_entry = reveal_work_addition(&window, "Add a subproject", "New subproject");
+    let tree = runtime.block_on(state.work_tree(space)).unwrap();
+    assert!(
+        tree.children(project)
+            .into_iter()
+            .all(|id| tree.items[&id].note.type_name == zib_core::schema::TASK)
     );
+    project_entry.set_text("Subproject *title*");
+    project_entry.emit_activate();
+    until(|| {
+        task_title(&window, "Subproject *title*").is_some() && project_entry.text().is_empty()
+    });
+    assert_eq!(project_entry, addition("New subproject").unwrap());
     let aligned = |input: &gtk::Entry, title: &gtk::Widget| {
         let container = &window.inner().work.widget;
         input.width() > 0
             && title.width() > 0
-            && input
-                .compute_bounds(container)
-                .zip(title.compute_bounds(container))
-                .is_some_and(|(input, title)| (input.x() - title.x()).abs() < 1.0)
+            && input.compute_bounds(container).zip(title.compute_bounds(container)).is_some_and(
+                |(input, title)| {
+                    (input.x() - title.x()).abs() < 1.0
+                        && (input.width() - title.width()).abs() < 1.0
+                },
+            )
     };
     until(|| aligned(&entry, &task_title(&window, "First task").unwrap().parent().unwrap()));
     until(|| {
         let title = task_title(&window, "Subproject *title*").unwrap().parent().unwrap();
         aligned(&project_entry, &title)
     });
-    assert_eq!(start(&entry), Some(task_start));
-    assert_eq!(start(&project_entry), Some(project_start));
     assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, project);
     assert!(window.inner().window.visible_dialog().is_none());
     let tree = runtime.block_on(state.work_tree(space)).unwrap();
@@ -314,7 +346,18 @@ fn inline_additions_keep_focus_drafts_and_project_context() {
     }
     window.space_changed(space);
     until(|| window.inner().work.tree.borrow().children(project).is_empty());
-    until(|| start(&entry) == Some(task_start) && start(&project_entry) == Some(project_start));
+    assert!(work_button(&window, "Add a task").is_some());
+    assert!(work_button(&window, "Add a subproject").is_some());
+    assert!(addition("New task").is_none() && addition("New subproject").is_none());
+    for (action, kind) in [("win.new-project", "project"), ("win.new-task", "task")] {
+        WidgetExt::activate_action(&window.inner().window, action, None).unwrap();
+        until(|| {
+            window.inner().editor.borrow().as_ref().is_some_and(|e| e.type_name == kind)
+                && window.inner().widget.text().as_deref() == Some("")
+                && window.inner().widget.is_focus()
+        });
+        assert!(window.inner().window.visible_dialog().is_none());
+    }
     window.inner().window.destroy();
 }
 
@@ -1109,11 +1152,14 @@ fn task_titles_are_compact_preserve_notes_and_flush_pending_edits() {
     );
     window.inner().search.buffer().set_text(zib_core::work::WORK_QUERY);
     until(|| window.inner().rows.borrow().iter().any(|(_, id)| *id == task));
-    let check = descendants(&window.inner().work.widget)
-        .into_iter()
-        .filter_map(|w| w.downcast::<gtk::CheckButton>().ok())
-        .find(|c| c.tooltip_text().as_deref() == Some("Complete Latest task"))
-        .unwrap();
+    let latest_check = || {
+        descendants(&window.inner().work.widget)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::CheckButton>().ok())
+            .find(|c| c.tooltip_text().as_deref() == Some("Complete Latest task"))
+    };
+    until(|| latest_check().is_some());
+    let check = latest_check().unwrap();
     check.set_active(true);
     until(|| !window.inner().rows.borrow().iter().any(|(_, id)| *id == task));
     assert_eq!(
@@ -1190,6 +1236,11 @@ fn show_completed_is_saved_per_work_note_and_restored_after_restart() {
         until(|| task_title(window, &format!("Active {suffix}")).is_some());
     };
     open(&window, project, "A");
+    assert!(
+        descendants(&window.inner().work.header)
+            .iter()
+            .all(|widget| { widget.tooltip_text().as_deref() != Some("Project actions") })
+    );
     assert!(!check(&window).is_active());
     assert!(task_title(&window, "Done A").is_none());
     check(&window).set_active(true);
@@ -1214,6 +1265,12 @@ fn show_completed_is_saved_per_work_note_and_restored_after_restart() {
     assert!(task_title(&window, "Done A").is_some());
     open(&window, standalone, "C");
     assert!(!check(&window).is_active());
+    let inner = window.inner();
+    assert!(inner.project_pane.scroll.is_visible());
+    assert!(inner.work.widget.is_ancestor(&inner.project_pane.scroll));
+    assert!(descendants(&inner.work.widget).iter().any(|widget| {
+        widget.downcast_ref::<gtk::Label>().is_some_and(|label| label.text() == "Subtasks")
+    }));
     check(&window).set_active(true);
     // Navigation mustn't redirect a pending setting write into the newly opened note.
     open(&window, subproject, "B");
@@ -1222,6 +1279,58 @@ fn show_completed_is_saved_per_work_note_and_restored_after_restart() {
     for note in &before {
         assert_eq!(runtime.block_on(state.note(space, note.id)).unwrap(), *note);
     }
+    open(&window, standalone, "C");
+    let header = &window.inner().work.header;
+    for name in ["Due date", "Move…", "Scheduled date", "Work status"] {
+        assert!(descendants(header).iter().any(|widget| {
+            widget.tooltip_text().is_some_and(|tooltip| tooltip.starts_with(name))
+        }));
+    }
+    assert!(
+        descendants(header)
+            .iter()
+            .all(|widget| { widget.tooltip_text().as_deref() != Some("Task actions") })
+    );
+    let grid = header.first_child().and_downcast::<gtk::Grid>().unwrap();
+    for (row, name) in
+        (0..).zip(["Completed", "Status", "Scheduled date", "Due date", "Parent", "Recurrence"])
+    {
+        let label = grid.child_at(0, row).and_downcast::<gtk::Label>().unwrap();
+        assert_eq!(label.text(), name);
+        assert!(label.xalign() > 0.99);
+        assert!(label.has_css_class("zib-work-field-name") && !label.has_css_class("caption"));
+        assert!(grid.child_at(1, row).is_some());
+    }
+    let control_labels: Vec<_> = (1..=4)
+        .map(|row| {
+            descendants(&grid.child_at(1, row).unwrap())
+                .into_iter()
+                .find_map(|widget| widget.downcast::<gtk::Label>().ok())
+                .unwrap()
+        })
+        .collect();
+    until(|| control_labels.iter().all(|label| label.width() > 0));
+    let left = control_labels[0].compute_bounds(&grid).unwrap().x();
+    for label in control_labels {
+        assert!(!label.has_css_class("caption"));
+        assert!((label.compute_bounds(&grid).unwrap().x() - left).abs() < 1.0);
+        if let Some(button) =
+            label.ancestor(gtk::MenuButton::static_type()).and_downcast::<gtk::MenuButton>()
+        {
+            assert!(!button.has_css_class("flat"));
+            assert!(!button.has_css_class("zib-work-quiet"));
+            assert!(left - button.compute_bounds(&grid).unwrap().x() >= 12.0);
+            let weight = label.pango_context().font_description().unwrap().weight();
+            assert_eq!(weight, gtk::pango::Weight::Bold);
+        }
+    }
+    let complete = grid
+        .child_at(1, 0)
+        .and_then(|cell| cell.first_child())
+        .and_downcast::<gtk::CheckButton>()
+        .unwrap();
+    complete.set_active(true);
+    until(|| window.inner().work.tree.borrow().items[&standalone].completed());
     window.close_editor();
     runtime.block_on(state.finish());
     window.inner().window.destroy();
@@ -1738,7 +1847,7 @@ fn task_actions_choose_parent_without_an_inline_parent_selector() {
     until(|| task_title(&window, "Task").is_some());
     let mut parent_metrics = None;
     for query in ["", "Destination"] {
-        let popup = work_popup(&window.inner().work.header, "Change parent");
+        let popup = work_popup(&window.inner().work.header, "Move…");
         let search = descendants(&popup)
             .into_iter()
             .find_map(|widget| widget.downcast::<gtk::SearchEntry>().ok())
@@ -1753,9 +1862,11 @@ fn task_actions_choose_parent_without_an_inline_parent_selector() {
         assert_eq!(runtime.block_on(state.work_tree(space)).unwrap().items[&project].parent, None);
     }
     let row = task_row(&window, "Task").unwrap();
-    assert!(!descendants(&row).iter().any(|widget| {
-        widget.tooltip_text().is_some_and(|text| text.starts_with("Change parent"))
-    }));
+    assert!(
+        !descendants(&row).iter().any(|widget| {
+            widget.tooltip_text().is_some_and(|text| text.starts_with("Move…"))
+        })
+    );
     let popup = work_popup(&row, "Task actions");
     assert!(popup.is::<gtk::PopoverMenu>());
     assert!(menu_item(&popup, "Add subtask").is_none());
@@ -1770,10 +1881,11 @@ fn task_actions_choose_parent_without_an_inline_parent_selector() {
         [
             "Add schedule date",
             "Add due date",
+            "Add recurrence…",
             "Someday",
             "Maybe",
             "Waiting…",
-            "Choose parent…",
+            "Move…",
             "Delete task…"
         ]
     );
@@ -1791,9 +1903,9 @@ fn task_actions_choose_parent_without_an_inline_parent_selector() {
     assert!(menu_item(&popup, "Waiting…").unwrap().activate());
 
     let choose = || {
-        until(|| menu_item(&popup, "Choose parent…").is_some());
-        assert!(menu_item(&popup, "Choose parent…").unwrap().activate());
-        let back = menu_item(&popup, "Choose parent…").unwrap();
+        until(|| menu_item(&popup, "Move…").is_some());
+        assert!(menu_item(&popup, "Move…").unwrap().activate());
+        let back = menu_item(&popup, "Move…").unwrap();
         // Start with the native navigation row focused, before the opening frame settles.
         assert!(back.grab_focus());
     };
@@ -1809,7 +1921,7 @@ fn task_actions_choose_parent_without_an_inline_parent_selector() {
     until(focused);
     assert_eq!(picker_row_metrics(&popup), parent_metrics.unwrap());
     search.set_text("draft");
-    assert!(menu_item(&popup, "Choose parent…").unwrap().activate());
+    assert!(menu_item(&popup, "Move…").unwrap().activate());
     until(|| !search.is_mapped());
     choose();
     until(focused);
@@ -1980,7 +2092,14 @@ fn parent_popup_filters_projects_and_excludes_cycles_and_tasks() {
     present(&window.inner().window.clone().upcast());
     window.open_note(space, project);
     until(|| window.inner().work.header.is_visible());
-    let popup = work_popup(&window.inner().work.header, "Change parent");
+    let empty_parent = descendants(&window.inner().work.header)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+        .find(|button| button.label().as_deref() == Some("No parent"))
+        .unwrap();
+    assert!(empty_parent.has_css_class("zib-work-field-control"));
+    assert!(!empty_parent.is_sensitive());
+    let popup = work_popup(&window.inner().work.header, "Move…");
     let widgets = descendants(&popup);
     let search =
         widgets.iter().find_map(|w| w.clone().downcast::<gtk::SearchEntry>().ok()).unwrap();
@@ -1999,12 +2118,7 @@ fn parent_popup_filters_projects_and_excludes_cycles_and_tasks() {
 }
 
 fn undo(widget: &EditorWidget) {
-    let controllers = widget.observe_controllers();
-    let keys = (0..controllers.n_items())
-        .filter_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerKey>().ok())
-        .find(|keys| keys.im_context().is_some())
-        .unwrap();
-    keys.emit_by_name::<bool>(
+    editor_keys(widget).emit_by_name::<bool>(
         "key-pressed",
         &[&gdk::Key::z, &0u32, &gdk::ModifierType::CONTROL_MASK],
     );
@@ -2580,4 +2694,381 @@ fn saved_sidebar_keeps_drafts_saves_copies_and_restores_after_restart() {
     assert_eq!(saved[0].search.name, "Everything");
     assert!(saved[0].search.definition.query.is_empty());
     runtime.block_on(reopened.finish());
+}
+
+fn check_recurrence_calendar_dismissal(dialog: &adw::AlertDialog, ending: &gtk::DropDown) {
+    let calendar = |picker: &gtk::Popover| picker.child().and_downcast::<gtk::Calendar>().unwrap();
+    let start = work_popup(dialog, "Choose start date");
+    let first = calendar(&start);
+    let selected = descendants(&first)
+        .into_iter()
+        .find(|widget| widget.has_css_class("day-number") && widget.has_css_class("today"))
+        .unwrap();
+    click_calendar(&first, &selected);
+    until(|| !start.is_mapped());
+    assert!(dialog.is_visible());
+
+    ending.set_selected(1);
+    let end_input = descendants(dialog)
+        .into_iter()
+        .find(|widget| widget.tooltip_text().as_deref() == Some("Choose end date"))
+        .and_then(|button| button.prev_sibling())
+        .and_downcast::<gtk::Entry>()
+        .unwrap();
+    end_input.set_text("2026-12-02");
+    let end = work_popup(dialog, "Choose end date");
+    let last = calendar(&end);
+    let later = descendants(&last)
+        .into_iter()
+        .find(|widget| {
+            widget.has_css_class("day-number")
+                && !widget.has_css_class("other-month")
+                && widget.downcast_ref::<gtk::Label>().is_some_and(|label| label.text() == "3")
+        })
+        .unwrap();
+    click_calendar(&last, &later);
+    until(|| !end.is_mapped());
+    assert_eq!(end_input.text(), "2026-12-03");
+    assert!(dialog.is_visible());
+}
+
+fn check_recurrence_response_layout(dialog: &adw::AlertDialog) {
+    let widgets = descendants(dialog);
+    let mode = widgets
+        .iter()
+        .filter_map(|widget| widget.downcast_ref::<gtk::DropDown>())
+        .find(|choice| {
+            choice
+                .model()
+                .and_downcast::<gtk::StringList>()
+                .is_some_and(|model| model.string(0).as_deref() == Some("Keep every occurrence"))
+        })
+        .unwrap();
+    let buttons = ["Cancel", "Save", "End recurrence"].map(|label| {
+        widgets
+            .iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+            .find(|button| button.label().as_deref() == Some(label))
+            .unwrap()
+    });
+    let clock = dialog.frame_clock().unwrap();
+    let painted = Rc::new(Cell::new(false));
+    let handler = clock.connect_after_paint({
+        let painted = painted.clone();
+        move |_| painted.set(true)
+    });
+    for choice in 0..3 {
+        painted.set(false);
+        mode.set_selected(choice);
+        dialog.queue_draw();
+        until(|| painted.get());
+        let [cancel, save, end] = buttons.map(|button| button.compute_bounds(dialog).unwrap());
+        assert_eq!(cancel.y(), save.y());
+        assert_eq!(save.y(), end.y());
+        assert!(cancel.x() < save.x() && save.x() < end.x());
+    }
+    clock.disconnect(handler);
+}
+
+fn check_occurrence_comment_focus(window: &Window) {
+    let header = &window.inner().work.header;
+    let check = || {
+        descendants(header)
+            .into_iter()
+            .find(|widget| widget.is_mapped() && widget.is::<gtk::CheckButton>())
+    };
+    until(|| check().is_some());
+    let buttons: Vec<_> =
+        std::iter::successors(check().unwrap().next_sibling(), |child| child.next_sibling())
+            .map(|child| child.downcast::<gtk::Button>().unwrap().label().unwrap())
+            .collect();
+    assert_eq!(buttons, ["Complete with note…", "Skip", "Skip with note…"]);
+    for label in ["Complete with note…", "Skip with note…"] {
+        let find = || {
+            descendants(&window.inner().work.header)
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.is_mapped() && button.label().as_deref() == Some(label))
+        };
+        until(|| find().is_some());
+        find().unwrap().emit_clicked();
+        let host = &window.inner().window;
+        until(|| host.visible_dialog().is_some());
+        let dialog = host.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+        assert_eq!(dialog.heading().as_deref(), label.strip_suffix('…'));
+        let view = descendants(&dialog)
+            .into_iter()
+            .find_map(|child| child.downcast::<gtk::TextView>().ok())
+            .unwrap();
+        until(|| view.is_focus());
+        assert!(view.is_editable());
+        dialog.emit_by_name::<()>("response", &[&"cancel"]);
+        dialog.close();
+        until(|| host.visible_dialog().is_none());
+    }
+}
+
+#[test]
+fn repeating_task_expands_and_opens_occurrence_history() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, project, task, subtask) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let project = state.create_work(space, "project", "Project", None).await.unwrap();
+        let task = state.create_work(space, "task", "# Review", Some(project)).await.unwrap();
+        state.create_work(space, "task", "Later task", Some(project)).await.unwrap();
+        let subtask = state.create_work(space, "task", "Actual subtask", Some(task)).await.unwrap();
+        (space, project, task, subtask)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.RecurrenceTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(&window.inner().window.clone().upcast());
+    let select_result = |id| {
+        window.inner().search.buffer().set_text(&format!("@id={id}"));
+        until(|| window.inner().rows.borrow().as_slice() == [(space, id)]);
+        let results = &window.inner().list;
+        results.emit_by_name::<()>("row-activated", &[&results.row_at_index(0).unwrap()]);
+    };
+    select_result(task);
+    until(|| task_row(&window, "Review").is_some());
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, project);
+    let link = |label: &str| {
+        let row = task_row(&window, "Review").unwrap();
+        descendants(&row)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().is_some_and(|text| text.starts_with(label)))
+            .unwrap()
+    };
+    link("Open task").emit_clicked();
+    let widget = &window.inner().widget;
+    until(|| widget.text().as_deref() == Some("# Review") && widget.is_focus());
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, task);
+    editor_keys(widget).emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::End, &0u32, &gdk::ModifierType::CONTROL_MASK],
+    );
+    input(widget).emit_by_name::<()>("commit", &[&"\n\n- [x] Check the logs"]);
+    let template = "# Review\n\n- [x] Check the logs";
+    assert_eq!(runtime.block_on(state.note(space, task)).unwrap().body, template);
+    let parent = || {
+        descendants(&window.inner().work.header)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().as_deref() == Some("Open parent · Project"))
+    };
+    until(|| parent().is_some());
+    assert!(window.inner().project_pane.scroll.is_visible());
+    assert!(
+        descendants(&window.inner().work.header)
+            .iter()
+            .any(|widget| { widget.downcast_ref::<gtk::CheckButton>().is_some() })
+    );
+    let add = descendants(&window.inner().work.header)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+        .find(|button| button.label().as_deref() == Some("Add recurrence…"))
+        .unwrap();
+    add.emit_clicked();
+    until(|| window.inner().window.visible_dialog().is_some());
+    let dialog =
+        window.inner().window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+    assert_eq!(dialog.heading().as_deref(), Some("Add recurrence"));
+    let ending = descendants(&dialog)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::DropDown>().ok())
+        .find(|choice| {
+            choice
+                .model()
+                .and_downcast::<gtk::StringList>()
+                .is_some_and(|model| model.string(0).as_deref() == Some("Never"))
+        })
+        .unwrap();
+    check_recurrence_calendar_dismissal(&dialog, &ending);
+    ending.set_selected(2);
+    let set_number = |label, value| {
+        let spin = descendants(&dialog)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::SpinButton>().ok())
+            .find(|spin| spin.tooltip_text().as_deref() == Some(label))
+            .unwrap();
+        spin.set_value(value);
+    };
+    set_number("Repeat interval", 2.0);
+    set_number("Number of occurrences", 3.0);
+    for name in ["Mon", "Wed"] {
+        let find_day = || {
+            descendants(&dialog)
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::ToggleButton>().ok())
+                .find(|day| day.is_mapped() && day.label().as_deref() == Some(name))
+        };
+        until(|| find_day().is_some());
+        find_day().unwrap().set_active(true);
+    }
+    dialog.emit_by_name::<()>("response", &[&"save"]);
+    dialog.close();
+    until(|| window.inner().work.tree.borrow().series.contains(&task));
+    let tree = runtime.block_on(state.work_tree(space)).unwrap();
+    let current = tree.current_occurrences[&task];
+    assert_eq!(tree.children(task), [subtask]);
+    let rule = runtime.block_on(state.recurrence_rule(space, task)).unwrap().unwrap();
+    assert_eq!(rule.pattern, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=3;WKST=SU");
+    parent().unwrap().emit_clicked();
+    until(|| task_row(&window, "Review").is_some());
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, project);
+
+    let add_task = || {
+        descendants(&window.inner().work.widget)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Entry>().ok())
+            .find(|entry| {
+                gtk::prelude::WidgetExt::is_visible(entry)
+                    && entry.placeholder_text().as_deref() == Some("New task")
+            })
+    };
+    let toggle_series = || {
+        // The series is the only expandable row. Its occurrence can have the same title.
+        let toggle = descendants(&window.inner().work.widget)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.has_css_class("zib-task-expander") && button.is_sensitive())
+            .unwrap();
+        toggle.emit_clicked();
+    };
+    let assert_no_occurrence_rows = || {
+        let titles: Vec<_> = descendants(&window.inner().work.widget)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Entry>().ok())
+            .filter(|entry| entry.has_css_class("zib-work-title-entry") && entry.text() == "Review")
+            .collect();
+        assert_eq!(titles.len(), 1);
+    };
+    add_task().unwrap().set_text("Draft task");
+    toggle_series();
+    until(|| task_row(&window, "Actual subtask").is_some());
+    assert_no_occurrence_rows();
+    assert!(task_row(&window, "Later task").is_some_and(|row| row.is_visible()));
+    assert_eq!(add_task().unwrap().text(), "Draft task");
+    toggle_series();
+    until(|| task_row(&window, "Actual subtask").is_none());
+    assert_no_occurrence_rows();
+    assert_eq!(add_task().unwrap().text(), "Draft task");
+
+    let row = task_row(&window, "Review").unwrap();
+    assert!(
+        descendants(&row)
+            .iter()
+            .any(|widget| { widget.tooltip_text().as_deref() == Some("Recurring task") })
+    );
+    assert!(descendants(&row).iter().all(|widget| {
+        widget.tooltip_text().is_none_or(|text| {
+            text != "Occurrence history" && !text.starts_with("Open current occurrence")
+        })
+    }));
+    until(|| {
+        let inner = window.inner();
+        inner.rows.borrow().as_slice() == [(space, task)]
+            && inner.list.row_at_index(0).is_some_and(|row| {
+                descendants(&row)
+                    .iter()
+                    .any(|widget| widget.tooltip_text().as_deref() == Some("Recurring task"))
+            })
+    });
+    select_result(task);
+    until(|| widget.text().as_deref() == Some(template));
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, task);
+    until(|| parent().is_some());
+    assert!(window.inner().project_pane.scroll.is_visible());
+    assert!(
+        descendants(&window.inner().work.header)
+            .iter()
+            .all(|widget| { widget.downcast_ref::<gtk::CheckButton>().is_none() })
+    );
+    let summary = descendants(&window.inner().work.header)
+        .into_iter()
+        .find_map(|child| {
+            child
+                .downcast::<gtk::Label>()
+                .ok()
+                .filter(|label| label.text() == "Every 2 weeks on Mon, Wed for 3 occurrences")
+        })
+        .unwrap();
+    assert!(!summary.has_css_class("caption"));
+    assert!(descendants(&window.inner().work.header).iter().all(|widget| {
+        widget.tooltip_text().is_none_or(|text| !text.starts_with("Open current occurrence"))
+    }));
+    let sidebar = &window.inner().work.widget;
+    let heading = sidebar.first_child().unwrap().downcast::<gtk::Label>().unwrap();
+    assert_eq!(heading.text(), "Occurrence history");
+    until(|| summary.height() > 0 && heading.height() > 0);
+    let content = &window.inner().project_pane.content;
+    let bottom = summary.compute_bounds(content).unwrap();
+    let top = heading.compute_bounds(content).unwrap().y();
+    let gap = top - bottom.y() - bottom.height();
+    assert!((0.0..40.0).contains(&gap), "recurrence summary to history gap: {gap}");
+    summary.parent().and_downcast::<gtk::Button>().unwrap().emit_clicked();
+    let host = &window.inner().window;
+    until(|| host.visible_dialog().is_some());
+    let dialog = host.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+    assert!(!dialog.has_response("apply-template"));
+    check_recurrence_response_layout(&dialog);
+    dialog.emit_by_name::<()>("response", &[&"cancel"]);
+    dialog.close();
+    until(|| host.visible_dialog().is_none());
+    let list = heading.next_sibling().unwrap().downcast::<gtk::ListBox>().unwrap();
+    let date = tree.occurrences[&current].day.to_string();
+    let current_row = descendants(&list)
+        .into_iter()
+        .filter_map(|child| child.downcast::<adw::ActionRow>().ok())
+        .find(|row| row.title().starts_with(&date))
+        .unwrap();
+    adw::prelude::ActionRowExt::activate(&current_row);
+    until(|| window.inner().editor.borrow().as_ref().is_some_and(|editor| editor.note == current));
+    let body = runtime.block_on(state.note(space, current)).unwrap().body;
+    assert_eq!(body, "# Review\n\n- [ ] Check the logs");
+    check_occurrence_comment_focus(&window);
+    let status = descendants(&window.inner().work.header)
+        .into_iter()
+        .filter_map(|child| child.downcast::<gtk::MenuButton>().ok())
+        .find(|button| button.tooltip_text().as_deref() == Some("Work status · No status"))
+        .unwrap();
+    assert!(status.is_mapped() && status.has_css_class("zib-work-field-control"));
+    assert!(!status.is_sensitive());
+    assert_eq!(status.child().and_downcast::<gtk::Label>().unwrap().text(), "No status");
+    let entry = reveal_work_addition(&window, "Add a subtask", "New subtask");
+    assert!(runtime.block_on(state.work_tree(space)).unwrap().children(current).is_empty());
+    entry.set_text("Occurrence subtask");
+    entry.emit_activate();
+    until(|| task_row(&window, "Occurrence subtask").is_some());
+    let occurrence_subtask = window.inner().work.tree.borrow().children(current)[0];
+    let series = descendants(&window.inner().work.header)
+        .into_iter()
+        .filter_map(|child| child.downcast::<gtk::Button>().ok())
+        .find(|button| button.tooltip_text().as_deref() == Some("Open parent · Review"))
+        .unwrap();
+    series.emit_clicked();
+    until(|| task_row(&window, "Actual subtask").is_some());
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, task);
+    assert!(task_row(&window, "Occurrence subtask").is_none());
+    select_result(current);
+    until(|| task_row(&window, "Occurrence subtask").is_some());
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, current);
+    select_result(task);
+    until(|| {
+        window.inner().editor.borrow().as_ref().is_some_and(|editor| editor.note == task)
+            && task_row(&window, "Actual subtask").is_some()
+    });
+    select_result(occurrence_subtask);
+    until(|| task_row(&window, "Occurrence subtask").is_some());
+    assert_eq!(window.inner().editor.borrow().as_ref().unwrap().note, current);
+    window.inner().window.close();
 }

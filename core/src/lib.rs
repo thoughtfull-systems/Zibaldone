@@ -23,6 +23,7 @@ pub mod pairing;
 pub mod pipe_tables;
 #[cfg(feature = "print")]
 pub mod print;
+pub mod recurrence;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod schema;

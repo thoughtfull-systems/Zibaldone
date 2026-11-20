@@ -218,22 +218,7 @@ impl Index {
                     {
                         continue;
                     }
-                    let value = if let Some(item) = tree.items.get(&id) {
-                        match name.as_str() {
-                            "due-on" | "scheduled-on" => {
-                                tree.date(id, name).map(|d| Value::Date(d.value))
-                            }
-                            "parent-id" => item.parent.map(Value::Link),
-                            "status" => tree.status(id).map(|status| Value::Choice(status.value)),
-                            "waiting-for" => tree
-                                .status(id)
-                                .and_then(|status| status.waiting_for)
-                                .map(Value::Text),
-                            _ => note.fields.get(name).and_then(|v| Value::from_loro(def, v)),
-                        }
-                    } else {
-                        note.fields.get(name).and_then(|v| Value::from_loro(def, v))
-                    };
+                    let value = search_value(tree, &note, name, def);
                     let Some(value) = value else {
                         continue;
                     };
@@ -344,6 +329,36 @@ impl Index {
             .db
             .query_row("SELECT title FROM notes WHERE id = ?1", [id.to_string()], |row| row.get(0))
             .optional()?)
+    }
+}
+
+fn search_value(
+    tree: &crate::work::Tree,
+    note: &crate::space::Note,
+    name: &str,
+    def: &schema::FieldDef,
+) -> Option<Value> {
+    let id = note.id;
+    if let Some(item) = tree.items.get(&id) {
+        match name {
+            "due-on" | "scheduled-on" => tree.date(id, name).map(|d| Value::Date(d.value)),
+            "parent-id" if note.is_task_occurrence() => None,
+            "parent-id" => item.parent.map(Value::Link),
+            "completed-on" | "skipped-on" | "superseded-on" => {
+                item.explicit_date(name).map(Value::Date)
+            }
+            "recurrence-on" => {
+                tree.occurrences.get(&id).map(|occurrence| Value::Date(occurrence.day.to_string()))
+            }
+            "series-id" => {
+                tree.occurrences.get(&id).map(|occurrence| Value::Link(occurrence.series))
+            }
+            "status" => tree.status(id).map(|status| Value::Choice(status.value)),
+            "waiting-for" => tree.status(id).and_then(|status| status.waiting_for).map(Value::Text),
+            _ => note.fields.get(name).and_then(|v| Value::from_loro(def, v)),
+        }
+    } else {
+        note.fields.get(name).and_then(|v| Value::from_loro(def, v))
     }
 }
 

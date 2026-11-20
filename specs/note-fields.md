@@ -66,6 +66,15 @@ completion. The [work specification][work] defines precedence and work-view filt
 The `status` choice also accepts explicit `none`, which stops inheritance. An absent field resumes
 inheritance. Search treats None as no effective status, so `@status!?` includes these items.
 
+## Recurring task fields
+
+A task occurrence stores `series-id` as a link and `rule-id` and `occurrence-slot` as text. It also
+stores `original-on` as a date and can store `realized-on` as a date. An open occurrence of a
+replaced or ended rule stores `superseded-on`. Search indexes `recurrence-on` and the dates from the
+winning outcome action on occurrences. Series tasks store `recurrence` as a boolean flag. The
+[recurring tasks specification][recurrence] defines these values.
+
 [decision]: ../decisions/ZIB0026-name-date-and-timestamp-fields.md
+[recurrence]: recurring-tasks.md
 [types]: built-in-types.md
 [work]: projects-and-tasks.md

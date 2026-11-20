@@ -442,6 +442,68 @@ irrelevant actions.
 Waiting focuses its text box after the submenu opens, including when editing an existing value or
 returning to the picker. Keep its current text and suggestion behavior.
 
+## Recurring tasks
+
+The [recurring tasks specification](recurring-tasks.md) extends the work view with occurrence notes.
+An occurrence shares its series' project context and work status. Its body and outcome belong to
+that occurrence. Ordinary subtasks retain their existing hierarchy and date inheritance.
+
+## Editing task bodies
+
+Choose **Edit task body** in a task row to open the full note editor for that task. This works
+before and after setting up recurrence. Edit the series body before setting up recurrence to include
+that text in its first occurrence. Use the parent link or Back to return to the project. Selecting a
+task in search results continues to reveal its row in the project.
+
+## Task details sidebar
+
+An open task shows its body beside the same independently scrolling sidebar as a project. Share the
+machine's sidebar width across both views. Show status, scheduled and due dates, and the parent
+picker in the sidebar header. List subtasks with the same controls and completed filtering as
+project tasks. The header has a completion checkbox for an ordinary task. For a recurring task,
+complete the occurrence from its own note.
+
+## Shared work editor controls
+
+**New project** and **New standalone task** create and open blank notes with focus in the body
+editor. Work editors show Status, Scheduled date, Due date, and Parent as rows with a label and a
+control. An occurrence displays its inherited status and links to its series in the Parent row. Use
+**Move…** to open the parent picker. In the task row menu, **Repeat…** follows the date actions. Use
+the **Open task** or **Open subproject** arrow in a row to open its note.
+
+Replace an empty Subprojects, Tasks, or Subtasks section with an add button for its item type. The
+button creates a blank note and focuses its title in the new row. Once the section has an item, show
+the title entry for adding more items below the list. Align both ends of that entry with the
+corresponding title column. Omit Occurrence history when it has no entries.
+
+## Work editor field layout
+
+Place the overflow menu at the upper right of the sidebar. Use bold, right-aligned field labels and
+normal-size labels and controls. Align the values at the start of the second column. Put the
+completion checkbox first when the note has one. The parent link ends with a right-pointing arrow.
+
+A task offers **Add recurrence…** in its menu and in the Recurrence field. When a rule is active,
+the field summarizes its cadence and bounds. Select the summary to edit the rule.
+
+## Work editor buttons
+
+The editor offers actions through its fields and buttons. List rows keep their actions menus. Use
+the same bold text, padding, and hover style for the editor's field buttons and its add buttons.
+Keep the recurrence summary on one line and open occurrences from the history directly below. Open
+the recurrence editor to apply a template to future occurrences. Occurrence editors offer skip,
+reopen, and note actions as buttons where applicable.
+
+## First additions and recurring search results
+
+In an empty section, the add button reveals the section and focuses its title entry. Press Enter
+with a title to create the first item. Keep the entry available for further additions.
+
+Mark search results for tasks with an active recurrence. Selecting one opens the task's series
+editor.
+
+An occurrence's status button shows its inherited value. Use the recurring task's status picker to
+change the series status.
+
 [decision]: ../decisions/ZIB0025-projects-and-tasks.md
 [document]: space-document.md
 [saved]: saved-searches.md

@@ -16,6 +16,7 @@ use super::{Hit, ID_FIELD, Index, MATCH_END, MATCH_START, TYPE_FIELD, fts_query}
 pub enum Sort {
     Due,
     Modified,
+    Recurrence,
     #[default]
     Relevance,
     Title,
@@ -26,6 +27,7 @@ impl Sort {
         match self {
             Self::Due => "due",
             Self::Modified => "modified",
+            Self::Recurrence => "recurrence",
             Self::Relevance => "relevance",
             Self::Title => "title",
         }
@@ -35,6 +37,7 @@ impl Sort {
         match name {
             "due" => Some(Self::Due),
             "modified" => Some(Self::Modified),
+            "recurrence" => Some(Self::Recurrence),
             "relevance" => Some(Self::Relevance),
             "title" => Some(Self::Title),
             _ => None,
@@ -46,6 +49,7 @@ impl Sort {
             Self::Due => "(due IS NULL), due, n.title COLLATE NOCASE, n.id",
             Self::Relevance => "score, n.updated DESC, n.id",
             Self::Modified => "n.updated DESC, n.id",
+            Self::Recurrence => "(recurrence IS NULL), recurrence DESC, n.id",
             Self::Title => "n.title COLLATE NOCASE, n.id",
         }
     }
@@ -60,6 +64,7 @@ struct RankedHit {
     hit: Hit,
     due: Option<String>,
     modified: i64,
+    recurrence: Option<String>,
     score: f64,
 }
 
@@ -75,6 +80,7 @@ impl RankedHit {
                 .then_with(|| self.due.cmp(&other.due))
                 .then_with(|| Sort::compare_titles(&self.hit.title, &other.hit.title)),
             Sort::Modified => modified(),
+            Sort::Recurrence => other.recurrence.cmp(&self.recurrence),
             Sort::Title => Sort::compare_titles(&self.hit.title, &other.hit.title),
         }
         .then_with(|| self.hit.id.cmp(&other.hit.id))
@@ -296,7 +302,8 @@ impl Statement {
             sql,
             "SELECT n.id, n.title, n.updated, {score} AS score, \
             (SELECT text FROM filters WHERE note = n.id AND field = 'due-on' LIMIT 1) AS due, \
-            n.type{excerpts} FROM notes n"
+            (SELECT text FROM filters WHERE note = n.id AND field = 'recurrence-on' LIMIT 1)
+                AS recurrence, n.type{excerpts} FROM notes n"
         )
         .unwrap();
         for (n, m) in self.matches.iter().enumerate() {
@@ -313,7 +320,7 @@ impl Statement {
         let count = self.matches.iter().filter(|m| m.scored).count();
         let rows = statement.query_map(params_from_iter(&self.args), |row| {
             let highlighted = (0..count)
-                .map(|index| row.get::<_, Option<String>>(index + 6))
+                .map(|index| row.get::<_, Option<String>>(index + 7))
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok((
                 row.get::<_, String>(0)?,
@@ -322,18 +329,20 @@ impl Statement {
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
                 highlighted,
             ))
         })?;
         let mut hits = Vec::new();
         for row in rows {
-            let (id, title, modified, score, due, type_name, highlighted) = row?;
+            let (id, title, modified, score, due, recurrence, type_name, highlighted) = row?;
             let snippets = super::snippets::collect(highlighted.into_iter().flatten());
             let snippet = snippets.first().cloned().unwrap_or_default();
             hits.push(RankedHit {
                 hit: Hit { id: Id::parse(&id)?, title, type_name, snippets, snippet },
                 due,
                 modified,
+                recurrence,
                 score,
             });
         }

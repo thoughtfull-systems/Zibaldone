@@ -256,4 +256,13 @@ defaults to false. Store the setting on the project or root task whose hierarchy
 Each note has its own value, independent of its ancestors. It syncs and moves with the note. Writing
 the setting doesn't change the note body, fields, or metadata.
 
+## Recurring tasks
+
+The optional `recurrence-revisions` map on a task and the optional `recurrence-actions` map on an
+occurrence note follow the [recurring tasks specification](recurring-tasks.md). Both use mergeable
+child maps.
+
+The optional mergeable `recurrence-body-seeds` map on an occurrence records digests of its starting
+body. See the [recurring tasks specification](recurring-tasks.md#identity-and-body).
+
 [blake3]: https://github.com/BLAKE3-team/BLAKE3

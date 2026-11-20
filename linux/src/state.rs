@@ -297,7 +297,10 @@ impl State {
     async fn open_spaces(&self) -> Result<()> {
         let mut store = self.store.lock().await;
         for id in store.config.spaces.keys().copied().collect::<Vec<_>>() {
-            let space = store.load_space(id)?;
+            let mut space = store.load_space(id)?;
+            if space.realize_recurrences(zib_core::recurrence::today())? {
+                store.save_space(&space)?;
+            }
             store.record_peer(&space)?;
             self.index(id, &space)?;
             self.node.spaces().lock().await.insert(id, Arc::new(Mutex::new(space)));
@@ -491,6 +494,25 @@ impl State {
                 let value = Value::from_loro(&def, note.fields.get(&name)?)?;
                 Some((name, value))
             }));
+        }
+        if note.is_task_occurrence() {
+            let tree = zib_core::work::Tree::read(&space);
+            if let Some(occurrence) = tree.occurrences.get(&id) {
+                fields.retain(|(name, _)| {
+                    !matches!(
+                        name.as_str(),
+                        "completed-on" | "due-on" | "scheduled-on" | "skipped-on" | "superseded-on"
+                    )
+                });
+                fields.push(("recurrence-on".into(), Value::Date(occurrence.day.to_string())));
+                for field in
+                    ["completed-on", "due-on", "scheduled-on", "skipped-on", "superseded-on"]
+                {
+                    if let Some(date) = tree.date(id, field) {
+                        fields.push((field.into(), Value::Date(date.value)));
+                    }
+                }
+            }
         }
         fields.sort_by(|a, b| a.0.cmp(&b.0));
         Ok((note, fields))
@@ -1296,6 +1318,7 @@ impl State {
     /// Saves, indexes, and shows changes that arrived from another member.
     async fn arrived(&self, id: Id) {
         self.mark_dirty(id);
+        let _ = self.catch_up_recurrences(id).await;
         if let Ok(space) = self.space(id).await {
             let _ = self.index(id, &*space.lock().await);
         }
@@ -1306,6 +1329,7 @@ impl State {
     /// editor shows by itself.
     pub async fn live_changed(&self, id: Id) {
         self.mark_dirty(id);
+        let _ = self.catch_up_recurrences(id).await;
         if let Ok(space) = self.space(id).await {
             let _ = self.index(id, &*space.lock().await);
         }
@@ -1336,6 +1360,7 @@ impl State {
         loop {
             let spaces: Vec<Id> = self.node.spaces().lock().await.keys().copied().collect();
             for id in spaces {
+                let _ = self.catch_up_recurrences(id).await;
                 let _ = self.derive(id).await;
                 let _ = self.collect_garbage(id).await;
             }
