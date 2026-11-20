@@ -47,6 +47,11 @@ pub struct Pattern {
 }
 
 impl Rule {
+    /// Offset-only edits keep the schedule and its existing occurrence identities.
+    pub fn same_schedule(&self, other: &Self) -> bool {
+        self.mode == other.mode && self.start == other.start && self.pattern == other.pattern
+    }
+
     /// Validates a date-only rule and returns its first matching occurrence.
     pub fn first(&self) -> Result<NaiveDate> {
         let pattern = self.compile()?;

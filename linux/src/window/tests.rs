@@ -2770,6 +2770,26 @@ fn check_recurrence_response_layout(dialog: &adw::AlertDialog) {
     clock.disconnect(handler);
 }
 
+fn check_recurrence_end_preview(window: &Window, dialog: &adw::AlertDialog, date: &str) {
+    let host = &window.inner().window;
+    let visible_heading = |heading: &str| {
+        host.visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .is_some_and(|dialog| dialog.heading().as_deref() == Some(heading))
+    };
+    dialog.emit_by_name::<()>("response", &[&"end"]);
+    dialog.close();
+    until(|| visible_heading("End recurrence?"));
+    let preview = host.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+    assert!(preview.body().contains("One open occurrence"));
+    assert!(descendants(&preview).iter().any(|child| {
+        child.downcast_ref::<gtk::Label>().is_some_and(|label| label.text() == date)
+    }));
+    preview.emit_by_name::<()>("response", &[&"back"]);
+    preview.close();
+    until(|| visible_heading("Edit recurrence"));
+}
+
 fn check_occurrence_comment_focus(window: &Window) {
     let header = &window.inner().work.header;
     let check = || {
@@ -3021,11 +3041,14 @@ fn repeating_task_expands_and_opens_occurrence_history() {
     let dialog = host.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
     assert!(!dialog.has_response("apply-template"));
     check_recurrence_response_layout(&dialog);
+    let date = tree.occurrences[&current].day.to_string();
+    check_recurrence_end_preview(&window, &dialog, &date);
+    assert_eq!(runtime.block_on(state.recurrence_rule(space, task)).unwrap(), Some(rule));
+    let dialog = host.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
     dialog.emit_by_name::<()>("response", &[&"cancel"]);
     dialog.close();
     until(|| host.visible_dialog().is_none());
     let list = heading.next_sibling().unwrap().downcast::<gtk::ListBox>().unwrap();
-    let date = tree.occurrences[&current].day.to_string();
     let current_row = descendants(&list)
         .into_iter()
         .filter_map(|child| child.downcast::<adw::ActionRow>().ok())

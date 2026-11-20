@@ -6,7 +6,9 @@ use adw::prelude::*;
 use chrono::{Datelike, NaiveDate};
 use gtk::{gio, glib};
 use zib_core::Id;
-use zib_core::recurrence::{self, Frequency, Mode, Occurrence, Outcome, Pattern, Rule};
+use zib_core::recurrence::{
+    self, Frequency, Mode, Occurrence, Outcome, Pattern, Replacement, Rule,
+};
 use zib_core::work::{Item, Tree};
 
 use super::{Window, core, flow};
@@ -136,20 +138,44 @@ impl Window {
             dialog.set_close_response("cancel");
             dialog.set_extra_child(Some(&form.rows));
             form.watch(&dialog);
-            let response = dialog.choose_future(Some(&w.inner().window)).await;
-            let rule = match response.as_str() {
-                "end" => None,
-                "save" => match form.read() {
-                    Ok(rule) => Some(rule),
+            let (rule, replacement) = loop {
+                let response = dialog.clone().choose_future(Some(&w.inner().window)).await;
+                let rule = match response.as_str() {
+                    "end" => None,
+                    "save" => match form.read() {
+                        Ok(rule) => Some(rule),
+                        Err(error) => {
+                            w.toast(&error.to_string());
+                            return;
+                        }
+                    },
+                    _ => return,
+                };
+                let preview = core({
+                    let (state, rule) = (state.clone(), rule.clone());
+                    async move { state.recurrence_replacement(space, note, rule).await }
+                })
+                .await;
+                let replacement = match preview {
+                    Ok(preview) => preview,
                     Err(error) => {
-                        w.toast(&error.to_string());
+                        w.toast(&format!("Couldn't preview the change: {error}"));
                         return;
                     }
-                },
-                _ => return,
+                };
+                if let Some(preview) = &replacement
+                    && confirm_replacement(preview, rule.is_none())
+                        .choose_future(Some(&w.inner().window))
+                        .await
+                        != "confirm"
+                {
+                    continue;
+                }
+                break (rule, replacement);
             };
             if let Err(error) =
-                core(async move { state.set_recurrence(space, note, rule).await }).await
+                core(async move { state.set_recurrence(space, note, rule, replacement).await })
+                    .await
             {
                 w.toast(&format!("Couldn't save repetition: {error}"));
             } else {
@@ -282,6 +308,49 @@ impl Window {
         history.append(&list);
         history.append(&earlier);
     }
+}
+
+fn confirm_replacement(preview: &Replacement, ending: bool) -> adw::AlertDialog {
+    let heading = if ending { "End recurrence?" } else { "Replace recurrence?" };
+    let body = match preview.occurrences.len() {
+        0 => "There are no open occurrences to supersede.".to_owned(),
+        1 => "One open occurrence will be superseded and kept in history.".to_owned(),
+        count => format!("{count} open occurrences will be superseded and kept in history."),
+    };
+    let dialog = adw::AlertDialog::new(Some(heading), Some(&body));
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    if !preview.occurrences.is_empty() {
+        let dates: Vec<_> = preview.occurrences.iter().map(|(day, _)| day.to_string()).collect();
+        let label = gtk::Label::builder()
+            .label(dates.join(", "))
+            .max_width_chars(40)
+            .wrap(true)
+            .xalign(0.0)
+            .build();
+        content.append(
+            &gtk::ScrolledWindow::builder()
+                .child(&label)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .max_content_height(150)
+                .propagate_natural_height(true)
+                .build(),
+        );
+    }
+    if let Some(remaining) = preview.remaining {
+        let suggestion = format!("The previous rule suggests a count of {remaining}.");
+        content.append(&gtk::Label::builder().label(suggestion).wrap(true).xalign(0.0).build());
+    }
+    if content.first_child().is_some() {
+        dialog.set_extra_child(Some(&content));
+    }
+    dialog.add_responses(&[
+        ("back", "Back"),
+        ("confirm", if ending { "End recurrence" } else { "Replace recurrence" }),
+    ]);
+    dialog.set_close_response("back");
+    dialog.set_default_response(Some("back"));
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+    dialog
 }
 
 fn recurrence_summary(rule: &Rule) -> String {

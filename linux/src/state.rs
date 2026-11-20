@@ -682,11 +682,11 @@ impl State {
         Ok(deleted)
     }
 
-    /// Searches the selected space or every space, best matches first within each space.
-    pub(crate) fn search_in(&self, query: &str, limit: usize, scope: Option<Id>) -> Vec<(Id, Hit)> {
+    /// Searches full text for the link picker.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<(Id, Hit)> {
         let indexes = self.indexes.lock().expect("unpoisoned");
         let mut hits = Vec::new();
-        for (space, index) in indexes.iter().filter(|(id, _)| scope.is_none_or(|s| s == **id)) {
+        for (space, index) in indexes.iter() {
             if let Ok(found) = index.search(query, limit) {
                 hits.extend(found.into_iter().map(|hit| (*space, hit)));
             }
@@ -695,8 +695,24 @@ impl State {
         hits
     }
 
-    pub fn search(&self, query: &str, limit: usize) -> Vec<(Id, Hit)> {
-        self.search_in(query, limit, None)
+    /// Searches the requested space or every space for the command-line client.
+    pub(crate) fn search_in(
+        &self,
+        scope: Option<Id>,
+        query: &str,
+        sort: Sort,
+        limit: usize,
+    ) -> Result<Vec<(Id, Hit)>> {
+        let indexes = self.indexes.lock().expect("unpoisoned");
+        search_indexes(
+            indexes
+                .iter()
+                .filter(|(id, _)| scope.is_none_or(|space| space == **id))
+                .map(|(id, index)| (*id, index)),
+            query,
+            sort,
+            limit,
+        )
     }
 
     pub(crate) fn search_fields(&self, spaces: &[Id]) -> Vec<String> {

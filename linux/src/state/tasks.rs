@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use zib_core::recurrence::{self, Replacement, Rule};
 use zib_core::schema::Value;
 use zib_core::search::Sort;
 use zib_core::search::saved::Definition;
@@ -184,24 +185,39 @@ impl State {
 }
 
 impl State {
-    pub(crate) async fn recurrence_rule(
+    pub(crate) async fn recurrence_rule(&self, space: Id, note: Id) -> Result<Option<Rule>> {
+        Ok(self.space(space).await?.lock().await.recurrence_rule(note))
+    }
+
+    pub(crate) async fn recurrence_replacement(
         &self,
         space: Id,
         note: Id,
-    ) -> Result<Option<zib_core::recurrence::Rule>> {
-        Ok(self.space(space).await?.lock().await.recurrence_rule(note))
+        rule: Option<Rule>,
+    ) -> Result<Option<Replacement>> {
+        let space = self.space(space).await?;
+        let space = space.lock().await;
+        Ok(space.recurrence_replacement(note, rule.as_ref(), recurrence::today()))
     }
 
     pub(crate) async fn set_recurrence(
         &self,
         space_id: Id,
         note: Id,
-        rule: Option<zib_core::recurrence::Rule>,
+        rule: Option<Rule>,
+        replacement: Option<Replacement>,
     ) -> Result<()> {
         let store = self.store.lock().await;
         let space = self.space(space_id).await?;
         let mut space = space.lock().await;
-        space.set_recurrence(note, rule, zib_core::recurrence::today())?;
+        let today = recurrence::today();
+        if space.recurrence_replacement(note, rule.as_ref(), today) != replacement {
+            return Err(zib_core::Error::Space(
+                "The series changed during review. Open the recurrence editor and try again."
+                    .into(),
+            ));
+        }
+        space.set_recurrence(note, rule, today)?;
         self.save_recurrences(&store, space_id, &space)
     }
 

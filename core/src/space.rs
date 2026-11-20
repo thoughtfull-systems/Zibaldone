@@ -540,16 +540,31 @@ impl Space {
         }
         let now = time::now();
         for (id, title) in &deleted {
-            let tombstone =
-                self.doc.get_map(TOMBSTONES).insert_container(&id.to_string(), LoroMap::new())?;
-            tombstone.insert("title", title.as_str())?;
-            tombstone.insert("deleted-at", now)?;
-            tombstone.insert("deleted-by", self.machine.to_string())?;
-            self.notes().delete(&id.to_string())?;
-            self.open.remove(id);
+            self.tombstone_note(*id, title, now, Some(self.machine))?;
         }
         commit(&self.doc);
         Ok(deleted.into_iter().map(|(id, _)| id).collect())
+    }
+
+    pub(crate) fn tombstone_note(
+        &mut self,
+        id: Id,
+        title: &str,
+        deleted_at: Timestamp,
+        deleted_by: Option<Id>,
+    ) -> Result<()> {
+        if self.tombstone(id).is_none() {
+            let tombstone =
+                self.doc.get_map(TOMBSTONES).insert_container(&id.to_string(), LoroMap::new())?;
+            tombstone.insert("title", title)?;
+            tombstone.insert("deleted-at", deleted_at)?;
+            if let Some(deleted_by) = deleted_by {
+                tombstone.insert("deleted-by", deleted_by.to_string())?;
+            }
+        }
+        self.notes().delete(&id.to_string())?;
+        self.open.remove(&id);
+        Ok(())
     }
 
     /// The tombstone of a note deleted for good.

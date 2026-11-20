@@ -8,7 +8,7 @@ use pulldown_cmark::{Event, Parser};
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{self, Value, child_map};
-use crate::space::{Note, NoteMeta, commit, insert_note, note_body, note_map};
+use crate::space::{Note, NoteMeta, Tombstone, commit, insert_note, note_body, note_map};
 use crate::{Error, Id, Result, Space, body, work};
 
 mod checklist;
@@ -160,6 +160,14 @@ pub struct Occurrence {
     pub scheduled: Option<String>,
     pub due: Option<String>,
     pub closed: Option<String>,
+}
+
+/// The existing work affected by replacing or ending the active rule.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Replacement {
+    pub occurrences: Vec<(NaiveDate, Id)>,
+    pub remaining: Option<u32>,
+    revision: Id,
 }
 
 struct Series {
@@ -513,6 +521,44 @@ impl Space {
         series.revisions.get(&series.head()?)?.rule.clone()
     }
 
+    /// Previews a rule change without realizing or modifying any notes.
+    pub fn recurrence_replacement(
+        &self,
+        id: Id,
+        rule: Option<&Rule>,
+        today: NaiveDate,
+    ) -> Option<Replacement> {
+        let series = Series::read(self, id);
+        let revision = series.head()?;
+        let old = series.revisions[&revision].rule.as_ref()?;
+        if rule.is_some_and(|rule| old.same_schedule(rule)) {
+            return None;
+        }
+        let tree = work::Tree::read_on(self, today);
+        let mut occurrences: Vec<_> = tree
+            .occurrences
+            .iter()
+            .filter(|(_, row)| {
+                row.series == id && row.outcome == Outcome::Open && row.superseded_on.is_none()
+            })
+            .map(|(&id, row)| (row.day, id))
+            .collect();
+        occurrences.sort_unstable();
+        let remaining = rule.and_then(|rule| {
+            rule.compile().ok()?.count?;
+            let pattern = old.compile().ok()?;
+            let total = pattern.count?;
+            let used = if old.mode == Mode::Interval {
+                series.slots(self, today).into_iter().filter(|slot| slot.day < rule.start).count()
+            } else {
+                pattern.dates(old.start).take_while(|day| *day < rule.start).count()
+            };
+            let remaining = total.saturating_sub(u32::try_from(used).ok()?);
+            (remaining > 0).then_some(remaining)
+        });
+        Some(Replacement { occurrences, remaining, revision })
+    }
+
     pub fn set_recurrence(&mut self, id: Id, rule: Option<Rule>, today: NaiveDate) -> Result<()> {
         let note = self.note(id)?;
         if note.type_name != schema::TASK || note.is_task_occurrence() {
@@ -523,9 +569,7 @@ impl Space {
             rule.first()?;
             if let Some((id, old)) =
                 series.head().and_then(|head| Some((head, series.revisions[&head].rule.as_ref()?)))
-                && old.mode == rule.mode
-                && old.start == rule.start
-                && old.pattern == rule.pattern
+                && old.same_schedule(rule)
             {
                 let offsets = [rule.scheduled, rule.due];
                 if offsets != [old.scheduled, old.due] {
@@ -577,6 +621,7 @@ impl Space {
         let mut changed = schema::upgrade_draft_work_schema(self.doc())?;
         let mut series_by_id = BTreeMap::new();
         let mut occurrences = Vec::new();
+        let mut orphaned = Vec::new();
         for id in self.note_ids() {
             let Ok(note) = self.note_map(id) else { continue };
             let Some(ValueOrContainer::Value(LoroValue::String(kind))) = note.get("type") else {
@@ -586,17 +631,35 @@ impl Space {
                 continue;
             }
             let Ok(fields) = child_map(&note, "fields") else { continue };
-            if fields.get("series-id").is_some() {
-                occurrences.push(id);
+            if let Some(series) = fields.get("series-id") {
+                let deletion = match series {
+                    ValueOrContainer::Value(LoroValue::String(series)) => {
+                        Id::parse(&series).ok().and_then(|id| self.tombstone(id))
+                    }
+                    _ => None,
+                };
+                if let Some(deletion) = deletion {
+                    orphaned.push((id, deletion));
+                } else {
+                    occurrences.push(id);
+                }
                 continue;
             }
             let series = Series::read(self, id);
-            if series.head().is_none() {
-                continue;
+            if series.head().is_some() {
+                series_by_id.insert(id, series);
             }
+        }
+        if !orphaned.is_empty() {
+            self.delete_orphaned_occurrences(orphaned)?;
+            changed = true;
+        }
+        for (&id, series) in &series_by_id {
+            let Ok(note) = self.note_map(id) else { continue };
+            let Ok(fields) = child_map(&note, "fields") else { continue };
             changed |= mark_series(&fields)?;
             for slot in series.slots(self, today) {
-                if insert_occurrence(self, &series, &slot)? {
+                if insert_occurrence(self, series, &slot)? {
                     if slot.cycle.is_some() {
                         let fields = child_map(&self.note_map(slot.id)?, "fields")?;
                         fields.insert("realized-on", slot.day.to_string())?;
@@ -604,9 +667,11 @@ impl Space {
                     changed = true;
                 }
             }
-            series_by_id.insert(id, series);
         }
         for id in occurrences {
+            if self.note_map(id).is_err() {
+                continue;
+            }
             changed |= checklist::reconcile(self, id)?;
             let note = self.note(id)?;
             let Some(slot) = Slot::stored(&note) else { continue };
@@ -636,6 +701,35 @@ impl Space {
             commit(self.doc());
         }
         Ok(changed)
+    }
+
+    fn delete_orphaned_occurrences(&mut self, mut orphaned: Vec<(Id, Tombstone)>) -> Result<()> {
+        // The regular hierarchy hides edges to invalid occurrences. Keep those edges here so
+        // a late-arriving successor and the tasks still attached to it are removed together.
+        let mut children = BTreeMap::<Id, Vec<Id>>::new();
+        for id in self.note_ids() {
+            let Ok(note) = self.note(id) else { continue };
+            if note.type_name != schema::TASK {
+                continue;
+            }
+            let field = if note.is_task_occurrence() { "series-id" } else { "parent-id" };
+            if let Some(parent) = note
+                .fields
+                .get(field)
+                .and_then(LoroValue::as_string)
+                .and_then(|id| Id::parse(id).ok())
+            {
+                children.entry(parent).or_default().push(id);
+            }
+        }
+        while let Some((id, deletion)) = orphaned.pop() {
+            let Ok(title) = self.title(id) else { continue };
+            self.tombstone_note(id, &title.markdown, deletion.deleted_at, deletion.deleted_by)?;
+            if let Some(children) = children.remove(&id) {
+                orphaned.extend(children.into_iter().map(|child| (child, deletion.clone())));
+            }
+        }
+        Ok(())
     }
 
     pub fn record_occurrence(
@@ -1081,12 +1175,13 @@ mod tests {
 
     #[test]
     fn concurrent_replacements_agree_on_the_supersession_date() {
-        let mut a = Space::create(Id::generate()).unwrap();
-        let series = a.create_work(schema::TASK, "Report", None).unwrap();
+        let mut base = Space::create(Id::generate()).unwrap();
+        let series = base.create_work(schema::TASK, "Report", None).unwrap();
         let day = date("2026-11-02");
-        a.set_recurrence(series, Some(rule(Mode::Keep, "FREQ=DAILY")), day).unwrap();
-        let original = work::Tree::read_on(&a, day).current_occurrences[&series];
-        let mut b = Space::open(&a.snapshot().unwrap(), Id::generate()).unwrap();
+        base.set_recurrence(series, Some(rule(Mode::Keep, "FREQ=DAILY")), day).unwrap();
+        let original = work::Tree::read_on(&base, day).current_occurrences[&series];
+        let fork = || Space::open(&base.snapshot().unwrap(), Id::generate()).unwrap();
+        let (mut a, mut b) = (fork(), fork());
         let mut changes = Vec::new();
         for (space, day) in [(&mut a, date("2026-11-03")), (&mut b, date("2026-11-04"))] {
             let replacement = Rule { start: day, ..rule(Mode::Keep, "FREQ=DAILY;COUNT=1") };
@@ -1097,18 +1192,13 @@ mod tests {
         changes.sort_unstable();
         let (_, _, loser) = changes[0];
         let (_, winning_day, winner) = changes[1];
-        let snapshot = a.snapshot().unwrap();
-        a.doc().import(&b.snapshot().unwrap()).unwrap();
-        b.doc().import(&snapshot).unwrap();
-        for space in [&mut a, &mut b] {
-            let today = date("2026-11-05");
-            space.realize_recurrences(today).unwrap();
-            assert!(!space.realize_recurrences(today).unwrap());
+        let today = date("2026-11-05");
+        replay_offline(&base, &a, &b, today, |space| {
             let tree = work::Tree::read_on(space, today);
             assert_eq!(tree.current_occurrences[&series], winner);
             assert_eq!(tree.occurrences[&loser].superseded_on, Some(winning_day));
             assert_eq!(tree.occurrences[&original].superseded_on, Some(winning_day));
-        }
+        });
     }
 
     #[test]
@@ -1137,6 +1227,138 @@ mod tests {
         assert_eq!(action["skipped-on"], "2026-11-04");
         assert!(action.get("completed-on").is_none());
         assert!(!a.realize_recurrences(return_day).unwrap());
+    }
+
+    #[test]
+    fn replacement_preview_matches_open_occurrences_and_keeps_the_previous_count_as_a_hint() {
+        let mut space = Space::create(Id::generate()).unwrap();
+        let series = space.create_work(schema::TASK, "Report", None).unwrap();
+        let old = rule(Mode::Keep, "FREQ=DAILY;COUNT=5");
+        let start = old.start;
+        let change = date("2026-11-04");
+        space.set_recurrence(series, Some(old.clone()), start).unwrap();
+        let first = work::Tree::read_on(&space, start).current_occurrences[&series];
+        space.record_occurrence(first, Outcome::Completed, start, "").unwrap();
+        space.realize_recurrences(change).unwrap();
+
+        let offsets = Rule { due: Some(7), ..old.clone() };
+        let new = Rule { start: change, pattern: "FREQ=WEEKLY;COUNT=5".into(), ..old };
+        let before = space.version();
+        assert!(space.recurrence_replacement(series, Some(&offsets), change).is_none());
+        let preview = space.recurrence_replacement(series, Some(&new), change).unwrap();
+        let ending = space.recurrence_replacement(series, None, change).unwrap();
+        assert_eq!(space.version(), before);
+        assert_eq!(preview.remaining, Some(3));
+        assert_eq!(ending.remaining, None);
+        assert_eq!(preview.occurrences, ending.occurrences);
+        assert_eq!(
+            preview.occurrences.iter().map(|(day, _)| *day).collect::<Vec<_>>(),
+            [date("2026-11-03"), change,]
+        );
+
+        space.set_recurrence(series, Some(new), change).unwrap();
+        let tree = work::Tree::read_on(&space, change);
+        assert_eq!(tree.occurrences[&first].outcome, Outcome::Completed);
+        for (_, id) in preview.occurrences {
+            assert_eq!(tree.occurrences[&id].superseded_on, Some(change));
+        }
+    }
+
+    fn replay_offline(
+        base: &Space,
+        left: &Space,
+        right: &Space,
+        day: NaiveDate,
+        verify: impl Fn(&Space),
+    ) {
+        let version = base.version();
+        let left = left.updates_since(&version).unwrap().unwrap();
+        let right = right.updates_since(&version).unwrap().unwrap();
+        let snapshot = base.snapshot().unwrap();
+        for (first, second) in [(&left, &right), (&right, &left)] {
+            let machine = Id::generate();
+            let mut space = Space::open(&snapshot, machine).unwrap();
+            space.import_checked(first).unwrap();
+            space.realize_recurrences(day).unwrap();
+            space = Space::open(&space.snapshot().unwrap(), machine).unwrap();
+            for updates in [second, first, second] {
+                space.import_checked(updates).unwrap();
+                space.realize_recurrences(day).unwrap();
+            }
+            verify(&space);
+            let mut restarted = Space::open(&space.snapshot().unwrap(), machine).unwrap();
+            assert!(!restarted.realize_recurrences(day).unwrap());
+            verify(&restarted);
+        }
+    }
+
+    #[test]
+    fn offline_closes_keep_one_successor_and_preserve_edits_across_replay() {
+        let mut base = Space::create(Id::generate()).unwrap();
+        let series = base.create_work(schema::TASK, "# Report\n\n- [ ] Review", None).unwrap();
+        let rule = rule(Mode::Interval, "FREQ=WEEKLY;COUNT=3");
+        let day = rule.start;
+        base.set_recurrence(series, Some(rule), day).unwrap();
+        let first = work::Tree::read_on(&base, day).current_occurrences[&series];
+        let fork = || Space::open(&base.snapshot().unwrap(), Id::generate()).unwrap();
+        let (mut left, mut right) = (fork(), fork());
+        left.record_occurrence(first, Outcome::Completed, day, "Left completion").unwrap();
+        let later = date("2026-11-04");
+        right.set_field(first, "due-on", &Value::Date("2026-11-12".into())).unwrap();
+        right.record_occurrence(first, Outcome::Skipped, later, "Right skip").unwrap();
+        let next = work::Tree::read_on(&right, later).current_occurrences[&series];
+        assert_eq!(work::Tree::read_on(&left, day).current_occurrences[&series], next);
+        right.set_body(next, "# Report\n\n- [x] Review").unwrap();
+        right.note_edited(next).unwrap();
+        right.set_field(next, "due-on", &Value::Date("2026-11-13".into())).unwrap();
+        right.record_occurrence(next, Outcome::Completed, date("2026-11-11"), "").unwrap();
+        let third = work::Tree::read_on(&right, later).current_occurrences[&series];
+
+        let verify = |space: &Space, outcome, due| {
+            let tree = work::Tree::read_on(space, later);
+            assert_eq!(tree.current_occurrences[&series], third);
+            assert_eq!(tree.occurrences.len(), 3);
+            assert_eq!(tree.occurrences[&first].outcome, outcome);
+            assert_eq!(tree.occurrences[&first].due.as_deref(), Some(due));
+            assert_eq!(tree.occurrences[&next].day, date("2026-11-09"));
+            assert_eq!(tree.occurrences[&next].due.as_deref(), Some("2026-11-13"));
+            assert_eq!(tree.occurrences[&next].outcome, Outcome::Completed);
+            assert_eq!(tree.occurrences[&third].day, date("2026-11-18"));
+            let body = space.note(first).unwrap().body;
+            assert_eq!(body.matches("Left completion").count(), 1);
+            assert_eq!(body.matches("Right skip").count(), 1);
+            assert_eq!(space.note(next).unwrap().body, "# Report\n\n- [x] Review");
+        };
+        replay_offline(&base, &left, &right, later, |space| {
+            verify(space, Outcome::Completed, "2026-11-04");
+        });
+        left.record_occurrence(first, Outcome::Open, later, "").unwrap();
+        replay_offline(&base, &left, &right, later, |space| {
+            verify(space, Outcome::Open, "2026-11-12");
+        });
+    }
+
+    #[test]
+    fn offline_series_deletion_also_removes_successors_realized_on_another_machine() {
+        let mut base = Space::create(Id::generate()).unwrap();
+        let series = base.create_work(schema::TASK, "Report", None).unwrap();
+        let rule = rule(Mode::Interval, "FREQ=WEEKLY");
+        let day = rule.start;
+        base.set_recurrence(series, Some(rule), day).unwrap();
+        let first = work::Tree::read_on(&base, day).current_occurrences[&series];
+        let fork = || Space::open(&base.snapshot().unwrap(), Id::generate()).unwrap();
+        let (mut left, mut right) = (fork(), fork());
+        left.delete_note(series).unwrap();
+        right.record_occurrence(first, Outcome::Completed, day, "").unwrap();
+        let next = work::Tree::read_on(&right, day).current_occurrences[&series];
+        let subtask = right.create_work(schema::TASK, "Successor subtask", Some(next)).unwrap();
+
+        replay_offline(&base, &left, &right, day, |space| {
+            for id in [series, first, next, subtask] {
+                assert!(space.note(id).is_err(), "deleted series retained {id}");
+                assert!(space.tombstone(id).is_some());
+            }
+        });
     }
 
     #[test]

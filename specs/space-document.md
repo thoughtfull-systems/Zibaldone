@@ -240,6 +240,9 @@ the affected set. Record the same `deleted-at` and `deleted-by` values on every 
 operation. Keep existing work-order entries and unrelated notes. Sync imports the written removals
 and tombstones without walking the receiving replica's hierarchy again.
 
+Recurrence upkeep also handles [occurrences created offline][late-occurrences] for a deleted series
+and tasks still attached to them.
+
 ## Waiting values
 
 The optional `waiting-values` root map retains Waiting completion candidates. Each key is nonempty
@@ -266,3 +269,4 @@ The optional mergeable `recurrence-body-seeds` map on an occurrence records dige
 body. See the [recurring tasks specification](recurring-tasks.md#identity-and-body).
 
 [blake3]: https://github.com/BLAKE3-team/BLAKE3
+[late-occurrences]: recurring-tasks.md#late-arrivals-for-a-deleted-series

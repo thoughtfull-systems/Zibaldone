@@ -195,4 +195,24 @@ opens that occurrence. A search result for its subtask reveals the subtask in th
 sidebar. A series result in a project opens the project and reveals the series row. Use **Edit task
 body** on that row to find the current occurrence and history in the series editor.
 
+## Previewing a rule change
+
+Before replacing or ending an active rule, the desktop opens a read-only preview. It lists every
+open occurrence that the change supersedes, in recurrence date order. Confirm to apply the change.
+If the rule or previewed set changes during review, ask the owner to review the change again.
+Changes that only adjust date offsets skip the replacement preview.
+
+When both rules use a count limit, suggest the previous count minus the calendar slots before the
+new start date. For a completion interval, subtract the cycles before that date instead. Offer a
+suggestion when at least one remains. Keep the count chosen in the editor, which starts with the new
+rule's first occurrence. The editor carries forward the previous end date by default.
+
+## Late arrivals for a deleted series
+
+During recurrence upkeep, remove any occurrence whose series has a tombstone in the same space. Also
+remove tasks still attached under that occurrence through `parent-id` or `series-id` links. Write
+tombstones for the removed notes with their own titles and the deletion timestamp and machine from
+the series tombstone. Preserve any existing tombstone. This reconciliation covers occurrences that
+another machine creates before it receives the series deletion.
+
 [decision]: ../decisions/ZIB0028-recurring-tasks.md

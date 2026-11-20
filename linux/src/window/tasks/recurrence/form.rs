@@ -166,11 +166,7 @@ impl RuleForm {
         };
         let rule =
             Rule { mode, start, pattern, scheduled: self.scheduled.read(), due: self.due.read() };
-        if self.updating
-            && (rule.mode, rule.start, &rule.pattern)
-                != (self.original.mode, self.original.start, &self.original.pattern)
-            && start < recurrence::today()
-        {
+        if self.updating && !rule.same_schedule(&self.original) && start < recurrence::today() {
             return Err(Error::Space(
                 "Choose today or a future start date for the changed rule".into(),
             ));
