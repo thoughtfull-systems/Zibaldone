@@ -97,8 +97,14 @@ the title. Preserve match highlighting, escape markup in source text, and avoid 
 line limit. Keep distant matches and matches from different fields or search clauses. Date and
 status controls open their pickers directly without navigating away from results.
 
+## Recurrence date sorting
+
+The sort value `recurrence` orders occurrence dates newest first, followed by notes without an
+occurrence date. Break ties by note identifier. See the [recurring tasks specification][recurring].
+
 [decision]: ../decisions/ZIB0022-saved-searches.md
 [document]: space-document.md
 [identifiers]: identifiers.md
 [ranges]: search-ranges.md
+[recurring]: recurring-tasks.md
 [work]: projects-and-tasks.md

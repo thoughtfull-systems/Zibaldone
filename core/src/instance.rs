@@ -49,6 +49,8 @@ pub enum Request {
         query: String,
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sort: Option<String>,
     },
     /// Searches one space by identifier or pet name.
     SearchSpace {
@@ -56,6 +58,8 @@ pub enum Request {
         query: String,
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sort: Option<String>,
         space: String,
     },
     /// Reads note bodies by identifier.

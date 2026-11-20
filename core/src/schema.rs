@@ -191,7 +191,11 @@ pub fn built_in() -> Vec<TypeDef> {
         .map(|(name, def)| (name.into(), def))
         .collect();
         if task {
-            fields.insert("completed-on".into(), FieldDef::new(Kind::Date, SearchMode::Filter));
+            for field in ["completed-on", "recurrence-on", "skipped-on", "superseded-on"] {
+                fields.insert(field.into(), FieldDef::new(Kind::Date, SearchMode::Filter));
+            }
+            fields.insert("recurrence".into(), FieldDef::new(Kind::Boolean, SearchMode::Filter));
+            fields.insert("series-id".into(), FieldDef::new(Kind::Link, SearchMode::Filter));
         }
         fields
     };
@@ -255,6 +259,24 @@ pub fn write_schemas(doc: &LoroDoc, types: &[TypeDef]) -> Result<bool> {
         }
     }
     Ok(wrote)
+}
+
+/// Upgrades the unpublished task schema used by earlier recurrence builds.
+pub(crate) fn upgrade_draft_work_schema(doc: &LoroDoc) -> Result<bool> {
+    let Some(task) = read_type(doc, TASK) else { return Ok(false) };
+    let remove_actionable = task.fields.contains_key("actionable");
+    let change_recurrence = task.fields.get("recurrence").is_some_and(|def| def.kind == Kind::Text);
+    if !remove_actionable && !change_recurrence {
+        return Ok(false);
+    }
+    let fields = child_map(&doc.get_map(SCHEMAS), TASK)?;
+    if remove_actionable {
+        fields.delete("actionable")?;
+    }
+    if change_recurrence {
+        child_map(&fields, "recurrence")?.insert("kind", Kind::Boolean.name())?;
+    }
+    Ok(true)
 }
 
 /// The map under `key`, created when it's missing.

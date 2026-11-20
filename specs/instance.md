@@ -160,6 +160,22 @@ The browser integration also adds **`import-web-pdf`** with `pdf`, as the
 [web clipper specification](web-clipper.md#import-request-for-pdfs) defines. The result holds `clip`
 with the file note's `note` and `space` identifiers and an empty `images` list.
 
+## Structured search
+
+The `search` and `search-space` requests accept the desktop query syntax, including field
+conditions, grouping, Boolean operators, and [ranges and relative dates](search-ranges.md).
+Comparisons match only notes with a populated field. The missing-field operator `!?` matches absent
+fields. An invalid query returns `invalid-query` with a text explanation.
+
+Both requests accept an optional text `sort`, with the [saved search sort names](saved-searches.md).
+An omitted sort uses `relevance`. An unknown sort returns `invalid-query`. The instance applies one
+sort across all spaces in scope before applying `limit`. The result keeps the existing list of hits
+and its fields.
+
+Use `zib search --sort ORDER --limit N QUERY` to set the sort and maximum number of hits. Other
+options can precede the query in any order. Quote the query to protect shell operators and retain
+double quotes around values with spaces, as in `zib search '@authors="Jane Doe"'`.
+
 ## Platforms
 
 - **Linux.** This specification applies to the Linux app and the `zib` command, on sway with a

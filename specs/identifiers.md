@@ -108,6 +108,12 @@ Examples:
 - **Browser.** A web app, when one exists, registers `web+zib` through the browser's protocol
   handler interface.
 
+## Generated occurrence identifiers
+
+Task occurrence notes use a derived version 8 UUID as the
+[recurring tasks specification](recurring-tasks.md) defines. This exception lets two offline
+machines assign the same address to the same occurrence. The text and URI formats remain the same.
+
 [crockford]: https://www.crockford.com/base32.html
 [rfc 3986]: https://www.rfc-editor.org/rfc/rfc3986
 [rfc 9562]: https://www.rfc-editor.org/rfc/rfc9562

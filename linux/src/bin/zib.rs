@@ -8,7 +8,7 @@ use std::process::{Command, ExitCode, Stdio};
 use zib_core::Id;
 use zib_core::channel::Dirs;
 use zib_core::instance::{Client, NoteRead, Reply, Request};
-use zib_core::search::{MATCH_END, MATCH_START};
+use zib_core::search::{MATCH_END, MATCH_START, Sort};
 use zib_linux::CHANNEL;
 
 #[path = "../firefox_host.rs"]
@@ -20,8 +20,10 @@ Usage:
   zib zib:note/<id>       Open a note
   zib spaces              List the spaces on this machine
   zib create-space NAME   Create a space
-  zib search [--json] [--space SPACE] WORDS...
-                          Search all spaces or the given space name or ID
+  zib search [--json] [--limit N] [--sort ORDER] [--space SPACE] QUERY
+                          Use the desktop query syntax across all spaces or one space
+                          Sort by due, modified, recurrence, relevance, or title
+                          Try zib search --sort due '@type=task AND @due-on<=today+1w'
   zib get NOTE...         Read note bodies as a JSON array
   zib get --raw NOTE      Print one note body as markdown
   zib write NOTE --expect ORIGINAL < REVISED
@@ -146,6 +148,8 @@ async fn run(args: Vec<String>) -> Result<ExitCode, String> {
 }
 
 fn search_request(id: u64, mut args: &[String]) -> Result<(Request, Output), String> {
+    let mut limit = None;
+    let mut sort = None;
     let mut space = None;
     let mut output = Output::Default;
     while let [flag, rest @ ..] = args {
@@ -158,13 +162,26 @@ fn search_request(id: u64, mut args: &[String]) -> Result<(Request, Output), Str
                 output = Output::HitsJson;
                 args = rest;
             }
-            "--space" => {
-                let Some((name, rest)) = rest.split_first() else {
-                    return Err("search --space needs a space name or ID".into());
-                };
-                space = Some(name.clone());
+            "--limit" | "--sort" | "--space" => {
+                let (value, rest) =
+                    rest.split_first().ok_or_else(|| format!("search {flag} needs a value"))?;
+                match flag.as_str() {
+                    "--limit" => {
+                        limit = Some(value.parse().map_err(|_| {
+                            "search --limit needs a nonnegative integer no larger than 4294967295"
+                        })?);
+                    }
+                    "--sort" => {
+                        if Sort::from_name(value).is_none() {
+                            return Err(format!("Unknown search sort {value:?}"));
+                        }
+                        sort = Some(value.clone());
+                    }
+                    _ => space = Some(value.clone()),
+                }
                 args = rest;
             }
+            _ if flag.starts_with("--") => return Err(format!("unknown search option {flag}")),
             _ => break,
         }
     }
@@ -173,9 +190,9 @@ fn search_request(id: u64, mut args: &[String]) -> Result<(Request, Output), Str
         return Err("search needs at least one search term".into());
     }
     let request = if let Some(space) = space {
-        Request::SearchSpace { id, query, limit: None, space }
+        Request::SearchSpace { id, query, limit, sort, space }
     } else {
-        Request::Search { id, query, limit: None }
+        Request::Search { id, query, limit, sort }
     };
     Ok((request, output))
 }
@@ -234,4 +251,29 @@ fn print_request(id: u64, args: &[String]) -> Result<Request, String> {
     }
     let path = env::current_dir().map_err(|e| e.to_string())?.join(path);
     Ok(Request::Print { id, notes, linked, path: path.to_string_lossy().into_owned() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_options_pass_the_desktop_expression_unchanged() {
+        let query = r#"@authors="Jane Doe" OR @due-on=+1d...+1w"#;
+        let args = ["--json", "--limit", "5", "--sort", "due", "--space", "Work", "--", query];
+        let (request, output) = search_request(1, &args.map(str::to_owned)).unwrap();
+        assert!(matches!(output, Output::HitsJson));
+        assert_eq!(
+            request,
+            Request::SearchSpace {
+                id: 1,
+                limit: Some(5),
+                query: query.into(),
+                sort: Some("due".into()),
+                space: "Work".into(),
+            }
+        );
+        assert!(search_request(1, &["--limit", "-1", query].map(str::to_owned)).is_err());
+        assert!(search_request(1, &["--sort", "unknown", query].map(str::to_owned)).is_err());
+    }
 }

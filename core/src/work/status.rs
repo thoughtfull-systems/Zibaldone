@@ -10,7 +10,10 @@ use crate::search::saved::Definition;
 use crate::space::note_map;
 use crate::{Error, Id, Result, Space};
 
-use super::{PRE_STATUS_WORK_QUERY, Tree, WORK_QUERY, is_work};
+use super::{
+    ACTIONABLE_WORK_QUERY, PRE_RECURRENCE_WORK_QUERY, PRE_STATUS_WORK_QUERY, Tree, WORK_QUERY,
+    is_work,
+};
 
 const HISTORY: &str = "waiting-values";
 
@@ -71,7 +74,10 @@ impl Space {
     /// Changes status and Waiting detail together. An absent status resumes inheritance.
     pub fn set_work_status(&mut self, id: Id, status: Option<&str>, reason: &str) -> Result<()> {
         let note = self.note(id)?;
-        if !is_work(&note.type_name) || status.is_some_and(|status| !Status::valid(status)) {
+        if !is_work(&note.type_name)
+            || note.is_task_occurrence()
+            || status.is_some_and(|status| !Status::valid(status))
+        {
             return Err(Error::Space("Choose a valid work status".into()));
         }
         let fields = child_map(&note_map(self.doc(), id)?, "fields")?;
@@ -124,24 +130,28 @@ impl Space {
     }
 
     pub(crate) fn upgrade_work_search(&mut self) -> Result<()> {
-        if self.setting(None, "zib.work-status-search")?.is_some() {
+        if self.setting(None, "zib.work-date-search")?.is_some() {
             return Ok(());
         }
         let space = self.id()?;
         for search in self.saved_searches() {
             let definition = &search.definition;
-            if search.name == "What should I work on?"
-                && definition.query == PRE_STATUS_WORK_QUERY
-                && definition.scope == Some(space)
-                && definition.sort == Sort::Due
-            {
-                self.update_saved_search(
-                    &search,
-                    &Definition { query: WORK_QUERY.into(), ..definition.clone() },
-                )?;
+            if definition.scope != Some(space) || definition.sort != Sort::Due {
+                continue;
             }
+            let new = match (search.name.as_str(), definition.query.as_str()) {
+                (
+                    "What should I work on?",
+                    ACTIONABLE_WORK_QUERY | PRE_STATUS_WORK_QUERY | PRE_RECURRENCE_WORK_QUERY,
+                ) => WORK_QUERY,
+                _ => continue,
+            };
+            self.update_saved_search(
+                &search,
+                &Definition { query: new.into(), ..definition.clone() },
+            )?;
         }
-        self.set_setting(None, "zib.work-status-search", true)
+        self.set_setting(None, "zib.work-date-search", true)
     }
 }
 
@@ -232,6 +242,13 @@ mod tests {
             sort: Sort::Due,
         };
         let default = space.create_saved_search("What should I work on?", &original).unwrap();
+        let from_recurrence = space
+            .create_saved_search(
+                "What should I work on?",
+                &Definition { query: ACTIONABLE_WORK_QUERY.into(), ..original.clone() },
+            )
+            .unwrap();
+        space.set_setting(None, "zib.work-recurrence-search", true).unwrap();
         let edited = space
             .create_saved_search(
                 "What should I work on?",
@@ -254,6 +271,10 @@ mod tests {
         let searches = reopened.saved_searches();
         let upgraded = searches.iter().find(|s| s.id == default.id).unwrap();
         assert_eq!(upgraded.definition.query, WORK_QUERY);
+        assert_eq!(
+            searches.iter().find(|s| s.id == from_recurrence.id).unwrap().definition.query,
+            WORK_QUERY
+        );
         for search in [edited, global, reordered] {
             assert_eq!(
                 searches.iter().find(|s| s.id == search.id).unwrap().definition,

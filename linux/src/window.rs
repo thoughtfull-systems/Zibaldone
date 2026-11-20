@@ -94,7 +94,6 @@ pub struct Inner {
     /// Set while a lookup that also restores the open note's backlinks height is under way.
     backlinks_restoring: Cell<bool>,
     editor_scroll: gtk::ScrolledWindow,
-    editor_content: gtk::Box,
     project_pane: ProjectPane,
     /// The notes opened before the open one, the latest last, and those to go forward to again.
     back: RefCell<Vec<(Id, Id)>>,
@@ -167,6 +166,7 @@ impl Window {
         let sort_menu = gio::Menu::new();
         sort_menu.append(Some("Due date"), Some("win.sort-notes::due"));
         sort_menu.append(Some("Last modified"), Some("win.sort-notes::modified"));
+        sort_menu.append(Some("Recurrence date"), Some("win.sort-notes::recurrence"));
         sort_menu.append(Some("Relevance"), Some("win.sort-notes::relevance"));
         sort_menu.append(Some("Title"), Some("win.sort-notes::title"));
         let sort = gtk::MenuButton::builder()
@@ -245,15 +245,14 @@ impl Window {
 
         let widget = EditorWidget::default();
         let work = tasks::WorkPanel::new();
-        let editor_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        editor_content.append(&work.header);
-        editor_content.append(&widget);
-        editor_content.append(&work.widget);
         let editor_scroll = gtk::ScrolledWindow::builder()
-            .child(&editor_content)
+            .child(&widget)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
+        if let Some(viewport) = editor_scroll.child().and_downcast::<gtk::Viewport>() {
+            viewport.set_scroll_to_focus(false);
+        }
         let backlinks_list = gtk::ListBox::new();
         backlinks_list.add_css_class("navigation-sidebar");
         backlinks_list.set_selection_mode(gtk::SelectionMode::None);
@@ -278,6 +277,8 @@ impl Window {
         backlinks_panel.set_visible(false);
         let backlinks = BottomPane::new(&editor_scroll, &backlinks_panel);
         let project_pane = ProjectPane::new(&backlinks.widget);
+        project_pane.content.append(&work.header);
+        project_pane.content.append(&work.widget);
         let empty = adw::StatusPage::builder()
             .icon_name("accessories-text-editor-symbolic")
             .title(state.channel.display_name())
@@ -336,7 +337,6 @@ impl Window {
             backlinks_generation: Cell::new(0),
             backlinks_restoring: Cell::new(false),
             editor_scroll,
-            editor_content,
             project_pane,
             back: RefCell::default(),
             forward: RefCell::default(),
@@ -504,7 +504,7 @@ impl Window {
                 .get(usize::try_from(row.index()).unwrap_or(usize::MAX))
                 .copied();
             if let Some((space, note)) = picked {
-                w.open_note(space, note);
+                w.open_search_result(space, note);
             }
         });
         let w = self.clone();
@@ -553,9 +553,9 @@ impl Window {
             ("edit-space-dictionary", |w: &Self| w.spelling_dictionary(None)),
             ("move-note", Self::move_note),
             ("move-notes", |w: &Self| crate::sharing::move_all(w, w.inner().state.clone())),
-            ("new-project", |w: &Self| w.new_work(zib_core::schema::PROJECT, None)),
+            ("new-project", |w: &Self| w.new_work(zib_core::schema::PROJECT)),
             ("new-space", Self::new_space),
-            ("new-task", |w: &Self| w.new_work(zib_core::schema::TASK, None)),
+            ("new-task", |w: &Self| w.new_work(zib_core::schema::TASK)),
             ("print", |w: &Self| w.print(false)),
             ("print-linked", |w: &Self| w.print(true)),
             ("rename-space", Self::rename_space),
@@ -594,6 +594,7 @@ impl Window {
             let order = match value.str() {
                 Some("due") => Sort::Due,
                 Some("modified") => Sort::Modified,
+                Some("recurrence") => Sort::Recurrence,
                 Some("relevance") => Sort::Relevance,
                 Some("title") => Sort::Title,
                 _ => return,
@@ -699,8 +700,8 @@ impl Window {
                 core(async move { (state.space_list().await, state.last_space().await) }).await;
             let menu = &w.inner().new_note_menu;
             menu.remove_all();
-            menu.append(Some("New project…"), Some("win.new-project"));
-            menu.append(Some("New standalone task…"), Some("win.new-task"));
+            menu.append(Some("New project"), Some("win.new-project"));
+            menu.append(Some("New standalone task"), Some("win.new-task"));
             for (id, name, _) in &spaces {
                 menu.append(
                     Some(&format!("New note in {name}")),
@@ -802,14 +803,18 @@ impl Window {
         let state = self.inner().state.clone();
         glib::spawn_future_local(async move {
             let reading = state.clone();
-            let type_name = match core(async move { reading.note(space, note).await }).await {
-                Ok(note) => note.type_name,
+            let item = match core(async move { reading.note(space, note).await }).await {
+                Ok(item) => item,
                 Err(error) => {
                     w.toast(&format!("Couldn't delete note: {error}"));
                     return;
                 }
             };
-            let (heading, body) = match type_name.as_str() {
+            if item.is_task_occurrence() {
+                w.toast("Skip the occurrence to remove it from open work");
+                return;
+            }
+            let (heading, body) = match item.type_name.as_str() {
                 "project" => (
                     "Delete this project?",
                     "This also deletes all subprojects and tasks, including completed tasks. \
@@ -887,7 +892,7 @@ impl Window {
                 titles: titles.clone(),
                 cursors: None,
             });
-            w.work_layout(&loaded.type_name);
+            w.inner().project_pane.show(zib_core::work::is_work(&loaded.type_name));
             let widget = &w.inner().widget;
             widget.set_editor(Some(zib_core::editor::Editor::new(body)));
             widget.set_titles(titles);

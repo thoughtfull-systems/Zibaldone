@@ -46,7 +46,11 @@ pub(super) fn prepare(space: &Space) -> Result<LoroMovableList> {
     for index in duplicates.into_iter().rev() {
         list.delete(index, 1)?;
     }
-    let mut missing: Vec<_> = tree.items.values().filter(|i| !seen.contains(&i.note.id)).collect();
+    let mut missing: Vec<_> = tree
+        .items
+        .values()
+        .filter(|i| !i.note.is_task_occurrence() && !seen.contains(&i.note.id))
+        .collect();
     missing.sort_by(|a, b| {
         a.title.to_lowercase().cmp(&b.title.to_lowercase()).then_with(|| a.note.id.cmp(&b.note.id))
     });
@@ -88,7 +92,11 @@ impl Space {
         };
         validate(self, id, "parent-id", parent.map(Value::Link).as_ref())?;
         if let Some(before) = before {
-            if tree.items.get(&before).is_none_or(|i| i.parent != parent) {
+            if tree
+                .items
+                .get(&before)
+                .is_none_or(|i| i.parent != parent || i.note.is_task_occurrence())
+            {
                 return Err(Error::Space("Choose a sibling at the destination".into()));
             }
             if before == id {

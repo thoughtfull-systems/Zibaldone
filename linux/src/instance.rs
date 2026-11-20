@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use zib_core::instance::{self, Handler, HitInfo, Lock, NoteRead, Reply, Request, SpaceInfo};
+use zib_core::search::Sort;
 use zib_core::{Channel, Error, Id, Result};
 
 use crate::state::{State, UiEvent};
@@ -58,6 +59,7 @@ fn handler(state: Arc<State>) -> Handler {
                     let code = match error {
                         Error::NotFound(_) => "not-found",
                         Error::NoteChanged(_) => "conflict",
+                        Error::SearchQuery(_) => "invalid-query",
                         _ => "failed",
                     };
                     Reply::Error { id, reason: error.to_string(), code: code.into() }
@@ -93,10 +95,12 @@ async fn answer(state: &State, request: Request) -> Result<Reply> {
                 notes: Vec::new(),
             }
         }
-        Request::Search { id, query, limit } => search_reply(state, id, &query, limit, None),
-        Request::SearchSpace { id, query, limit, space } => {
+        Request::Search { id, query, limit, sort } => {
+            search_reply(state, id, &query, limit, sort.as_deref(), None)?
+        }
+        Request::SearchSpace { id, query, limit, sort, space } => {
             let space = resolve_space(state, &space).await?;
-            search_reply(state, id, &query, limit, Some(space))
+            search_reply(state, id, &query, limit, sort.as_deref(), Some(space))?
         }
         Request::GetNotes { id, notes } => {
             let mut entries = Vec::with_capacity(notes.len());
@@ -138,14 +142,19 @@ fn search_reply(
     id: u64,
     query: &str,
     limit: Option<u32>,
+    sort: Option<&str>,
     space: Option<Id>,
-) -> Reply {
+) -> Result<Reply> {
+    let sort = sort.map_or(Ok(Sort::default()), |name| {
+        Sort::from_name(name)
+            .ok_or_else(|| Error::SearchQuery(format!("Unknown search sort {name:?}")))
+    })?;
     let hits = state
-        .search_in(query, limit.unwrap_or(20) as usize, space)
+        .search_in(space, query, sort, limit.unwrap_or(20) as usize)?
         .into_iter()
         .map(|(space, hit)| HitInfo { space, note: hit.id, title: hit.title, snippet: hit.snippet })
         .collect();
-    Reply::Result { id, clip: None, spaces: Vec::new(), hits, notes: Vec::new() }
+    Ok(Reply::Result { id, clip: None, spaces: Vec::new(), hits, notes: Vec::new() })
 }
 
 async fn resolve_space(state: &State, name: &str) -> Result<Id> {
@@ -198,19 +207,44 @@ mod tests {
             Client::connect(&dirs, || panic!("instance already started")).await.unwrap();
 
         let id = client.next_id();
-        let request = Request::Search { id, query: "Sharedterm".into(), limit: None };
+        let request = Request::Search { id, query: "Sharedterm".into(), limit: None, sort: None };
         let Reply::Result { hits, .. } = client.request(request).await.unwrap() else {
             panic!("expected search hits")
         };
         assert_eq!(hits.len(), 2);
         for space in ["Research notes".into(), second_space.to_string()] {
             let id = client.next_id();
-            let request =
-                Request::SearchSpace { id, query: "Sharedterm".into(), limit: None, space };
+            let request = Request::SearchSpace {
+                id,
+                query: "Sharedterm AND @type=note".into(),
+                limit: None,
+                sort: None,
+                space,
+            };
             let Reply::Result { hits, .. } = client.request(request).await.unwrap() else {
                 panic!("expected scoped search hits")
             };
             assert_eq!(hits.iter().map(|hit| hit.note).collect::<Vec<_>>(), [second]);
+        }
+
+        let id = client.next_id();
+        let query = format!("Sharedterm AND (@id={first} OR @id={second}) AND NOT @due-on?");
+        let request = Request::Search { id, query, limit: Some(1), sort: Some("title".into()) };
+        let Reply::Result { hits, .. } = client.request(request).await.unwrap() else {
+            panic!("expected sorted search hits")
+        };
+        assert_eq!(hits.iter().map(|hit| hit.note).collect::<Vec<_>>(), [first]);
+        assert!(hits[0].snippet.contains("Sharedterm"));
+
+        for (query, message) in [
+            ("@unrecognized-field=1", "Unknown search field"),
+            ("@due-on=not-a-date", "not-a-date"),
+        ] {
+            let id = client.next_id();
+            let request = Request::Search { id, query: query.into(), limit: None, sort: None };
+            let reply = client.request(request).await.unwrap();
+            assert!(matches!(reply, Reply::Error { code, reason, .. }
+                if code == "invalid-query" && reason.contains(message)));
         }
 
         let id = client.next_id();
