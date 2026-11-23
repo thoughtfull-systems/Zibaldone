@@ -60,10 +60,18 @@ pub struct Line {
     /// that lines up a numbered list's one-digit numbers.
     left: f64,
     /// The bullets and task boxes drawn over its text.
-    markers: Vec<(Range<usize>, Shape)>,
+    markers: Vec<Marker>,
     images: Vec<InlineImage>,
     backgrounds: Vec<Background>,
     quote: Option<QuoteRoom>,
+}
+
+/// A bullet or task box and the original font cell it draws within, relative to the baseline.
+struct Marker {
+    ascent: i32,
+    height: i32,
+    range: Range<usize>,
+    shape: Shape,
 }
 
 /// Room for quote bars: before the paragraph or inside it, past a list item's prefix.
@@ -104,10 +112,17 @@ enum Content {
 
 /// Context shared by the source paragraphs in a single layout pass.
 struct Layout<'a> {
+    body: VerticalMetrics,
     column: f64,
     display: &'a Display,
     text: &'a str,
     wrap: f64,
+}
+
+#[derive(Clone, Copy)]
+struct VerticalMetrics {
+    ascent: i32,
+    descent: i32,
 }
 
 /// Where a paste started, including which open editor it belongs to.
@@ -677,8 +692,10 @@ impl EditorWidget {
                 .or_else(|| editor.as_ref().map(|e| e.selection().range()))
                 .unwrap_or_default();
             let shown = editor.as_ref().map(|e| e.display_for(&selection)).unwrap_or_default();
+            let (body, column) = measure_fonts(self.upcast_ref());
             let context = Layout {
-                column: monospace_width(self.upcast_ref()),
+                body,
+                column,
                 display: &shown,
                 text,
                 wrap: (f64::from(width) - 2.0 * MARGIN_SIDES).max(1.0),
@@ -749,7 +766,7 @@ impl EditorWidget {
         previous: Option<&Line>,
     ) -> Line {
         let (start, end) = (range.start, range.end);
-        let Layout { column, display: shown, text, wrap } = *context;
+        let Layout { body, column, display: shown, text, wrap } = *context;
         let imp = self.imp();
         let dark = adw::StyleManager::default().is_dark();
         let (pieces, shown_text) = pieces(text, start, end, shown);
@@ -780,7 +797,9 @@ impl EditorWidget {
             .filter(|m| m.range.start >= start && m.range.start < end.max(start + 1))
             .map(|m| (m.range.clone(), m.shape))
             .collect();
-        style_markers(&attributes, &pieces, &markers);
+        let revealed =
+            shown.revealed_task_boxes.iter().copied().filter(|at| start < *at && *at < end);
+        let markers = shape_markers(&layout, &attributes, &pieces, markers, revealed, body);
         self.underline_misspellings(&attributes, &pieces, start..end);
         let quote = quoted.map(|q| {
             let inline = q.start > start;
@@ -952,6 +971,15 @@ impl EditorWidget {
         let Some(editor) = editor.as_ref() else { return };
         let color = self.color();
         let selected = editor.selection().range();
+        let (surface_x, device_scale) = self
+            .native()
+            .and_then(|native| {
+                let surface = native.surface()?;
+                let widget = native.dynamic_cast_ref::<gtk::Widget>()?;
+                let origin = self.compute_point(widget, &graphene::Point::zero())?;
+                Some((f64::from(origin.x()) - native.surface_transform().0, surface.scale()))
+            })
+            .unwrap_or((0.0, 1.0));
         let highlight = adw::StyleManager::default().accent_color_rgba().with_alpha(0.3);
         let (red, green, blue, alpha) = SHADE;
         #[allow(clippy::cast_possible_truncation)]
@@ -1004,8 +1032,8 @@ impl EditorWidget {
             for block in &line.blocks {
                 block.paint(snapshot, &selected, &highlight);
             }
-            for (range, shape) in &line.markers {
-                draw_marker(snapshot, line, range, *shape, &color);
+            for marker in &line.markers {
+                draw_marker(snapshot, line, marker, &color, surface_x + line.left, device_scale);
             }
             snapshot.restore();
             tables::snapshot(self, snapshot, line);
@@ -1027,15 +1055,15 @@ impl EditorWidget {
         #[allow(clippy::cast_possible_truncation)]
         let point = graphene::Point::new(x as f32, y as f32);
         lines.iter().filter(|line| line.y <= y && y < line.y + line.height).find_map(|line| {
-            line.markers.iter().find_map(|(range, shape)| {
-                if !matches!(shape, Shape::TaskBox(_)) {
+            line.markers.iter().find_map(|marker| {
+                if !matches!(marker.shape, Shape::TaskBox(_)) {
                     return None;
                 }
                 #[allow(clippy::cast_possible_truncation)]
-                let area = run_rect(line, range)
-                    .union(&marker_rect(line, range))
+                let area = run_rect(line, &marker.range)
+                    .union(&marker_rect(line, marker))
                     .offset_r(line.left as f32, line.y as f32);
-                area.contains_point(&point).then_some(range.start)
+                area.contains_point(&point).then_some(marker.range.start)
             })
         })
     }
@@ -1127,7 +1155,17 @@ impl EditorWidget {
         if trailing > 0 {
             let text = line.layout.text();
             let after = index + text[index..].chars().next().map_or(0, char::len_utf8);
-            line.source_after(after)
+            let at = line.source_after(after);
+            // The position after a drawn box on an empty task is past its hidden source.
+            if after == text.len()
+                && line.markers.iter().any(|marker| {
+                    marker.range.end == at && matches!(marker.shape, Shape::TaskBox(_))
+                })
+            {
+                line.end
+            } else {
+                at
+            }
         } else {
             line.source(index)
         }
@@ -1728,21 +1766,69 @@ fn quote_rects(line: &Line) -> Vec<graphene::Rect> {
         .collect()
 }
 
-/// The text under a bullet or task box keeps its room but stays unseen. An alpha of zero would
-/// make Pango draw it at full opacity, so use the smallest visible alpha instead.
-fn style_markers(
+/// Keeps the marker's advance and reserves room for the body font even before any text follows.
+fn shape_markers(
+    layout: &pango::Layout,
     attributes: &pango::AttrList,
     pieces: &[Piece],
-    markers: &[(Range<usize>, Shape)],
-) {
-    for (range, _) in markers {
+    markers: Vec<(Range<usize>, Shape)>,
+    revealed: impl Iterator<Item = usize>,
+    body: VerticalMetrics,
+) -> Vec<Marker> {
+    let mut revealed = revealed.peekable();
+    if markers.is_empty() && revealed.peek().is_none() {
+        return Vec::new();
+    }
+    layout.set_attributes(attributes.copy().as_ref());
+    for at in revealed {
+        // Keep the visible brackets and put the same height reservation on their leading space.
+        let space = pieces_shown(pieces, at - 1);
+        if matches!(layout.text().as_bytes().get(space), Some(b' ' | b'\t')) {
+            reserve_body_height(layout, attributes, space, body);
+        }
+    }
+    let mut shaped = Vec::with_capacity(markers.len());
+    for (range, shape) in markers {
         let (from, to) = (pieces_shown(pieces, range.start), pieces_shown(pieces, range.end));
+        let VerticalMetrics { ascent, descent } =
+            reserve_body_height(layout, attributes, from, body);
+        // An alpha of zero would make Pango draw the source at full opacity.
         for mut attribute in foreground((0.5, 0.5, 0.5, 0.004)) {
             attribute.set_start_index(u32::try_from(from).unwrap_or(0));
             attribute.set_end_index(u32::try_from(to).unwrap_or(u32::MAX));
             attributes.insert(attribute);
         }
+        shaped.push(Marker { ascent, height: ascent + descent, range, shape });
     }
+    shaped
+}
+
+/// Reserves the body font's vertical space on an ASCII character without changing its advance.
+fn reserve_body_height(
+    layout: &pango::Layout,
+    attributes: &pango::AttrList,
+    at: usize,
+    body: VerticalMetrics,
+) -> VerticalMetrics {
+    let cell = layout.index_to_pos(i32::try_from(at).unwrap_or(0));
+    let ascent = baseline_at(layout, at) - cell.y();
+    let descent = cell.height() - ascent;
+    let reserved_ascent = ascent.max(body.ascent);
+    let reserved_descent = descent.max(body.descent);
+    if reserved_ascent != ascent || reserved_descent != descent {
+        let logical = pango::Rectangle::new(
+            0,
+            -reserved_ascent,
+            cell.width().abs(),
+            reserved_ascent + reserved_descent,
+        );
+        let ink = pango::Rectangle::new(0, 0, 0, 0);
+        let mut shape = pango::AttrShape::new(&ink, &logical);
+        shape.set_start_index(u32::try_from(at).unwrap_or(0));
+        shape.set_end_index(u32::try_from(at + 1).unwrap_or(u32::MAX));
+        attributes.change(shape);
+    }
+    VerticalMetrics { ascent, descent }
 }
 
 /// The core shares the same math scale between the editor and printing.
@@ -2355,13 +2441,15 @@ fn pieces_shown(pieces: &[Piece], at: usize) -> usize {
     pieces.last().map_or(0, |piece| piece.shown + piece.len)
 }
 
-/// The width of a character of the monospace font that list prefixes use, in pixels.
-fn monospace_width(widget: &gtk::Widget) -> f64 {
+/// The body font's vertical metrics and the width of a monospace column in pixels.
+fn measure_fonts(widget: &gtk::Widget) -> (VerticalMetrics, f64) {
     let layout = widget.create_pango_layout(Some("0"));
+    let ascent = layout.baseline();
+    let body = VerticalMetrics { ascent, descent: layout.size().1 - ascent };
     let mut font = widget.pango_context().font_description().unwrap_or_default();
     font.set_family("monospace");
     layout.set_font_description(Some(&font));
-    f64::from(layout.pixel_size().0)
+    (body, f64::from(layout.pixel_size().0))
 }
 
 /// The cells of the text from `range` on `line`, in the line's coordinates, on its first row.
@@ -2384,9 +2472,14 @@ fn run_rect(line: &Line, range: &Range<usize>) -> graphene::Rect {
 /// Where a shape over `range` goes, in the line's coordinates: a square a little smaller than a
 /// row, in the middle of a box's own source, or on a list item's marker, where its siblings'
 /// bullets are.
-fn marker_rect(line: &Line, range: &Range<usize>) -> graphene::Rect {
+#[allow(clippy::cast_possible_truncation)]
+fn marker_rect(line: &Line, marker: &Marker) -> graphene::Rect {
+    let range = &marker.range;
     let run = run_rect(line, range);
-    let side = (run.height() * 0.8).round();
+    let height = pixels(marker.height) as f32;
+    let side = (height * 0.8).round();
+    let baseline = baseline_at(&line.layout, line.shown(range.start));
+    let top = pixels(baseline - marker.ascent) as f32;
     let own_source = line.layout.text()[line.shown(range.start)..].starts_with('[');
     let center = if own_source {
         run.x() + run.width() / 2.0
@@ -2396,7 +2489,7 @@ fn marker_rect(line: &Line, range: &Range<usize>) -> graphene::Rect {
     };
     graphene::Rect::new(
         (center - side / 2.0).round(),
-        (run.y() + (run.height() - side) / 2.0).round(),
+        (top + (height - side) / 2.0).round(),
         side,
         side,
     )
@@ -2407,22 +2500,24 @@ fn box_border(side: f32) -> f32 {
     (side * 0.1).max(1.5)
 }
 
-/// Draws a bullet or a task box over `range` on `line`, in the line's coordinates.
+/// Draws a bullet or a task box in the line's coordinates.
 fn draw_marker(
     snapshot: &gtk::Snapshot,
     line: &Line,
-    range: &Range<usize>,
-    shape: Shape,
+    marker: &Marker,
     color: &gdk::RGBA,
+    surface_x: f64,
+    device_scale: f64,
 ) {
-    let rect = marker_rect(line, range);
+    let rect = marker_rect(line, marker);
     let side = rect.width();
-    match shape {
+    let border = box_border(side);
+    match marker.shape {
         Shape::TaskBox(checked) => {
             let rounded = gtk::gsk::RoundedRect::from_rect(rect, side * 0.2);
             if !checked {
                 let outline = color.with_alpha(0.55);
-                snapshot.append_border(&rounded, &[box_border(side); 4], &[outline; 4]);
+                snapshot.append_border(&rounded, &[border; 4], &[outline; 4]);
                 return;
             }
             let accent = adw::StyleManager::default().accent_color_rgba();
@@ -2440,7 +2535,6 @@ fn draw_marker(
             snapshot.append_stroke(&check.to_path(), &stroke, &gdk::RGBA::WHITE);
         }
         Shape::Bullet(marker) => {
-            // As wide as the inside of a task box, so bullets and boxes look alike in size.
             let (glyph, weight) = match marker {
                 '*' => ("•", pango::Weight::Normal),
                 '+' => ("＋", pango::Weight::Bold),
@@ -2462,15 +2556,30 @@ fn draw_marker(
                 pixels(ink.width()) as f32,
                 pixels(ink.height()) as f32,
             );
-            let scale = (side - 2.0 * box_border(side)) / ink_width;
+            // Round inward so the glyph fits between the pixels touched by the checkbox border.
+            let inner = rect.inset_r(border, 0.0);
+            let left = ((surface_x + f64::from(inner.x())) * device_scale).ceil();
+            let right = ((surface_x + f64::from(inner.x() + inner.width())) * device_scale).floor();
+            if right <= left {
+                return;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let (left, width) =
+                ((left / device_scale - surface_x) as f32, ((right - left) / device_scale) as f32);
+            let scale = width / ink_width;
+            let center = graphene::Point::new(left + width / 2.0, rect.center().y());
+            let height = rect.height().max(ink_height * scale);
+            let bounds = graphene::Rect::new(left, center.y() - height / 2.0, width, height);
             snapshot.save();
-            snapshot.translate(&rect.center());
+            snapshot.push_clip(&bounds);
+            snapshot.translate(&center);
             snapshot.scale(scale, scale);
             snapshot.translate(&graphene::Point::new(
                 -(ink_x + ink_width / 2.0),
                 -(ink_y + ink_height / 2.0),
             ));
             snapshot.append_layout(&layout, color);
+            snapshot.pop();
             snapshot.restore();
         }
     }
@@ -2577,6 +2686,128 @@ mod tests {
         widget
             .key(gdk::Key::Return, gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
         assert_eq!(widget.text().as_deref(), Some(before.as_str()));
+    }
+
+    #[test]
+    fn list_markers_stay_in_place_as_body_text_appears_and_disappears() {
+        for prefix in ["- ", "* ", "+ ", "- [ ] ", "- [x] ", "1. [ ] "] {
+            let Some(widget) = widget(&format!("{prefix}|\n\nFollowing paragraph")) else { return };
+            let geometry = || {
+                let lines = widget.imp().lines.borrow();
+                let line = &lines[0];
+                let [marker] = line.markers.as_slice() else {
+                    panic!("expected one visible marker for {prefix:?}");
+                };
+                let rect = marker_rect(line, marker);
+                if matches!(marker.shape, Shape::TaskBox(_)) {
+                    let center = rect.center();
+                    assert_eq!(
+                        widget.box_at(
+                            line.left + f64::from(center.x()),
+                            line.y + f64::from(center.y())
+                        ),
+                        Some(marker.range.start)
+                    );
+                }
+                (rect, line.layout.baseline(), lines[2].y)
+            };
+            let empty = geometry();
+            widget.commit_text(" ", gdk::ModifierType::empty());
+            assert_eq!(geometry(), empty, "adding a space after {prefix:?}");
+            widget.commit_text("t", gdk::ModifierType::empty());
+            assert_eq!(geometry(), empty, "adding the first letter after {prefix:?}");
+            widget.key(gdk::Key::BackSpace, gdk::ModifierType::empty());
+            assert_eq!(geometry(), empty, "deleting the first letter after {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn revealing_an_empty_checkbox_keeps_the_row_height_and_baseline() {
+        for task in ["- [ ]", "- [x] ", "-\t[x]", "1. [ ]", "1.\t[x]", "> - [ ]"] {
+            let Some(widget) = widget(&format!("Above\n\n{task}\n\n|Below")) else { return };
+            let font = pango::FontDescription::from_string("Adwaita Sans 11");
+            widget.pango_context().set_font_description(&font);
+            widget.rebuild_layout();
+            let geometry = |revealed| {
+                let lines = widget.imp().lines.borrow();
+                let line = &lines[2];
+                assert_eq!(line.markers.is_empty(), revealed, "{task:?}");
+                if revealed {
+                    assert!(line.layout.text().contains('['), "{task:?}");
+                }
+                (line.layout.baseline(), line.height, lines.last().unwrap().y)
+            };
+            let drawn = geometry(false);
+            let outside = head(&widget);
+            let opening = "Above\n\n".len() + task.find('[').unwrap();
+            widget.edit(|editor| editor.move_to(opening, false));
+            assert_eq!(geometry(true), drawn, "revealing {task:?}");
+            widget.edit(|editor| editor.move_to(outside, false));
+            assert_eq!(geometry(false), drawn, "hiding {task:?}");
+        }
+    }
+
+    #[test]
+    fn painted_bullets_match_the_checkbox_interior_width() {
+        let Some(widget) = widget("- [ ] to do\n- dash\n* dot\n+ plus\n\n|End") else { return };
+        let font = pango::FontDescription::from_string("Adwaita Sans 11");
+        widget.pango_context().set_font_description(&font);
+        widget.rebuild_layout();
+        let lines = widget.imp().lines.borrow();
+        let rows: Vec<_> = lines
+            .iter()
+            .filter_map(|line| line.markers.first().map(|marker| (line, marker)))
+            .collect();
+        let [(line, checkbox), bullets @ ..] = rows.as_slice() else { panic!("expected markers") };
+        assert!(matches!(checkbox.shape, Shape::TaskBox(false)));
+        assert_eq!(bullets.len(), 3);
+        let renderer = gtk::gsk::CairoRenderer::new();
+        renderer.realize(None::<&gdk::Surface>).unwrap();
+        let rect = marker_rect(line, checkbox);
+        let measured = [1.0_f32, 1.25, 2.0].map(|scale| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let size = (64.0 * scale) as usize;
+            let viewport = graphene::Rect::new(0.0, 0.0, 64.0 * scale, 64.0 * scale);
+            let paint = |line: &Line, marker: &Marker| {
+                let snapshot = gtk::Snapshot::new();
+                snapshot.append_color(&gdk::RGBA::BLACK, &viewport);
+                snapshot.scale(scale, scale);
+                snapshot.translate(&graphene::Point::new(25.0, 24.0));
+                draw_marker(&snapshot, line, marker, &gdk::RGBA::WHITE, 25.0, f64::from(scale));
+                let texture = renderer.render_texture(snapshot.to_node().unwrap(), Some(&viewport));
+                let mut bytes = vec![0; size * size * 4];
+                texture.download(&mut bytes, size * 4);
+                bytes
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let center_y = ((rect.center().y() + 24.0) * scale) as usize;
+            let box_pixels = paint(line, checkbox);
+            let box_row = &box_pixels[center_y * size * 4..(center_y + 1) * size * 4];
+            let inside = box_row
+                .chunks_exact(4)
+                .skip_while(|p| p[0] < 64)
+                .skip_while(|p| p[0] >= 64)
+                .take_while(|p| p[0] < 64)
+                .count();
+            let widths: Vec<_> = bullets
+                .iter()
+                .map(|(line, marker)| {
+                    let pixels = paint(line, marker);
+                    let width = (0..size)
+                        .filter(|&x| (0..size).any(|y| pixels[(y * size + x) * 4] >= 64))
+                        .count();
+                    (marker.shape, width)
+                })
+                .collect();
+            (scale, size, inside, widths)
+        });
+        renderer.unrealize();
+        for (scale, size, inside, widths) in measured {
+            assert!(inside > 0 && inside < size / 2);
+            for (shape, width) in widths {
+                assert!(width.abs_diff(inside) <= 1, "{shape:?} at {scale}×: {width} vs {inside}");
+            }
+        }
     }
 
     #[test]
@@ -3512,6 +3743,43 @@ mod tests {
             assert!(up < start, "up from {start} stayed at {up} in {text:?}");
             widget.move_vertically(true, false, 1);
             assert_eq!(head(&widget), start, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn vertical_movement_lands_after_a_drawn_task_box() {
+        let neighboring = "A longer line of text";
+        for task in ["- [ ] ", "- [ ]", "- [x]  ", "1. [ ]", "- [ ] text"] {
+            let text = format!("{neighboring}\n{task}\n{neighboring}|");
+            let Some(widget) = widget(&text) else { return };
+            let end = neighboring.len() + 1 + task.len();
+            let outside = head(&widget);
+            let row_y = {
+                let lines = widget.imp().lines.borrow();
+                lines[1].y + lines[1].height / 2.0
+            };
+            assert_eq!(widget.position_at(580.0, row_y), end, "{task:?}");
+            let box_is_drawn = || {
+                widget.imp().lines.borrow()[1]
+                    .markers
+                    .iter()
+                    .any(|marker| matches!(marker.shape, Shape::TaskBox(_)))
+            };
+            widget.key(gdk::Key::Up, gdk::ModifierType::empty());
+            assert_eq!(head(&widget), end, "{task:?}");
+            assert!(box_is_drawn(), "{task:?}");
+            widget.key(gdk::Key::Up, gdk::ModifierType::empty());
+            assert_eq!(head(&widget), neighboring.len(), "{task:?}");
+            widget.key(gdk::Key::Down, gdk::ModifierType::empty());
+            assert_eq!(head(&widget), end, "{task:?}");
+            assert!(box_is_drawn(), "{task:?}");
+            widget.key(gdk::Key::Down, gdk::ModifierType::empty());
+            assert_eq!(head(&widget), outside, "{task:?}");
+            if !task.ends_with("text") {
+                widget.key(gdk::Key::Up, gdk::ModifierType::empty());
+                widget.key(gdk::Key::Left, gdk::ModifierType::empty());
+                assert!(!box_is_drawn(), "{task:?}");
+            }
         }
     }
 

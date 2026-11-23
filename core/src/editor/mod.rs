@@ -966,15 +966,15 @@ impl Editor {
             return edge;
         }
         // Back onto the hidden source of a task box that takes its marker's place, a move lands
-        // before the item's text, with the box still drawn, and the next one just after the box's
-        // `]`, which shows its source.
+        // before the item's text, with the box still drawn. The next move reveals its source,
+        // stopping inside the brackets if the box ends the line, or just after `]` otherwise.
         if !forward && unit == Unit::Grapheme {
             for task_box in &display.task_boxes {
                 if to == task_box.end && at > task_box.end {
                     return to;
                 }
                 if task_box.start <= to && to < task_box.end && at == task_box.end {
-                    return task_box.start + "[ ]".len();
+                    return to.min(task_box.start + "[ ]".len());
                 }
             }
         }

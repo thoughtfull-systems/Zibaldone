@@ -111,6 +111,8 @@ pub struct Display {
     pub hidden: Vec<Range<usize>>,
     /// The bullets and task boxes to draw, in order.
     pub markers: Vec<Marker>,
+    /// The opening bracket of each task box whose source shows.
+    pub revealed_task_boxes: Vec<usize>,
     /// The hidden source of each task box that takes its list item's marker's place: `[ ]` or
     /// `[x]`, and the space after it. Moves treat it apart from other hidden syntax.
     pub task_boxes: Vec<Range<usize>>,
@@ -119,9 +121,9 @@ pub struct Display {
     pub pads: Vec<(Range<usize>, usize)>,
 }
 
-/// How `text` looks with `selection`, a byte range, selected. An element's syntax shows while the
-/// selection touches it, the cursor at either edge included, and hides otherwise. In a pipe table
-/// that the selection touches, all of it shows, so its columns line up.
+/// How `text` looks with `selection`, a byte range, selected. Syntax usually shows while the
+/// selection touches it, the cursor at either edge included. In a pipe table that the selection
+/// touches, all of it shows, so its columns line up.
 pub fn display(text: &str, selection: &Range<usize>) -> Display {
     with_titles(text, selection, &mut |_| None)
 }
@@ -175,7 +177,7 @@ pub(super) fn with_previews(
         .map(|span| span.range.clone())
         .collect();
     for span in found {
-        let shows = span.touches(selection)
+        let shows = touches_syntax(text, selection, &span)
             || tables.iter().any(|t| t.start <= span.range.start && span.range.end <= t.end);
         let Span { range, style, syntax: pieces } = span;
         let display_math = style == Style::Math && text[range.clone()].starts_with("$$");
@@ -208,7 +210,10 @@ pub(super) fn with_previews(
                 let bullet = text[range.clone()].chars().next().unwrap_or('-');
                 display.markers.push(Marker { range: range.clone(), shape: Shape::Bullet(bullet) });
             }
-            Style::Checkbox(checked) if !shows => {
+            Style::Checkbox(_) if shows => {
+                display.revealed_task_boxes.extend(pieces.last().map(|source| source.start));
+            }
+            Style::Checkbox(checked) => {
                 if let Some(first) = pieces.first() {
                     let shape = Shape::TaskBox(checked);
                     display.markers.push(Marker { range: first.clone(), shape });
@@ -264,6 +269,15 @@ pub(super) fn with_previews(
     }
     drawings::collect(&mut display, text, selection, render, preview);
     display
+}
+
+fn touches_syntax(text: &str, selection: &Range<usize>, span: &Span) -> bool {
+    // A caret after an empty task's closing bracket belongs to the item's text position.
+    let after_empty_task = matches!(span.style, Style::Checkbox(_))
+        && selection.is_empty()
+        && selection.start == span.range.end
+        && matches!(text.as_bytes().get(span.range.end), None | Some(b'\n' | b'\r'));
+    span.touches(selection) && !after_empty_task
 }
 
 impl Label {
@@ -497,6 +511,26 @@ mod tests {
         let on = display(text, &(6..6));
         assert_eq!(on.markers.len(), 2);
         assert_eq!(on.task_boxes, Vec::<Range<usize>>::new());
+    }
+
+    #[test]
+    fn shows_empty_nested_bullets_as_text_on_the_parent_line() {
+        let text = "- -\n* *\n+ +\n\nEnd";
+        let shown = display(text, &(text.len()..text.len()));
+        let markers: Vec<_> = shown.markers.iter().map(|m| (m.range.start, m.shape)).collect();
+        assert_eq!(
+            markers,
+            [(0, Shape::Bullet('-')), (4, Shape::Bullet('*')), (8, Shape::Bullet('+'))]
+        );
+        assert!(shown.hidden.is_empty());
+
+        for (item, nested) in [("- - nested", 2), ("- -\n    continued", 2), ("- outer\n\n  -", 11)]
+        {
+            let text = format!("{item}\n\nEnd");
+            let shown = display(&text, &(text.len()..text.len()));
+            let starts: Vec<_> = shown.markers.iter().map(|m| m.range.start).collect();
+            assert_eq!(starts, [0, nested], "{item:?}");
+        }
     }
 
     #[test]

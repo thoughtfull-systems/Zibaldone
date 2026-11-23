@@ -197,6 +197,11 @@ When the owner picks a target, the editor stores a wikilink with its canonical i
 label. If the owner wraps selected text in `[[` and `]]` first, the editor stores that text as the
 label, with each line break replaced by a space and each backslash, `]`, and `|` escaped.
 
+## Bullets in display editors
+
+When an empty bulleted item starts on its parent's line, display editors show its marker as typed.
+For example, `* *` shows a bullet followed by an asterisk.
+
 ## Platforms
 
 No platform differs. Every app renders bodies from the core's parse tree.

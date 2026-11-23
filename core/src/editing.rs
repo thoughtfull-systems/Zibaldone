@@ -684,8 +684,8 @@ fn list_markers(body: &str) -> Vec<Span> {
     let mut markers = Vec::new();
     // Whether each list that holds the current event is bulleted.
     let mut lists = Vec::new();
-    // Where the marker of each item that holds the current event starts, when it's a bullet.
-    let mut items: Vec<Option<usize>> = Vec::new();
+    // Where each open item starts and whether it has a bullet to draw.
+    let mut items: Vec<(usize, bool)> = Vec::new();
     for (event, range) in Parser::new_ext(body, body::options()).into_offset_iter() {
         match event {
             Event::Start(Tag::List(start)) => lists.push(start.is_none()),
@@ -693,11 +693,17 @@ fn list_markers(body: &str) -> Vec<Span> {
                 lists.pop();
             }
             Event::Start(Tag::Item) => {
+                let start = range.start;
                 let bullet = lists.last() == Some(&true)
-                    && matches!(body.as_bytes().get(range.start), Some(b'*' | b'-' | b'+'));
-                items.push(bullet.then_some(range.start));
+                    && matches!(body.as_bytes().get(start), Some(b'*' | b'-' | b'+'))
+                    // Leave an empty nested item as text when it starts on its parent's line.
+                    && !items.last().is_some_and(|&(parent, _)| {
+                        body[start + 1..range.end].trim_ascii().is_empty()
+                            && !body[parent..start].contains(['\n', '\r'])
+                    });
+                items.push((start, bullet));
                 if bullet {
-                    let marker = range.start..range.start + 1;
+                    let marker = start..start + 1;
                     markers.push(span(body, marker.clone(), Style::ListMarker, vec![marker]));
                 }
             }
@@ -706,7 +712,7 @@ fn list_markers(body: &str) -> Vec<Span> {
             }
             Event::TaskListMarker(checked) => {
                 let style = Style::Checkbox(checked);
-                let Some(&Some(marker)) = items.last() else {
+                let Some(&(marker, true)) = items.last() else {
                     markers.push(span(body, range.clone(), style, vec![range]));
                     continue;
                 };
