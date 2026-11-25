@@ -530,9 +530,7 @@ mod tests {
 
     #[test]
     fn recurrence_editor_preserves_saved_patterns_when_editing_offsets() {
-        if adw::init().is_err() {
-            return;
-        }
+        crate::test_support::init_gtk();
         let rule = Rule {
             mode: Mode::Jump,
             start: "2026-01-01".parse().unwrap(),
@@ -561,9 +559,7 @@ mod tests {
 
     #[test]
     fn recurrence_editor_shows_only_options_for_each_frequency() {
-        if adw::init().is_err() {
-            return;
-        }
+        crate::test_support::init_gtk();
         let rule = Rule {
             mode: Mode::Keep,
             start: "2026-11-21".parse().unwrap(),
@@ -606,9 +602,7 @@ mod tests {
 
     #[test]
     fn recurrence_editor_preserves_the_saved_week_boundary_on_offset_edits() {
-        if adw::init().is_err() {
-            return;
-        }
+        crate::test_support::init_gtk();
         let rule = Rule {
             mode: Mode::Keep,
             start: "2026-11-21".parse().unwrap(),

@@ -14,6 +14,8 @@ pub mod sharing;
 pub mod state;
 pub mod status;
 pub mod tables;
+#[cfg(test)]
+mod test_support;
 pub mod tray;
 pub mod window;
 

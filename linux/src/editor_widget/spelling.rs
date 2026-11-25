@@ -260,6 +260,7 @@ mod tests {
 
     use super::*;
     use crate::editor_widget::pixels;
+    use crate::test_support::{init_gtk, present};
 
     // Omit the second "l" to exercise the correction path.
     const MISSPELLED: &str = concat!("spel", "ing");
@@ -282,9 +283,8 @@ mod tests {
 
     #[test]
     fn spelling_menu_replaces_ignores_in_one_note_and_adds_to_the_space() {
-        if adw::init().is_err() || base_dictionary().is_none() {
-            return;
-        }
+        init_gtk();
+        assert!(base_dictionary().is_some(), "the packaged dictionary loads");
         let space = Rc::new(RefCell::new(Space::create(Id::generate()).unwrap()));
         let source = format!("A **{MISSPELLED}** test with {MISSPELLED}");
         let note = space.borrow_mut().create_note("note", &source).unwrap();
@@ -303,7 +303,7 @@ mod tests {
         });
         widget.set_editor(Some(Editor::new(space.borrow_mut().open_body(note).unwrap())));
         let window = gtk::Window::builder().child(&widget).default_width(400).build();
-        window.present();
+        present(&window);
         wait_until(|| widget.imp().spelling.borrow().misspellings.len() == 2);
 
         let point = |source_index| {

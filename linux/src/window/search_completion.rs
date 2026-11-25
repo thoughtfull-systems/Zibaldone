@@ -260,9 +260,7 @@ mod tests {
 
     #[test]
     fn completing_a_field_preserves_multiline_query_and_undo() {
-        if adw::init().is_err() {
-            return;
-        }
+        crate::test_support::init_gtk();
         let search = gtk::TextView::new();
         let buffer = search.buffer();
         buffer.set_enable_undo(true);
@@ -280,9 +278,7 @@ mod tests {
 
     #[test]
     fn completion_list_measures_its_current_field_names() {
-        if adw::init().is_err() {
-            return;
-        }
+        crate::test_support::init_gtk();
         let chooser = SearchCompletion::new();
         let size = |names: &[&str]| {
             chooser.set_names(&names.iter().map(ToString::to_string).collect::<Vec<_>>());

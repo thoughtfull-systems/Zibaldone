@@ -33,6 +33,7 @@ let
       inherit root;
       fileset = lib.fileset.unions [
         # keep-sorted start
+        (root + "/.config/nextest.toml")
         (root + "/Cargo.lock")
         (root + "/Cargo.toml")
         (root + "/core")
@@ -143,8 +144,14 @@ in
   tests = craneLib.cargoNextest (
     common
     // {
-      inherit cargoArtifacts;
+      # keep-sorted start block=yes
       cargoNextestExtraArgs = "--workspace";
+      inherit cargoArtifacts;
+      nativeBuildInputs = common.nativeBuildInputs ++ [
+        (import ./test-display.nix { inherit pkgs; })
+      ];
+      preCheck = ''export XDG_CACHE_HOME="$TMPDIR/cache"'';
+      # keep-sorted end
     }
   );
 

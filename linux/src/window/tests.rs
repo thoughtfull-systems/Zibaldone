@@ -1,36 +1,7 @@
-use std::time::{Duration, Instant};
-
 use zib_core::channel::Dirs;
 
 use super::*;
-
-/// Drive GTK's queued work without waiting for a display event or the periodic status timer.
-#[track_caller]
-fn until(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready() {
-        assert!(Instant::now() < deadline, "GTK work didn't finish");
-        glib::MainContext::default().iteration(false);
-        std::thread::yield_now();
-    }
-}
-
-/// Present the window and wait for its first frame. GTK maps the window before it draws, but the
-/// compositor shows it only after that frame, and GTK blocks while it waits for the compositor to
-/// place a popover on a window it doesn't show yet.
-fn present(window: &gtk::Window) {
-    window.present();
-    until(|| window.is_mapped());
-    let clock = window.frame_clock().expect("the window's frame clock");
-    let painted = Rc::new(Cell::new(false));
-    let handler = clock.connect_after_paint({
-        let painted = painted.clone();
-        move |_| painted.set(true)
-    });
-    window.queue_draw();
-    until(|| painted.get());
-    clock.disconnect(handler);
-}
+use crate::test_support::{init_gtk, present, until};
 
 fn editor_keys(widget: &EditorWidget) -> gtk::EventControllerKey {
     let controllers = widget.observe_controllers();
@@ -108,9 +79,7 @@ fn reveal_work_addition(window: &Window, button: &str, placeholder: &str) -> gtk
 
 #[test]
 fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -237,9 +206,7 @@ fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
 
 #[test]
 fn inline_additions_keep_focus_drafts_and_project_context() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -363,9 +330,7 @@ fn inline_additions_keep_focus_drafts_and_project_context() {
 
 #[test]
 fn work_rows_align_title_actions_and_details_and_edit_titles_only_on_click() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -492,9 +457,7 @@ fn work_rows_align_title_actions_and_details_and_edit_titles_only_on_click() {
 
 #[test]
 fn results_show_type_details_breadcrumbs_and_all_passages_and_edit_the_correct_space() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -614,9 +577,7 @@ fn results_show_type_details_breadcrumbs_and_all_passages_and_edit_the_correct_s
 fn search_sidebar_resizes_collapses_and_restores_machine_layout() {
     use zib_core::store::SidebarLayout;
 
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -683,9 +644,7 @@ fn search_sidebar_resizes_collapses_and_restores_machine_layout() {
 
 #[test]
 fn task_rows_and_results_share_completion_and_inherited_due_emphasis() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -819,9 +778,7 @@ fn task_rows_and_results_share_completion_and_inherited_due_emphasis() {
 
 #[test]
 fn remote_title_changes_preserve_dirty_inline_drafts() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -964,9 +921,7 @@ fn subproject_row(window: &Window, title: &str) -> Option<gtk::Widget> {
 
 #[test]
 fn subproject_drag_targets_reorder_siblings_without_changing_parents() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -1051,9 +1006,7 @@ fn drop_work_row(source_row: &gtk::Widget, target_row: &gtk::Widget, fraction: f
 
 #[test]
 fn task_drag_targets_reorder_nest_and_reject_descendant_drops() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -1101,9 +1054,7 @@ fn task_drag_targets_reorder_nest_and_reject_descendant_drops() {
 
 #[test]
 fn task_titles_are_compact_preserve_notes_and_flush_pending_edits() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -1181,9 +1132,7 @@ fn task_titles_are_compact_preserve_notes_and_flush_pending_edits() {
 
 #[test]
 fn show_completed_is_saved_per_work_note_and_restored_after_restart() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -1351,9 +1300,7 @@ fn show_completed_is_saved_per_work_note_and_restored_after_restart() {
 
 #[test]
 fn task_dates_show_only_effective_values_and_add_from_the_actions_menu() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -1453,9 +1400,7 @@ fn task_dates_show_only_effective_values_and_add_from_the_actions_menu() {
 
 #[test]
 fn calendar_popovers_sync_typed_dates_selection_and_clear_to_inherit() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -1587,9 +1532,7 @@ fn calendar_popovers_sync_typed_dates_selection_and_clear_to_inherit() {
 
 #[test]
 fn work_status_menus_override_inherit_and_complete_previous_waiting_values() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -1818,9 +1761,7 @@ fn work_status_menus_override_inherit_and_complete_previous_waiting_values() {
 
 #[test]
 fn task_actions_choose_parent_without_an_inline_parent_selector() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -1956,9 +1897,7 @@ fn task_actions_choose_parent_without_an_inline_parent_selector() {
 
 #[test]
 fn deleting_work_cascades_from_task_menu_and_project_header_and_persists() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -2068,9 +2007,7 @@ fn deleting_work_cascades_from_task_menu_and_project_header_and_persists() {
 
 #[test]
 fn parent_popup_filters_projects_and_excludes_cycles_and_tasks() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -2126,9 +2063,7 @@ fn undo(widget: &EditorWidget) {
 
 #[test]
 fn last_note_restores_after_close_and_restart_and_explicit_navigation_takes_precedence() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -2172,9 +2107,7 @@ fn last_note_restores_after_close_and_restart_and_explicit_navigation_takes_prec
 
 #[test]
 fn chat_draft_undo_is_independent_and_transcripts_are_editable_notes() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -2250,9 +2183,7 @@ fn chat_draft_undo_is_independent_and_transcripts_are_editable_notes() {
 
 #[test]
 fn default_editor_edits_the_shared_body_and_keeps_it_through_navigation_and_close() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = std::env::temp_dir().join(format!("zib-window-{}", Id::generate()));
     let dirs = Dirs::under(&root);
@@ -2310,9 +2241,7 @@ fn default_editor_edits_the_shared_body_and_keeps_it_through_navigation_and_clos
 
 #[test]
 fn quick_search_opens_the_result_selected_with_the_arrow_keys() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -2419,9 +2348,7 @@ fn picker_has_recurring_task(list: &gtk::ListBox) -> bool {
 
 #[test]
 fn link_picker_creates_a_note_from_the_search_and_links_to_it() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -2479,9 +2406,7 @@ fn link_picker_creates_a_note_from_the_search_and_links_to_it() {
 
 #[test]
 fn space_dictionary_menu_opens_the_note_created_by_adding_a_word() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -2541,9 +2466,7 @@ fn note_metadata_shows_the_note_id_and_populated_fields_without_selecting_them()
     use zib_core::space::FileHash;
     use zib_core::web_clip::{Clip, Part};
 
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -2683,9 +2606,7 @@ fn note_metadata_shows_the_note_id_and_populated_fields_without_selecting_them()
 
 #[test]
 fn sidebar_search_sorts_matches_and_shows_invalid_values() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
@@ -2728,9 +2649,7 @@ fn sidebar_search_sorts_matches_and_shows_invalid_values() {
 fn saved_sidebar_keeps_drafts_saves_copies_and_restores_after_restart() {
     use zib_core::search::saved::Definition;
 
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(root.path());
@@ -2943,9 +2862,7 @@ fn check_occurrence_comment_focus(window: &Window) {
 
 #[test]
 fn repeating_task_expands_and_opens_occurrence_history() {
-    if adw::init().is_err() {
-        return;
-    }
+    init_gtk();
     let runtime = crate::app::test_runtime();
     let root = tempfile::tempdir().unwrap();
     let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();

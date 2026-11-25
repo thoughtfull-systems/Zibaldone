@@ -1,0 +1,17 @@
+experimental = ["wrapper-scripts"]
+nextest-version = "0.9.98"
+
+[[profile.default.overrides]]
+filter = 'binary_id(=zib-linux)'
+test-group = "test-display"
+
+[[profile.default.scripts]]
+filter = 'binary_id(=zib-linux)'
+run-wrapper = "test-display"
+
+[scripts.wrapper.test-display]
+command = "zib-test-display"
+
+# Each of these tests starts a compositor and renders in software.
+[test-groups.test-display]
+max-threads = 4

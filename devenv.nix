@@ -286,6 +286,7 @@ in
 
   packages = [
     # keep-sorted start
+    (import ./nix/test-display.nix { inherit pkgs; })
     pkgs.cargo-nextest
     pkgs.gtk4
     pkgs.libadwaita

@@ -36,6 +36,9 @@ nextest, and package it with a Nix flake that uses crane.
   compiling it. The core's `bundled-sqlite` feature compiles it for platforms without one, such as
   Android.
 - **Tests.** `cargo nextest run --workspace` runs the tests, in parallel, each in its own process.
+  Each Linux library test gets a private Wayland display with a headless Sway compositor. The
+  development shell and the flake check provide the compositor. Window and popover tests exercise
+  the same Wayland backend as the app and leave the desktop's input focus available to the owner.
 - **Worktrees.** Each worktree keeps its own `target/` directory and compiles Zib's crates
   incrementally. When the development shell starts in a worktree without one, it seeds `target/`
   with copy-on-write copies of the main checkout's build outputs, which take seconds to make and no

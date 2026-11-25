@@ -7,9 +7,10 @@ use zib_core::editor::display::ImageSize;
 
 use super::*;
 use crate::editor_widget::tests::{render, texture};
+use crate::test_support::init_gtk;
 
-fn editor(text: &str) -> Option<(EditorWidget, Space, Id)> {
-    adw::init().ok()?;
+fn editor(text: &str) -> (EditorWidget, Space, Id) {
+    init_gtk();
     let mut space = Space::create(Id::generate()).unwrap();
     let note = space.create_note("note", text).unwrap();
     let mut core = Editor::new(space.open_body(note).unwrap());
@@ -19,7 +20,7 @@ fn editor(text: &str) -> Option<(EditorWidget, Space, Id)> {
     widget.measure(gtk::Orientation::Horizontal, -1);
     widget.measure(gtk::Orientation::Vertical, 600);
     widget.allocate(600, 700, -1, None);
-    Some((widget, space, note))
+    (widget, space, note)
 }
 
 fn selection(space: &Space, note: Id, anchor: usize, head: usize) -> Selection {
@@ -31,7 +32,7 @@ fn selection(space: &Space, note: Id, anchor: usize, head: usize) -> Selection {
 
 #[test]
 fn cursor_notifications_send_the_new_editors_directed_source_selection() {
-    let Some((widget, space, note)) = editor("é **bold**\nend") else { return };
+    let (widget, space, note) = editor("é **bold**\nend");
     let changes = Rc::new(Cell::new(0));
     let count = changes.clone();
     widget.connect_selection_changed(move || count.set(count.get() + 1));
@@ -49,7 +50,7 @@ fn cursor_notifications_send_the_new_editors_directed_source_selection() {
 
 #[test]
 fn remote_highlights_use_hidden_syntax_mapping_and_render_without_revealing_source() {
-    let Some((widget, space, note)) = editor("before **bold** after\nend") else { return };
+    let (widget, space, note) = editor("before **bold** after\nend");
     let machine = Id::generate();
     let renderer = gtk::gsk::CairoRenderer::new();
     renderer.realize(None::<&gdk::Surface>).unwrap();
@@ -75,7 +76,7 @@ fn remote_highlights_use_hidden_syntax_mapping_and_render_without_revealing_sour
 fn image_and_block_selections_cover_the_preview_without_opening_its_source() {
     let image = Id::generate();
     let text = format!("before ![[{image}]] after\n```mermaid\na-->b\n```\nend");
-    let Some((widget, space, note)) = editor(&text) else { return };
+    let (widget, space, note) = editor(&text);
     let (session, _) = widget.image_requests(false);
     widget.set_image(session, image, Some(texture(160, 240)));
     let (session, drawings) = widget.drawing_requests();
@@ -107,7 +108,7 @@ fn image_and_block_selections_cover_the_preview_without_opening_its_source() {
 #[test]
 fn incoming_edits_keep_the_visible_caret_still_and_edit_before_the_notification_is_safe() {
     let text = format!("{}café\n{}", "earlier\n".repeat(35), "later\n".repeat(35));
-    let Some((widget, mut space, note)) = editor(&text) else { return };
+    let (widget, mut space, note) = editor(&text);
     let at = text.find("café").unwrap();
     widget.edit(|e| e.select(at, at + "café".len()));
     let scrolled = gtk::ScrolledWindow::builder().child(&widget).build();
@@ -137,7 +138,7 @@ fn incoming_edits_keep_the_visible_caret_still_and_edit_before_the_notification_
 #[test]
 fn incoming_edits_offscreen_do_not_scroll_to_the_owner_and_note_switches_clear_presence() {
     let text = "line\n".repeat(80);
-    let Some((widget, mut space, note)) = editor(&text) else { return };
+    let (widget, mut space, note) = editor(&text);
     let machine = Id::generate();
     widget.remote_started(machine);
     widget.remote_received(machine, vec![selection(&space, note, 1, 3)]);

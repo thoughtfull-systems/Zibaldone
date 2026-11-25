@@ -2590,11 +2590,11 @@ mod tests {
     use zib_core::editor::{Body, Editor};
 
     use super::*;
+    use crate::test_support::init_gtk;
 
-    /// A widget showing `text`, laid out 600 pixels wide, with the cursor at `|`. `None` without a
-    /// display to lay out on, such as in the Nix build, where these tests have nothing to check.
+    /// A widget showing `text`, laid out 600 pixels wide, with the cursor at `|`.
     pub(super) fn widget(text: &str) -> Option<EditorWidget> {
-        adw::init().ok()?;
+        init_gtk();
         let at = text.find('|')?;
         let mut editor = Editor::new(Body::detached(&text.replace('|', "")));
         editor.select(at, at);
@@ -3626,9 +3626,7 @@ mod tests {
 
     #[test]
     fn clipboards_with_text_prefer_it_over_an_image() {
-        if adw::init().is_err() {
-            return;
-        }
+        init_gtk();
         assert!(image_only(gdk::ContentFormats::for_type(gdk::Texture::static_type())));
         assert!(!image_only(gdk::ContentFormats::for_type(glib::Type::STRING)));
         assert!(!image_only(

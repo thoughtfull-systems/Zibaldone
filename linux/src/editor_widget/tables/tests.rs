@@ -1,13 +1,14 @@
-use gtk::{gdk, glib};
+use gtk::gdk;
 use zib_core::editing::Drawing;
 use zib_core::editor::{Body, Editor};
 
 use super::*;
 use crate::editor_widget::drawings::Content;
 use crate::editor_widget::tests::allocate_viewport;
+use crate::test_support::{init_gtk, present};
 
-fn editor(text: &str, width: i32) -> Option<(EditorWidget, gtk::Window)> {
-    adw::init().ok()?;
+fn editor(text: &str, width: i32) -> (EditorWidget, gtk::Window) {
+    init_gtk();
     let widget = EditorWidget::default();
     let window = gtk::Window::builder().child(&widget).build();
     let mut editor = Editor::new(Body::detached(text));
@@ -21,7 +22,7 @@ fn editor(text: &str, width: i32) -> Option<(EditorWidget, gtk::Window)> {
     widget.measure(gtk::Orientation::Horizontal, -1);
     widget.measure(gtk::Orientation::Vertical, width);
     widget.allocate(width, 700, -1, None);
-    Some((widget, window))
+    (widget, window)
 }
 
 fn grids(editor: &EditorWidget) -> Vec<gtk::Widget> {
@@ -71,7 +72,7 @@ fn pipe_and_list_tables_use_the_existing_grid_headers_and_cell_selection() {
         "| h | other |\n|---|---|\n| a | b |\n\nend",
         "```table\n- - h\n  - other\n- - a\n  - b\n```\nend",
     ] {
-        let Some((editor, _window)) = editor(text, 600) else { return };
+        let (editor, _window) = editor(text, 600);
         let grid = grids(&editor).remove(0);
         assert_eq!(grid.parent().as_ref(), Some(editor.upcast_ref()));
         let native = grid.downcast_ref::<gtk::Grid>().unwrap();
@@ -101,7 +102,7 @@ fn pipe_and_list_tables_use_the_existing_grid_headers_and_cell_selection() {
 #[test]
 fn identical_tables_get_distinct_native_children_and_note_switches_remove_them() {
     let text = "| h |\n|---|\n| a |\n\n| h |\n|---|\n| a |\n\nend";
-    let Some((editor, _window)) = editor(text, 600) else { return };
+    let (editor, _window) = editor(text, 600);
     let grids = grids(&editor);
     assert_eq!(grids.len(), 2);
     assert_ne!(grids[0], grids[1]);
@@ -117,7 +118,7 @@ fn identical_tables_get_distinct_native_children_and_note_switches_remove_them()
 #[test]
 fn small_tables_start_at_the_left_margin() {
     for text in ["| h |\n|---|\n| 1 |\n\nend", "```table\n- - h\n```\n\nend"] {
-        let Some((editor, _window)) = editor(text, 600) else { return };
+        let (editor, _window) = editor(text, 600);
         let grid = grids(&editor).remove(0);
         let bounds = grid.compute_bounds(&editor).unwrap();
         assert!(bounds.width() < 300.0);
@@ -132,7 +133,7 @@ fn arrows_enter_rendered_tables_from_the_nearest_source_line() {
         ("```table\n- - head\n  - cell\n```", "- - head", "```"),
     ] {
         let text = format!("above\n\n{table}\n\nbelow");
-        let Some((editor, _window)) = editor(&text, 600) else { return };
+        let (editor, _window) = editor(&text, 600);
         let keys = gdk::ModifierType::empty();
         editor.key(gdk::Key::Up, keys);
         editor.key(gdk::Key::Up, keys);
@@ -149,7 +150,7 @@ fn arrows_enter_rendered_tables_from_the_nearest_source_line() {
 fn entering_and_leaving_a_table_near_the_title_does_not_extend_the_document() {
     for table in ["| header |\n|---|\n| value |", "```table\n- - header\n- - value\n```"] {
         let text = format!("# Title\n\n{table}\n\nend");
-        let Some((editor, window)) = editor(&text, 600) else { return };
+        let (editor, window) = editor(&text, 600);
         window.set_child(None::<&gtk::Widget>);
         let scrolled = gtk::ScrolledWindow::builder().child(&editor).build();
         allocate_viewport(&scrolled, 600, 700);
@@ -179,7 +180,7 @@ fn narrow_tables_fit_and_scaled_cell_hit_testing_selects_the_right_source() {
         "|---|---|---|---|---|---|---|---|\n",
         "| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |\n\nend"
     );
-    let Some((editor, _window)) = editor(text, 240) else { return };
+    let (editor, _window) = editor(text, 240);
     let grid = grids(&editor).remove(0);
     let bounds = grid.compute_bounds(&editor).unwrap();
     assert!(bounds.width() <= 192.01);
@@ -194,7 +195,7 @@ fn nested_pipe_and_list_table_cells_select_the_inner_source() {
     for inner in ["```table\n- - inner\n  - value\n```", "| inner | value |\n|---|---|"] {
         let text =
             format!("````table\n- - outer\n  - {}\n````\nend", inner.replace('\n', "\n    "));
-        let Some((editor, _window)) = editor(&text, 600) else { return };
+        let (editor, _window) = editor(&text, 600);
         let grid = grids(&editor).remove(0);
         click_label(&editor, &grid, "value");
         assert_eq!(selected(&editor), "value");
@@ -204,7 +205,7 @@ fn nested_pipe_and_list_table_cells_select_the_inner_source() {
 #[test]
 fn table_edits_retain_the_old_grid_until_its_replacement_is_ready() {
     let text = "```table\n- - header\n- - value\n```\nend";
-    let Some((editor, _window)) = editor(text, 600) else { return };
+    let (editor, _window) = editor(text, 600);
     let old = grids(&editor).remove(0);
     click_label(&editor, &old, "value");
     editor.edit(|e| e.insert("changed"));
@@ -225,13 +226,7 @@ fn table_edits_retain_the_old_grid_until_its_replacement_is_ready() {
 
 #[test]
 fn table_snapshots_include_native_borders_and_headers() {
-    // Native child snapshots need a mapped window. Broadway keeps this off the owner's desktop.
-    if std::env::var("GDK_BACKEND").as_deref() != Ok("broadway") {
-        return;
-    }
-    let Some((editor, window)) = editor("| h | other |\n|---|---|\n| a | b |\n\nend", 600) else {
-        return;
-    };
+    let (editor, window) = editor("| h | other |\n|---|---|\n| a | b |\n\nend", 600);
     let provider = gtk::CssProvider::new();
     provider.load_from_string("* { color: #222; }");
     gtk::style_context_add_provider_for_display(
@@ -239,12 +234,7 @@ fn table_snapshots_include_native_borders_and_headers() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
-    window.present();
-    for _ in 0..100 {
-        if !glib::MainContext::default().iteration(false) {
-            break;
-        }
-    }
+    present(&window);
     editor.rebuild_layout();
     editor.measure(gtk::Orientation::Horizontal, -1);
     editor.measure(gtk::Orientation::Vertical, 600);
@@ -270,7 +260,7 @@ fn table_snapshots_include_native_borders_and_headers() {
 fn table_reference_reloads_reject_older_results_and_results_from_other_notes() {
     let id: zib_core::Id = "01k97krzh1fcx9rk9fhsgt1de7".parse().unwrap();
     let text = format!("| [[{id}]] |\n|---|\n\nend");
-    let Some((editor, _window)) = editor(&text, 600) else { return };
+    let (editor, _window) = editor(&text, 600);
     let old = grids(&editor).remove(0);
     let source = editor.imp().editor.borrow().as_ref().unwrap().drawing_targets()[0].clone();
     let session = editor.imp().session.get();
