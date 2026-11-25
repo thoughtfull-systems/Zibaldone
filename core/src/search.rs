@@ -1,6 +1,7 @@
 //! The search index of one space, as decision ZIB0008 describes: SQLite with FTS5 for text, plain
 //! tables for filter fields and backlinks.
 
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -89,6 +90,53 @@ pub struct Hit {
 pub struct Index {
     db: Connection,
     types: Vec<schema::TypeDef>,
+}
+
+/// Finds notes by title word prefixes across spaces, preferring exact titles and recent edits.
+/// A blank query lists the most recently edited notes.
+pub fn search_titles<'a>(
+    indexes: impl IntoIterator<Item = (Id, &'a Index)>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(Id, Hit)>> {
+    let query = query.trim();
+    let words = fts_query(query).map(|words| format!("title : ({words})"));
+    if words.is_none() && !query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = if words.is_some() {
+        "SELECT n.id, n.title, n.updated, n.title = ?2 COLLATE NOCASE AS exact, n.type \
+            FROM text JOIN notes n ON n.id = text.id WHERE text MATCH ?1 \
+            ORDER BY exact DESC, n.updated DESC, n.id LIMIT ?3"
+    } else {
+        "SELECT id, title, updated, 0, type FROM notes ORDER BY updated DESC, id LIMIT ?1"
+    };
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut hits = Vec::new();
+    for (space, index) in indexes {
+        let mut statement = index.db.prepare_cached(sql)?;
+        let mut rows = if let Some(words) = &words {
+            statement.query(params![words, query, sql_limit])?
+        } else {
+            statement.query([sql_limit])?
+        };
+        while let Some(row) = rows.next()? {
+            let note = Id::parse(&row.get::<_, String>(0)?)?;
+            let title: String = row.get(1)?;
+            let updated: i64 = row.get(2)?;
+            let exact: bool = row.get(3)?;
+            let type_name: String = row.get(4)?;
+            hits.push((Reverse(exact), Reverse(updated), note, space, title, type_name));
+        }
+    }
+    hits.sort_unstable();
+    hits.truncate(limit);
+    Ok(hits
+        .into_iter()
+        .map(|(_, _, id, space, title, type_name)| {
+            (space, Hit { id, title, type_name, snippets: Vec::new(), snippet: String::new() })
+        })
+        .collect())
 }
 
 impl Index {
@@ -405,6 +453,38 @@ fn fts_query(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_search_matches_only_titles_and_prioritizes_exact_matches_across_spaces() {
+        let machine = Id::generate();
+        let mut first = Space::create(machine).unwrap();
+        let exact = first.create_note(schema::NOTE, "# Garden").unwrap();
+        let mut second = Space::create(machine).unwrap();
+        let prefix = second.create_note(schema::NOTE, "# Garden plans").unwrap();
+        second.create_note(schema::NOTE, "# Groceries\n\nGarden supplies").unwrap();
+        let mut first_index = Index::in_memory().unwrap();
+        let mut second_index = Index::in_memory().unwrap();
+        first_index.rebuild(&first, &|_| None).unwrap();
+        second_index.rebuild(&second, &|_| None).unwrap();
+        let first = first.id().unwrap();
+        let second = second.id().unwrap();
+        let indexes = [(second, &second_index), (first, &first_index)];
+
+        let titles = |query, limit| {
+            search_titles(indexes, query, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(space, hit)| (space, hit.id, hit.title, hit.type_name))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(titles(" GARDEN ", 1), [(first, exact, "Garden".into(), schema::NOTE.into())]);
+        assert_eq!(
+            titles("garden plan", 20),
+            [(second, prefix, "Garden plans".into(), schema::NOTE.into())]
+        );
+        assert_eq!(search_titles(indexes, "supplies", 20).unwrap(), Vec::new());
+        assert_eq!(search_titles(indexes, "  ", 20).unwrap().len(), 3);
+    }
 
     #[test]
     fn searches_note_types_and_body_text_together() {

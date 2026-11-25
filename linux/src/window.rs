@@ -13,7 +13,7 @@ use zib_core::body;
 use zib_core::editing::{Drawing, LinkTarget};
 use zib_core::render::Kind;
 use zib_core::schema::Value;
-use zib_core::search::{MATCH_END, MATCH_START, Sort};
+use zib_core::search::{Hit, MATCH_END, MATCH_START, Sort};
 use zib_core::sync::{LiveEvent, Selection, SyncState};
 use zib_core::{Channel, Id};
 
@@ -24,6 +24,7 @@ use crate::state::State;
 use crate::tables;
 
 mod project_pane;
+mod quick_search;
 mod results;
 mod search_completion;
 mod search_pane;
@@ -66,6 +67,7 @@ pub struct Inner {
     /// The space the owner last put a note into.
     last_space: Cell<Option<Id>>,
     new_note_menu: gio::Menu,
+    quick_search: gtk::Popover,
     search: gtk::TextView,
     search_completion: SearchCompletion,
     sort: Cell<Sort>,
@@ -126,7 +128,18 @@ struct Editor {
 #[derive(Clone)]
 enum LinkPick {
     Create { space: Id, title: String },
-    Note(Id),
+    Note(PickerNote),
+}
+
+impl LinkPick {
+    fn row(&self, names: &HashMap<Id, String>) -> adw::ActionRow {
+        match self {
+            Self::Create { space, title } => {
+                picker_row(&format!("Create note “{title}”"), *space, names)
+            }
+            Self::Note(note) => note.row(names),
+        }
+    }
 }
 
 impl Window {
@@ -202,6 +215,15 @@ impl Window {
             .tooltip_text("Show or hide search sidebar")
             .build();
         sidebar_toggle.update_property(&[gtk::accessible::Property::Label("Search sidebar")]);
+        let quick_search = gtk::Popover::builder().position(gtk::PositionType::Bottom).build();
+        let popup = quick_search.downgrade();
+        title.connect_unrealize(move |_| {
+            if let Some(popup) = popup.upgrade()
+                && popup.parent().is_some()
+            {
+                popup.unparent();
+            }
+        });
         content_header.pack_start(&sidebar_toggle);
         content_header.pack_start(&new_note);
         content_header.pack_start(&add_file);
@@ -317,6 +339,7 @@ impl Window {
             spaces: RefCell::default(),
             last_space: Cell::new(None),
             new_note_menu,
+            quick_search,
             search,
             search_completion: SearchCompletion::new(),
             sort: Cell::new(Sort::Relevance),
@@ -351,6 +374,7 @@ impl Window {
             body_timer: RefCell::default(),
         }));
         this.connect(&new_note, &add_file, &delete);
+        this.connect_quick_search();
         this.inner().search_completion.connect(&this);
         this.connect_search_sidebar();
         this.connect_search_pane();
@@ -579,7 +603,7 @@ impl Window {
         actions.add_action(&new_note_in);
         self.connect_sort(&actions);
         self.inner().window.insert_action_group("win", Some(&actions));
-        self.connect_history();
+        self.connect_navigation();
     }
 
     fn connect_sort(&self, actions: &gio::SimpleActionGroup) {
@@ -606,16 +630,20 @@ impl Window {
         actions.add_action(&sort);
     }
 
-    /// Lets Alt+Left and Alt+Right, and a mouse's back and forward buttons, walk the history.
-    fn connect_history(&self) {
-        // The capture phase sees Alt+Left and Alt+Right before the editor, which would move by
-        // words.
+    /// Handles navigation shortcuts before the focused widget processes them.
+    fn connect_navigation(&self) {
         let keys = gtk::EventControllerKey::builder()
             .propagation_phase(gtk::PropagationPhase::Capture)
             .build();
         let w = self.clone();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
             let modifiers = modifiers & gtk::accelerator_get_default_mod_mask();
+            if modifiers == gdk::ModifierType::CONTROL_MASK
+                && matches!(key, gdk::Key::o | gdk::Key::O)
+            {
+                w.open_quick_search();
+                return glib::Propagation::Stop;
+            }
             // Ctrl+Tab shows the chat and moves into it, or hides it and returns to the note.
             if modifiers == gdk::ModifierType::CONTROL_MASK && key == gdk::Key::Tab {
                 if w.inner().chat.has_focus() {
@@ -1627,15 +1655,7 @@ impl Window {
         let entry = gtk::SearchEntry::builder().placeholder_text("Link to a note").build();
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
-        // A minimum height keeps several notes in view when the popover has little room.
-        let scroll = gtk::ScrolledWindow::builder()
-            .child(&list)
-            .width_request(360)
-            .min_content_height(240)
-            .max_content_height(320)
-            .propagate_natural_height(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
+        let scroll = picker_scroll(&list);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
         content.append(&entry);
         content.append(&scroll);
@@ -1655,21 +1675,23 @@ impl Window {
                     if generation.get() != mine {
                         return;
                     }
-                    for (_, title, subtitle) in &notes {
-                        let row = adw::ActionRow::builder()
-                            .title(escape(title))
-                            .subtitle(escape(subtitle))
-                            .activatable(true)
-                            .build();
-                        list.append(&row);
+                    let names = w
+                        .inner()
+                        .spaces
+                        .borrow()
+                        .iter()
+                        .map(|(id, name, _)| (*id, name.clone()))
+                        .collect();
+                    for note in &notes {
+                        list.append(&note.row(&names));
                     }
                     // Keep creation visible at the top, but prefer an existing match for Enter.
                     let default =
-                        i32::from(notes.len() > 1 && matches!(notes[0].0, LinkPick::Create { .. }));
+                        i32::from(notes.len() > 1 && matches!(notes[0], LinkPick::Create { .. }));
                     if let Some(row) = list.row_at_index(default) {
                         list.select_row(Some(&row));
                     }
-                    *found.borrow_mut() = notes.into_iter().map(|(pick, _, _)| pick).collect();
+                    *found.borrow_mut() = notes;
                 });
             }
         };
@@ -1695,7 +1717,7 @@ impl Window {
         let selected = list.clone();
         entry.connect_activate(move |_| pick(selected.selected_row().map_or(0, |r| r.index())));
         entry.connect_changed(move |entry| fill(entry.text().to_string()));
-        entry.add_controller(arrow_keys(&list));
+        entry.add_controller(arrow_keys(&list, &scroll));
         let closing = popover.clone();
         entry.connect_stop_search(move |_| closing.popdown());
         popover.connect_closed(move |popover| {
@@ -1712,7 +1734,7 @@ impl Window {
         let (space, title) = match target {
             LinkPick::Create { space, title } => (space, title),
             LinkPick::Note(note) => {
-                on_pick(note);
+                on_pick(note.hit.id);
                 return;
             }
         };
@@ -1732,40 +1754,31 @@ impl Window {
     }
 
     /// Offers recent notes or search results and creation with a nonblank query as the title.
-    /// Each choice comes with its title and destination space.
-    async fn link_candidates(&self, query: String) -> Vec<(LinkPick, String, String)> {
+    async fn link_candidates(&self, query: String) -> Vec<LinkPick> {
         let state = self.inner().state.clone();
-        let names: HashMap<Id, String> =
-            self.inner().spaces.borrow().iter().map(|(id, name, _)| (*id, name.clone())).collect();
         let shown: Vec<Id> = self.shown_spaces().into_iter().map(|(id, _)| id).collect();
         let open = self.inner().editor.borrow().as_ref().map(|e| e.note);
-        let creation = self.current_space_id().filter(|_| !query.trim().is_empty()).map(|space| {
-            let title = query.trim().to_owned();
-            let label = format!("Create note “{title}”");
-            let subtitle = names.get(&space).cloned().unwrap_or_default();
-            (LinkPick::Create { space, title }, label, subtitle)
-        });
-        let found: Vec<(Id, Id, String)> = core(async move {
-            if query.trim().is_empty() {
+        let creation = self
+            .current_space_id()
+            .filter(|_| !query.trim().is_empty())
+            .map(|space| LinkPick::Create { space, title: query.trim().to_owned() });
+        let found = core(async move {
+            let hits = if query.trim().is_empty() {
                 let mut all = Vec::new();
                 for space in shown {
                     let notes = state.notes(space).await.unwrap_or_default();
                     all.extend(notes.into_iter().map(|n| (space, n)));
                 }
                 all.sort_by_key(|(_, note)| std::cmp::Reverse(note.updated));
-                all.into_iter().take(20).map(|(space, n)| (space, n.id, n.plain)).collect()
+                all.into_iter().take(20).map(|(space, note)| (space, note.into())).collect()
             } else {
-                let hits = state.search(&query, 20);
-                hits.into_iter().map(|(space, hit)| (space, hit.id, hit.title)).collect()
-            }
+                state.search(&query, 20)
+            };
+            let hits = hits.into_iter().filter(|(_, hit)| Some(hit.id) != open).collect();
+            picker_notes(&state, hits).await
         })
         .await;
-        let matches =
-            found.into_iter().filter(|(_, id, _)| Some(*id) != open).map(|(space, id, title)| {
-                let title = if title.trim().is_empty() { "Untitled".to_owned() } else { title };
-                (LinkPick::Note(id), title, names.get(&space).cloned().unwrap_or_default())
-            });
-        creation.into_iter().chain(matches).collect()
+        creation.into_iter().chain(found.into_iter().map(LinkPick::Note)).collect()
     }
 
     /// Fills the pane of notes that link to the open note, and hides it when there are none. When
@@ -2118,19 +2131,76 @@ fn snippet_markup(snippet: &str) -> String {
     out
 }
 
+fn picker_scroll(list: &gtk::ListBox) -> gtk::ScrolledWindow {
+    // A minimum height keeps several notes in view when the popover has little room.
+    gtk::ScrolledWindow::builder()
+        .child(list)
+        .width_request(360)
+        .min_content_height(240)
+        .max_content_height(320)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build()
+}
+
+#[derive(Clone)]
+struct PickerNote {
+    hit: Hit,
+    recurring: bool,
+    space: Id,
+}
+
+impl PickerNote {
+    fn row(&self, names: &HashMap<Id, String>) -> adw::ActionRow {
+        let title = if self.hit.title.trim().is_empty() { "Untitled" } else { &self.hit.title };
+        let row = picker_row(title, self.space, names);
+        row.add_suffix(&results::type_pill(&self.hit.type_name));
+        if self.recurring {
+            row.add_suffix(&tasks::recurrence_indicator());
+        }
+        row
+    }
+}
+
+async fn picker_notes(state: &State, hits: Vec<(Id, Hit)>) -> Vec<PickerNote> {
+    let mut notes = Vec::with_capacity(hits.len());
+    for (space, hit) in hits {
+        let recurring = hit.type_name == zib_core::schema::TASK
+            && state.recurrence_rule(space, hit.id).await.is_ok_and(|rule| rule.is_some());
+        notes.push(PickerNote { hit, recurring, space });
+    }
+    notes
+}
+
+fn picker_row(title: &str, space: Id, names: &HashMap<Id, String>) -> adw::ActionRow {
+    adw::ActionRow::builder()
+        .title(escape(title))
+        .title_lines(1)
+        .subtitle(escape(names.get(&space).map_or("", String::as_str)))
+        .subtitle_lines(1)
+        .activatable(true)
+        .build()
+}
+
 /// Lets Up and Down in a search entry move the selection in `list`.
-fn arrow_keys(list: &gtk::ListBox) -> gtk::EventControllerKey {
-    let list = list.clone();
-    let keys = gtk::EventControllerKey::new();
+fn arrow_keys(list: &gtk::ListBox, scroll: &gtk::ScrolledWindow) -> gtk::EventControllerKey {
+    let (list, scroll) = (list.clone(), scroll.downgrade());
+    let keys = gtk::EventControllerKey::builder()
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
     keys.connect_key_pressed(move |_, key, _, _| {
         let step = match key {
-            gdk::Key::Down => 1,
-            gdk::Key::Up => -1,
+            gdk::Key::Down | gdk::Key::KP_Down => 1,
+            gdk::Key::Up | gdk::Key::KP_Up => -1,
             _ => return glib::Propagation::Proceed,
         };
         let at = list.selected_row().map_or(-1, |row| row.index()) + step;
         if let Some(row) = list.row_at_index(at.max(0)) {
             list.select_row(Some(&row));
+            if let (Some(scroll), Some(bounds)) = (scroll.upgrade(), row.compute_bounds(&list)) {
+                let top = f64::from(bounds.y());
+                scroll.vadjustment().clamp_page(top, top + f64::from(bounds.height()));
+            }
         }
         glib::Propagation::Stop
     });

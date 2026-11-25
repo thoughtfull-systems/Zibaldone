@@ -2309,6 +2309,115 @@ fn default_editor_edits_the_shared_body_and_keeps_it_through_navigation_and_clos
 }
 
 #[test]
+fn quick_search_opens_the_result_selected_with_the_arrow_keys() {
+    if adw::init().is_err() {
+        return;
+    }
+    let runtime = crate::app::test_runtime();
+    let root = tempfile::tempdir().unwrap();
+    let state = runtime.block_on(State::for_test(Dirs::under(root.path()))).unwrap();
+    let (space, exact, longer) = runtime.block_on(async {
+        let space = state.spaces().await[0].0;
+        let exact = state.create_note(space, "# Garden").await.unwrap();
+        let longer = state.create_note(space, "# Garden plans").await.unwrap();
+        state.create_note(space, "# Groceries\n\nGarden supplies").await.unwrap();
+        add_recurring_picker_task(&state, space).await;
+        (space, exact, longer)
+    });
+    let app = adw::Application::builder()
+        .application_id("systems.thoughtfull.Zibaldone.QuickSearchTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let window = Window::new(&app, state.clone());
+    present(window.inner().window.upcast_ref());
+    window.open_note(space, exact);
+    until(|| !window.shown_spaces().is_empty() && window.current_space_id() == Some(space));
+
+    assert!(window.inner().widget.grab_focus());
+    let controllers = window.inner().window.observe_controllers();
+    let shortcuts = (0..controllers.n_items())
+        .filter_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerKey>().ok())
+        .find(|keys| keys.propagation_phase() == gtk::PropagationPhase::Capture)
+        .unwrap();
+    assert!(shortcuts.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::o, &0u32, &gdk::ModifierType::CONTROL_MASK],
+    ));
+    let popup = &window.inner().quick_search;
+    assert_eq!(popup.parent().as_ref(), Some(window.inner().title.upcast_ref()));
+    let widgets = descendants(popup);
+    let entry =
+        widgets.iter().find_map(|widget| widget.downcast_ref::<gtk::SearchEntry>()).unwrap();
+    let list = widgets.iter().find_map(|widget| widget.downcast_ref::<gtk::ListBox>()).unwrap();
+    until(|| list.row_at_index(2).is_some());
+    let focus = gtk::prelude::RootExt::focus(&window.inner().window).unwrap();
+    assert!(focus.is_ancestor(entry) || &focus == entry.upcast_ref::<gtk::Widget>());
+    entry.set_text("Recurring review");
+    until(|| picker_has_recurring_task(list));
+    entry.set_text("Garden");
+    until(|| list.row_at_index(1).is_some());
+    assert!(list.row_at_index(2).is_none());
+    assert_eq!(list.selected_row().unwrap().index(), 0);
+    assert_eq!(picker_badges(&list.selected_row().unwrap()), (Some("note".into()), false));
+
+    let controllers = entry.observe_controllers();
+    let arrows = (0..controllers.n_items())
+        .filter_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerKey>().ok())
+        .find(|keys| keys.propagation_phase() == gtk::PropagationPhase::Capture)
+        .unwrap();
+    assert!(arrows.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::Down, &0u32, &gdk::ModifierType::empty()],
+    ));
+    assert_eq!(list.selected_row().unwrap().index(), 1);
+    entry.emit_by_name::<()>("activate", &[]);
+    until(|| window.inner().editor.borrow().as_ref().is_some_and(|editor| editor.note == longer));
+    until(|| !popup.is_mapped());
+    window.go(true);
+    until(|| window.inner().editor.borrow().as_ref().is_some_and(|editor| editor.note == exact));
+    window.close_editor();
+    runtime.block_on(state.finish());
+    window.inner().window.destroy();
+}
+
+async fn add_recurring_picker_task(state: &State, space: Id) {
+    use zib_core::recurrence::{Mode, Rule};
+
+    let task = state.create_work(space, "task", "Recurring review", None).await.unwrap();
+    let rule = Rule {
+        due: None,
+        mode: Mode::Keep,
+        pattern: "FREQ=DAILY;COUNT=1".into(),
+        scheduled: Some(0),
+        start: zib_core::recurrence::today(),
+    };
+    let replacement = state.recurrence_replacement(space, task, Some(rule.clone())).await.unwrap();
+    state.set_recurrence(space, task, Some(rule), replacement).await.unwrap();
+}
+
+fn picker_badges(row: &gtk::ListBoxRow) -> (Option<String>, bool) {
+    let widgets = descendants(row);
+    let pill = widgets.iter().find_map(|widget| {
+        widget
+            .has_css_class("zib-type-pill")
+            .then(|| widget.downcast_ref::<gtk::Label>().unwrap().text().to_string())
+    });
+    let recurring = widgets.iter().any(|widget| {
+        widget.downcast_ref::<gtk::Image>().is_some_and(|image| {
+            image.icon_name().as_deref() == Some("media-playlist-repeat-symbolic")
+        })
+    });
+    (pill, recurring)
+}
+
+fn picker_has_recurring_task(list: &gtk::ListBox) -> bool {
+    (0..)
+        .map_while(|index| list.row_at_index(index))
+        .any(|row| picker_badges(&row) == (Some("task".into()), true))
+}
+
+#[test]
 fn link_picker_creates_a_note_from_the_search_and_links_to_it() {
     if adw::init().is_err() {
         return;
@@ -2319,6 +2428,7 @@ fn link_picker_creates_a_note_from_the_search_and_links_to_it() {
     let (space, source) = runtime.block_on(async {
         let space = state.spaces().await[0].0;
         state.create_note(space, "Existing topic").await.unwrap();
+        add_recurring_picker_task(&state, space).await;
         (space, state.create_note(space, "See [[").await.unwrap())
     });
     let app = adw::Application::builder()
@@ -2327,7 +2437,7 @@ fn link_picker_creates_a_note_from_the_search_and_links_to_it() {
         .build();
     app.register(None::<&gio::Cancellable>).unwrap();
     let window = Window::new(&app, state.clone());
-    window.inner().window.present();
+    present(window.inner().window.upcast_ref());
     window.open_note(space, source);
     let widget = &window.inner().widget;
     until(|| {
@@ -2341,8 +2451,11 @@ fn link_picker_creates_a_note_from_the_search_and_links_to_it() {
     let viewport = scroll.child().unwrap().downcast::<gtk::Viewport>().unwrap();
     let list = viewport.child().unwrap().downcast::<gtk::ListBox>().unwrap();
 
+    search.set_text("Recurring review");
+    until(|| picker_has_recurring_task(&list));
     search.set_text("Existing topic");
     until(|| list.selected_row().is_some_and(|row| row.index() == 1));
+    assert_eq!(picker_badges(&list.selected_row().unwrap()), (Some("note".into()), false));
     search.set_text("  New topic & details  ");
     until(|| list.selected_row().is_some_and(|row| row.index() == 0));
     search.emit_by_name::<()>("activate", &[]);

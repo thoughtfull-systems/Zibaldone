@@ -49,16 +49,11 @@ impl Window {
                         };
                         order.then_with(|| a.id.cmp(&b.id)).then_with(|| a_space.cmp(b_space))
                     });
-                    rows.extend(notes.into_iter().map(|(space, note)| ResultItem {
-                        hit: Hit {
-                            id: note.id,
-                            title: note.plain,
-                            type_name: note.type_name,
-                            snippets: Vec::new(),
-                            snippet: String::new(),
-                        },
-                        space,
-                    }));
+                    rows.extend(
+                        notes
+                            .into_iter()
+                            .map(|(space, note)| ResultItem { hit: note.into(), space }),
+                    );
                 } else {
                     let ids: Vec<_> = spaces.iter().map(|(id, _)| *id).collect();
                     rows.extend(
@@ -126,7 +121,6 @@ impl Window {
         tree: Option<&Tree>,
         names: &HashMap<Id, String>,
     ) -> gtk::ListBoxRow {
-        style();
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
@@ -145,10 +139,7 @@ impl Window {
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build(),
         );
-        let pill = gtk::Label::new(Some(&item.hit.type_name));
-        pill.add_css_class("caption");
-        pill.add_css_class("zib-type-pill");
-        heading.append(&pill);
+        heading.append(&type_pill(&item.hit.type_name));
         if tree.is_some_and(|tree| tree.recurrence_rules.contains_key(&item.hit.id)) {
             heading.append(&super::tasks::recurrence_indicator());
         }
@@ -194,6 +185,15 @@ impl Window {
         }
         row
     }
+}
+
+pub(super) fn type_pill(type_name: &str) -> gtk::Label {
+    style();
+    gtk::Label::builder()
+        .label(type_name)
+        .css_classes(["caption", "zib-type-pill"])
+        .valign(gtk::Align::Center)
+        .build()
 }
 
 fn style() {

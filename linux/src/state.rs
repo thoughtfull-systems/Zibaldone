@@ -17,7 +17,7 @@ use zib_core::net::{Nearby, Network, Node, OpenNote, Pairing};
 use zib_core::pairing::{Invite, Paired, Party};
 use zib_core::render::{Image, Kind, Renderer};
 use zib_core::schema::{self, Value};
-use zib_core::search::{Hit, Index, Sort, field_names, search_indexes};
+use zib_core::search::{Hit, Index, Sort, field_names, search_indexes, search_titles};
 use zib_core::space::{FileHash, Machine, Note, Policy};
 use zib_core::store::Store;
 use zib_core::sync::{Exchanged, SyncState};
@@ -95,6 +95,18 @@ pub struct NoteRow {
     pub plain: String,
     pub updated: i64,
     pub type_name: String,
+}
+
+impl From<NoteRow> for Hit {
+    fn from(note: NoteRow) -> Self {
+        Self {
+            id: note.id,
+            title: note.plain,
+            type_name: note.type_name,
+            snippets: Vec::new(),
+            snippet: String::new(),
+        }
+    }
 }
 
 /// The running instance.
@@ -718,6 +730,20 @@ impl State {
     pub(crate) fn search_fields(&self, spaces: &[Id]) -> Vec<String> {
         let indexes = self.indexes.lock().expect("unpoisoned");
         field_names(spaces.iter().filter_map(|id| indexes.get(id)))
+    }
+
+    pub(crate) fn search_titles(
+        &self,
+        spaces: &[Id],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(Id, Hit)>> {
+        let indexes = self.indexes.lock().expect("unpoisoned");
+        search_titles(
+            spaces.iter().filter_map(|id| indexes.get(id).map(|index| (*id, index))),
+            query,
+            limit,
+        )
     }
 
     /// Searches the note list's spaces, applying the query and sort before the limit.
