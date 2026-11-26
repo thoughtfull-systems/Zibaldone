@@ -175,6 +175,7 @@ pub fn built_in() -> Vec<TypeDef> {
     };
     let work_fields = |task| {
         let mut fields: BTreeMap<String, FieldDef> = [
+            ("completed-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
             ("due-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
             ("parent-id", FieldDef::new(Kind::Link, SearchMode::Filter)),
             ("scheduled-on", FieldDef::new(Kind::Date, SearchMode::Filter)),
@@ -191,7 +192,7 @@ pub fn built_in() -> Vec<TypeDef> {
         .map(|(name, def)| (name.into(), def))
         .collect();
         if task {
-            for field in ["completed-on", "recurrence-on", "skipped-on", "superseded-on"] {
+            for field in ["recurrence-on", "skipped-on", "superseded-on"] {
                 fields.insert(field.into(), FieldDef::new(Kind::Date, SearchMode::Filter));
             }
             fields.insert("recurrence".into(), FieldDef::new(Kind::Boolean, SearchMode::Filter));

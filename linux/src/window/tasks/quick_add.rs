@@ -10,7 +10,7 @@ use zib_core::schema;
 
 use crate::app::core;
 
-use super::{Window, drag, task_expander};
+use super::{Window, work_expander};
 
 #[derive(Clone, Copy)]
 pub(super) enum Section {
@@ -36,7 +36,7 @@ impl Section {
         }
     }
 
-    fn kind(self) -> &'static str {
+    pub(super) fn kind(self) -> &'static str {
         if matches!(self, Self::Subprojects) { schema::PROJECT } else { schema::TASK }
     }
 }
@@ -71,37 +71,17 @@ impl Window {
                 .placeholder_text(name)
                 .truncate_multiline(true)
                 .build();
+            entry.add_css_class("zib-work-addition");
             entry.update_property(&[gtk::accessible::Property::Label(name)]);
-            let row = gtk::Grid::builder().column_spacing(4).build();
-            let project = kind == schema::PROJECT;
-            let prefix = gtk::Box::new(gtk::Orientation::Horizontal, if project { 4 } else { 2 });
-            prefix.append(&drag::handle());
-            if !project {
-                prefix.append(&task_expander(false));
-                let completed = gtk::CheckButton::new();
-                completed.add_css_class("zib-task-completion");
-                prefix.append(&completed);
-            }
-            let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-            let open = gtk::Button::from_icon_name("go-next-symbolic");
-            let menu = gtk::MenuButton::builder().icon_name("view-more-symbolic").build();
-            open.add_css_class("flat");
-            menu.add_css_class("flat");
-            actions.append(&open);
-            actions.append(&menu);
-            for spacer in [&prefix, &actions] {
-                spacer.set_opacity(0.0);
-                spacer.set_sensitive(false);
-                spacer.set_can_target(false);
-                spacer.update_state(&[gtk::accessible::State::Hidden(true)]);
-            }
-            let work = &self.inner().work;
-            let alignment = if project { &work.project_prefix } else { &work.task_prefix };
-            alignment.add_widget(&prefix);
-            work.row_actions.add_widget(&actions);
-            row.attach(&prefix, 0, 0, 1, 1);
+            let row = gtk::Grid::new();
+            let expander = work_expander(false, kind == schema::PROJECT);
+            expander.set_opacity(0.0);
+            expander.set_sensitive(false);
+            expander.set_can_target(false);
+            expander.update_state(&[gtk::accessible::State::Hidden(true)]);
+            self.inner().work.row_expanders.add_widget(&expander);
+            row.attach(&expander, 0, 0, 1, 1);
             row.attach(&entry, 1, 0, 1, 1);
-            row.attach(&actions, 2, 0, 1, 1);
             let add = Rc::new(AddRow {
                 busy: Cell::new(false),
                 button,

@@ -1,4 +1,4 @@
-//! Drag handles reorder projects and reorder or nest tasks within their lists.
+//! Dragging work titles reorders or nests items within their lists.
 
 use adw::prelude::*;
 use gtk::{gdk, glib};
@@ -21,20 +21,18 @@ struct WorkDrag {
 enum Zone {
     After,
     Before,
-    Subtask,
+    Child,
 }
 
 impl Zone {
-    fn at(y: f64, height: i32, project: bool) -> Self {
+    fn at(y: f64, height: i32) -> Self {
         let fraction = y / f64::from(height.max(1));
-        if project {
-            if fraction < 0.5 { Self::Before } else { Self::After }
-        } else if fraction < 0.25 {
+        if fraction < 0.25 {
             Self::Before
         } else if fraction > 0.75 {
             Self::After
         } else {
-            Self::Subtask
+            Self::Child
         }
     }
 
@@ -42,7 +40,7 @@ impl Zone {
         match self {
             Self::After => "zib-task-after",
             Self::Before => "zib-task-before",
-            Self::Subtask => "zib-task-subtask",
+            Self::Child => "zib-task-subtask",
         }
     }
 }
@@ -56,12 +54,9 @@ fn destination(tree: &Tree, note: Id, target: Id, zone: Zone) -> Option<(Option<
     if moving.note.type_name != target_item.note.type_name {
         return None;
     }
-    if moving.note.type_name == schema::PROJECT && moving.parent != target_item.parent {
-        return None;
-    }
     match zone {
         Zone::Before => Some((target_item.parent, Some(target))),
-        Zone::Subtask => (moving.note.type_name == schema::TASK).then_some((Some(target), None)),
+        Zone::Child => Some((Some(target), None)),
         Zone::After => {
             let parent = target_item.parent?;
             let siblings: Vec<_> = tree
@@ -82,34 +77,24 @@ fn clear_indicator(widget: &gtk::Widget) {
     }
 }
 
-pub(super) fn handle() -> gtk::Image {
-    let handle = gtk::Image::from_icon_name("list-drag-handle-symbolic");
-    handle.add_css_class("dim-label");
-    handle.set_valign(gtk::Align::Center);
-    handle
-}
-
 impl Window {
-    pub(super) fn work_drag_handle(&self, row: &gtk::Box, space: Id, item: &Item) {
-        let handle = handle();
-        handle.set_cursor_from_name(Some("grab"));
-        let tooltip = if item.note.type_name == schema::PROJECT {
-            "Drag to reorder subprojects"
-        } else {
-            "Drag to reorder · Drop at a row's edge to reorder, or its middle to make a subtask"
-        };
-        handle.set_tooltip_text(Some(tooltip));
+    pub(super) fn work_drag_source(&self, button: &gtk::Button, space: Id, note: Id) {
         let source = gtk::DragSource::builder().actions(gdk::DragAction::MOVE).build();
-        let payload = WorkDrag { note: item.note.id, space };
+        let payload = WorkDrag { note, space };
         source.connect_prepare(move |_, _, _| {
             Some(gdk::ContentProvider::for_value(&payload.to_value()))
         });
-        let (w, title) = (self.clone(), item.title.clone());
-        source.connect_drag_begin(move |_, drag| {
+        let w = self.clone();
+        source.connect_drag_begin(move |source, drag| {
+            w.cancel_work_title_open();
             w.inner().work.dragging.set(true);
-            let label = gtk::Label::new(Some(&title));
-            label.add_css_class("card");
-            gtk::DragIcon::for_drag(drag).set_child(Some(&label));
+            if let Some(title) =
+                source.widget().and_then(|button| button.first_child()).and_downcast::<gtk::Label>()
+            {
+                let label = gtk::Label::new(Some(&title.text()));
+                label.add_css_class("card");
+                gtk::DragIcon::for_drag(drag).set_child(Some(&label));
+            }
         });
         let w = self.clone();
         source.connect_drag_end(move |_, _, _| {
@@ -118,8 +103,7 @@ impl Window {
                 w.refresh_work();
             }
         });
-        handle.add_controller(source);
-        row.append(&handle);
+        button.add_controller(source);
     }
 
     pub(super) fn work_drop_target(&self, row: &gtk::Box, space: Id, item: &Item) {
@@ -128,12 +112,9 @@ impl Window {
         let target = gtk::DropTarget::new(WorkDrag::static_type(), gdk::DragAction::MOVE);
         target.set_preload(true);
         let w = self.clone();
-        target
-            .connect_enter(move |target, _, y| w.work_drop_motion(target, space, note, y, project));
+        target.connect_enter(move |target, _, y| w.work_drop_motion(target, space, note, y));
         let w = self.clone();
-        target.connect_motion(move |target, _, y| {
-            w.work_drop_motion(target, space, note, y, project)
-        });
+        target.connect_motion(move |target, _, y| w.work_drop_motion(target, space, note, y));
         target.connect_leave(|target| {
             if let Some(widget) = target.widget() {
                 clear_indicator(&widget);
@@ -147,7 +128,7 @@ impl Window {
             if payload.space != space {
                 return false;
             }
-            let zone = Zone::at(y, widget.height(), project);
+            let zone = Zone::at(y, widget.height());
             let location = destination(&w.inner().work.tree.borrow(), payload.note, note, zone);
             let Some((parent, before)) = location else { return false };
             w.move_work(space, payload.note, parent, before, project);
@@ -162,14 +143,13 @@ impl Window {
         space: Id,
         note: Id,
         y: f64,
-        project: bool,
     ) -> gdk::DragAction {
         let Some(widget) = target.widget() else { return gdk::DragAction::empty() };
         clear_indicator(&widget);
         let Some(payload) = target.value().and_then(|v| v.get::<WorkDrag>().ok()) else {
             return gdk::DragAction::empty();
         };
-        let zone = Zone::at(y, widget.height(), project);
+        let zone = Zone::at(y, widget.height());
         if payload.space == space
             && destination(&self.inner().work.tree.borrow(), payload.note, note, zone).is_some()
         {
@@ -190,20 +170,15 @@ impl Window {
     ) {
         let (w, state) = (self.clone(), self.inner().state.clone());
         glib::spawn_future_local(async move {
-            let saved = core(async move {
-                if project {
-                    state.reorder_project(space, note, before).await
-                } else {
-                    state.move_task(space, note, parent, before).await
-                }
-            })
-            .await;
+            let saved =
+                core(async move { state.move_work(space, note, parent, before, project).await })
+                    .await;
             match saved {
                 Ok(()) => {
+                    if let Some(parent) = parent {
+                        w.inner().work.expanded.borrow_mut().insert(parent);
+                    }
                     if !project {
-                        if let Some(parent) = parent {
-                            w.inner().work.expanded.borrow_mut().insert(parent);
-                        }
                         w.inner().work.selected.set(Some(note));
                     }
                     w.refresh_work();

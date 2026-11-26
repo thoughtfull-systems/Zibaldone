@@ -74,10 +74,6 @@ impl Chat {
         root.add_top_bar(&header);
         let model = model_picker();
         let history = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        history.set_margin_start(12);
-        history.set_margin_end(12);
-        history.set_margin_top(12);
-        history.set_margin_bottom(12);
         let scroll = gtk::ScrolledWindow::builder()
             .child(&history)
             .vexpand(true)
@@ -95,8 +91,7 @@ impl Chat {
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
-        let message =
-            gtk::Label::builder().wrap(true).xalign(0.0).margin_start(12).margin_end(12).build();
+        let message = gtk::Label::builder().wrap(true).xalign(0.0).build();
         message.add_css_class("dim-label");
         let send = gtk::Button::with_label("Send");
         send.set_tooltip_text(Some("Send (Ctrl+Enter)"));
@@ -105,12 +100,17 @@ impl Chat {
         let retry = gtk::Button::with_label("Retry");
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         buttons.set_halign(gtk::Align::End);
-        buttons.set_margin_end(12);
-        buttons.set_margin_bottom(12);
         buttons.append(&retry);
         buttons.append(&stop);
         buttons.append(&send);
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_bottom(12)
+            .margin_end(12)
+            .margin_start(12)
+            .margin_top(12)
+            .build();
         content.append(&model.widget);
         content.append(&scroll);
         content.append(&message);

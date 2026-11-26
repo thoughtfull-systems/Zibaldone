@@ -5,6 +5,7 @@ pub mod adding;
 pub mod app;
 pub mod bottom_pane;
 pub mod chat;
+mod checkbox;
 pub mod derive;
 pub mod editor_widget;
 pub mod icon;
@@ -13,6 +14,7 @@ pub mod settings;
 pub mod sharing;
 pub mod state;
 pub mod status;
+mod style;
 pub mod tables;
 #[cfg(test)]
 mod test_support;

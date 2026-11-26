@@ -21,9 +21,11 @@ use zib_core::editing::{Drawing, LinkTarget, link_at};
 use zib_core::editor::display::{Display, ImageSize, Look, Rendered, Shape};
 use zib_core::editor::{Direction, EditTarget, Editor, ListKey, Unit};
 
+use crate::checkbox;
+
 /// Space around the text, in pixels, as the text view has.
 const MARGIN_SIDES: f64 = 24.0;
-const MARGIN_TOP: f64 = 16.0;
+const MARGIN_TOP: f64 = 24.0;
 const MARGIN_BOTTOM: f64 = 24.0;
 /// The width of the caret, in pixels.
 const CARET: f32 = 1.5;
@@ -2477,7 +2479,7 @@ fn marker_rect(line: &Line, marker: &Marker) -> graphene::Rect {
     let range = &marker.range;
     let run = run_rect(line, range);
     let height = pixels(marker.height) as f32;
-    let side = (height * 0.8).round();
+    let side = checkbox::side(height);
     let baseline = baseline_at(&line.layout, line.shown(range.start));
     let top = pixels(baseline - marker.ascent) as f32;
     let own_source = line.layout.text()[line.shown(range.start)..].starts_with('[');
@@ -2495,11 +2497,6 @@ fn marker_rect(line: &Line, marker: &Marker) -> graphene::Rect {
     )
 }
 
-/// The width of the border of a task box whose side is `side`.
-fn box_border(side: f32) -> f32 {
-    (side * 0.1).max(1.5)
-}
-
 /// Draws a bullet or a task box in the line's coordinates.
 fn draw_marker(
     snapshot: &gtk::Snapshot,
@@ -2511,29 +2508,8 @@ fn draw_marker(
 ) {
     let rect = marker_rect(line, marker);
     let side = rect.width();
-    let border = box_border(side);
     match marker.shape {
-        Shape::TaskBox(checked) => {
-            let rounded = gtk::gsk::RoundedRect::from_rect(rect, side * 0.2);
-            if !checked {
-                let outline = color.with_alpha(0.55);
-                snapshot.append_border(&rounded, &[border; 4], &[outline; 4]);
-                return;
-            }
-            let accent = adw::StyleManager::default().accent_color_rgba();
-            snapshot.push_rounded_clip(&rounded);
-            snapshot.append_color(&accent, &rect);
-            snapshot.pop();
-            let (x, y) = (rect.x(), rect.y());
-            let check = gtk::gsk::PathBuilder::new();
-            check.move_to(x + side * 0.26, y + side * 0.52);
-            check.line_to(x + side * 0.43, y + side * 0.69);
-            check.line_to(x + side * 0.75, y + side * 0.33);
-            let stroke = gtk::gsk::Stroke::new(side * 0.13);
-            stroke.set_line_cap(gtk::gsk::LineCap::Round);
-            stroke.set_line_join(gtk::gsk::LineJoin::Round);
-            snapshot.append_stroke(&check.to_path(), &stroke, &gdk::RGBA::WHITE);
-        }
+        Shape::TaskBox(checked) => checkbox::draw(snapshot, rect, color, checked),
         Shape::Bullet(marker) => {
             let (glyph, weight) = match marker {
                 '*' => ("•", pango::Weight::Normal),
@@ -2557,7 +2533,7 @@ fn draw_marker(
                 pixels(ink.height()) as f32,
             );
             // Round inward so the glyph fits between the pixels touched by the checkbox border.
-            let inner = rect.inset_r(border, 0.0);
+            let inner = rect.inset_r(checkbox::border(side), 0.0);
             let left = ((surface_x + f64::from(inner.x())) * device_scale).ceil();
             let right = ((surface_x + f64::from(inner.x() + inner.width())) * device_scale).floor();
             if right <= left {
@@ -2745,6 +2721,79 @@ mod tests {
             widget.edit(|editor| editor.move_to(outside, false));
             assert_eq!(geometry(false), drawn, "hiding {task:?}");
         }
+    }
+
+    #[test]
+    fn gtk_checkboxes_match_markdown_at_each_font_size() {
+        init_gtk();
+        let settings = gtk::Settings::default().unwrap();
+        settings.set_gtk_enable_animations(false);
+        settings.set_gtk_font_name(Some("Adwaita Sans 11"));
+        let check = gtk::CheckButton::with_label("A native checkbox");
+        let indicator = check.first_child().unwrap();
+        let label = check.last_child().unwrap().downcast::<gtk::Label>().unwrap();
+        assert_eq!(indicator.css_name(), "check");
+        let editor = widget("- [x] A Markdown checkbox\n\n|End").unwrap();
+        let panes = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        panes.append(&check);
+        panes.append(&gtk::ScrolledWindow::builder().child(&editor).vexpand(true).build());
+        let window =
+            gtk::Window::builder().child(&panes).default_width(300).default_height(150).build();
+        crate::test_support::present(&window);
+        let renderer = window.renderer().unwrap();
+
+        let sizes = ["Adwaita Sans 11", "Adwaita Sans 16"].map(|font| {
+            settings.set_gtk_font_name(Some(font));
+            editor.rebuild_layout();
+            crate::test_support::present(&window);
+            let (markdown, markdown_gap, markdown_rise) = {
+                let lines = editor.imp().lines.borrow();
+                let line = &lines[0];
+                let marker = &line.markers[0];
+                let rect = marker_rect(line, marker);
+                let start = i32::try_from(line.shown(marker.range.end)).unwrap();
+                let gap = pixels(line.layout.index_to_pos(start).x());
+                let rise = pixels(line.layout.baseline()) - f64::from(rect.center().y());
+                (rect, gap - f64::from(rect.x() + rect.width()), rise)
+            };
+            let native = indicator.compute_bounds(&check).unwrap();
+            let (x, y) = label.layout_offsets();
+            let bounds = label.compute_bounds(&check).unwrap();
+            let gap = f64::from(bounds.x() - native.x() - native.width()) + f64::from(x);
+            let rise = f64::from(bounds.y() - native.center().y())
+                + f64::from(y)
+                + pixels(label.layout().baseline());
+            assert_eq!((native.width(), native.height()), (markdown.width(), markdown.height()));
+            assert!((gap - markdown_gap).abs() <= 0.5, "gap at {font}: {gap} vs. {markdown_gap}");
+            assert!(
+                (rise - markdown_rise).abs() <= 0.5,
+                "rise at {font}: {rise} vs. {markdown_rise}"
+            );
+
+            let paint = |checked| {
+                check.set_active(checked);
+                crate::test_support::present(&window);
+                let snapshot = gtk::Snapshot::new();
+                check.snapshot_child(&indicator, &snapshot);
+                let texture = renderer.render_texture(snapshot.to_node().unwrap(), Some(&native));
+                let stride = usize::try_from(texture.width()).unwrap() * 4;
+                let height = usize::try_from(texture.height()).unwrap();
+                let mut bytes = vec![0; stride * height];
+                texture.download(&mut bytes, stride);
+                let center = (height / 2) * stride + (stride / 8) * 4;
+                (bytes[center + 3], bytes)
+            };
+            let (alpha, outline) = paint(false);
+            assert_eq!(alpha, 0);
+            let darkest = outline.chunks_exact(4).map(|p| p[3]).max().unwrap();
+            assert!(darkest > 128, "outline opacity at {font}: {darkest}");
+            let (alpha, filled) = paint(true);
+            assert_eq!(alpha, 255);
+            assert!(filled.chunks_exact(4).any(|p| p.iter().all(|&channel| channel > 240)));
+            native.width()
+        });
+        assert!(sizes[0] < sizes[1]);
+        window.destroy();
     }
 
     #[test]

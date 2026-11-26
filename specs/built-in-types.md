@@ -123,6 +123,9 @@ means completed; an absent or invalid value means incomplete. Neither type has a
 [projects and tasks specification](projects-and-tasks.md) defines parent validation, inheritance,
 completion, and their search behavior.
 
+Projects also define `completed-on` as an optional date with search mode `filter`. A valid date
+means completed. A missing or invalid date leaves the project incomplete.
+
 ## Work status fields
 
 Projects and tasks also define `status` as a choice with values `maybe`, `someday`, and `waiting`,

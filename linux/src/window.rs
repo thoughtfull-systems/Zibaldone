@@ -191,17 +191,24 @@ impl Window {
         let search = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
             .monospace(true)
-            .top_margin(8)
-            .bottom_margin(8)
-            .left_margin(8)
-            .right_margin(8)
+            .top_margin(4)
+            .bottom_margin(4)
+            .left_margin(6)
+            .right_margin(6)
             .build();
         search.buffer().set_enable_undo(true);
         search.update_property(&[gtk::accessible::Property::Label("Search definition")]);
         let search_sidebar = SearchSidebar::new(&search, &sort);
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
-        let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let sidebar_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_bottom(10)
+            .margin_end(10)
+            .margin_start(10)
+            .margin_top(10)
+            .build();
         sidebar_box.append(&search_sidebar.widget);
         let results_scroll = gtk::ScrolledWindow::builder().child(&list).vexpand(true).build();
         sidebar_box.append(&results_scroll);
@@ -281,12 +288,16 @@ impl Window {
         let backlinks_heading = gtk::Label::builder()
             .label("Linked from")
             .xalign(0.0)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
             .css_classes(["caption-heading", "dim-label"])
             .build();
-        let backlinks_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let backlinks_panel = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_bottom(12)
+            .margin_end(12)
+            .margin_start(12)
+            .margin_top(12)
+            .build();
         backlinks_panel.append(&backlinks_heading);
         backlinks_panel.append(
             &gtk::ScrolledWindow::builder()
@@ -418,6 +429,7 @@ impl Window {
     }
 
     fn begin_open(&self) -> u64 {
+        self.cancel_work_title_open();
         let next = self.inner().opening.get().wrapping_add(1);
         self.inner().opening.set(next);
         next

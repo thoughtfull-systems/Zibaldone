@@ -66,34 +66,22 @@ impl State {
         values
     }
 
-    pub(crate) async fn reorder_project(
-        &self,
-        space_id: Id,
-        note: Id,
-        before: Option<Id>,
-    ) -> Result<()> {
-        let store = self.store.lock().await;
-        let space = self.space(space_id).await?;
-        let mut space = space.lock().await;
-        space.reorder_project(note, before)?;
-        let saved = store.save_space(&space);
-        self.changed_here(space_id);
-        self.send_ui(UiEvent::Changed(space_id));
-        saved?;
-        Ok(())
-    }
-
-    pub(crate) async fn move_task(
+    pub(crate) async fn move_work(
         &self,
         space_id: Id,
         note: Id,
         parent: Option<Id>,
         before: Option<Id>,
+        project: bool,
     ) -> Result<()> {
         let store = self.store.lock().await;
         let space = self.space(space_id).await?;
         let mut space = space.lock().await;
-        space.move_task(note, parent, before)?;
+        if project {
+            space.move_project(note, parent, before)?;
+        } else {
+            space.move_task(note, parent, before)?;
+        }
         let saved = store.save_space(&space);
         self.reindex_note(space_id, &space, note);
         self.changed_here(space_id);

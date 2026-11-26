@@ -13,6 +13,7 @@ pub(crate) fn init_gtk() {
         "run GTK tests with devenv shell -- cargo nextest run --workspace"
     );
     adw::init().expect("GTK connects to the private test display");
+    crate::style::install();
 }
 
 /// Drive GTK's queued work without waiting for a display event or the periodic status timer.

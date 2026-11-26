@@ -504,6 +504,44 @@ editor.
 An occurrence's status button shows its inherited value. Use the recurring task's status picker to
 change the series status.
 
+## Subproject hierarchy and row titles
+
+Projects use the same optional `completed-on` field, local completion date, and date search rules as
+tasks. Completion applies to the project itself. Its descendants keep their own completion values.
+Show a completion checkbox in project rows and in the open project's sidebar header.
+
+Show nested projects in Subprojects and nested tasks in Tasks or Subtasks. Expand and collapse each
+branch from its own row. A completed row stays visible when it has an unfinished descendant in its
+section. When the open item has subprojects or tasks, place one right-aligned **Show completed**
+checkbox on its own line before the lists. Apply its saved setting to both lists. Keep the expander
+closed and unavailable when no children match the filter. Use separate columns for the expander,
+completion checkbox, and title. Split the space between two columns equally into padding on either
+side. Use half that spacing between the checkbox and title. Use less vertical padding than
+horizontal padding. Put status and dates beneath the title and align them with its text. Hovering
+over the checkbox or title highlights both with a shared background. The background starts halfway
+between the expander arrow and checkbox. Align the leading edges of the **New subproject** and **New
+task** text boxes with that background. Align the text inside each box with the leading edge of the
+checkbox. Pressing either control darkens the background. Clicking the checkbox toggles completion.
+
+Click a row title once to open its note. Double-click the title to rename it in place. Use the title
+as the drag source and use the task drop zones for both sections. Dropping on the top or bottom
+quarter inserts before or after the target under its parent. Dropping in the middle nests the item
+under the target and expands the target. Validate project moves with the existing parent rules and
+use the movable sequence for ordering. Move the parent link and sequence entry in one commit. The
+dragged item's descendants keep their parent links and positions.
+
+Right-click a project or task row to open its context menu. With focus in the row, use the context
+menu key or Shift+F10 to open the same menu. Show status choices in the main project menu between
+the date actions and **Move…**. Use the task menu's order and relevance rules. Offer **Rename…**
+after **Move…** and before the delete action in both menus.
+
+## Inline project status
+
+Use a dropdown for the project status field. Selecting `Waiting...` sets the status to Waiting,
+closes the dropdown, and focuses a text box to the right of **Waiting for:**. Press Enter or leave
+the text box to save the reason. Tab completes text from earlier reasons. In search results and
+other item details, show a Waiting reason as `Waiting for: <reason>`.
+
 [decision]: ../decisions/ZIB0025-projects-and-tasks.md
 [document]: space-document.md
 [saved]: saved-searches.md

@@ -47,6 +47,7 @@ pub fn run(state: Arc<State>, runtime: tokio::runtime::Handle) -> glib::ExitCode
 }
 
 fn startup(app: &adw::Application, state: Arc<State>) {
+    crate::style::install();
     // Keep running with no window open, until the owner quits.
     std::mem::forget(app.hold());
     let window: std::rc::Rc<std::cell::RefCell<Option<Window>>> = std::rc::Rc::default();

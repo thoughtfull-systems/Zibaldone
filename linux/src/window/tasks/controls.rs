@@ -26,8 +26,7 @@ impl Window {
         grid.add_css_class("zib-work-fields");
         let id = item.note.id;
         let mut fields: Vec<(&str, gtk::Widget)> = Vec::new();
-        if zib_core::work::is_task(&item.note.type_name)
-            && !tree.series.contains(&id)
+        if !tree.series.contains(&id)
             && (!item.note.is_task_occurrence()
                 || tree.occurrences.get(&id).is_some_and(|row| row.superseded_on.is_none()))
         {
@@ -38,8 +37,13 @@ impl Window {
             };
             fields.push(("Completed", control));
         }
+        let status = if item.note.type_name == schema::PROJECT {
+            self.project_status_control(space, id, tree).upcast()
+        } else {
+            self.work_status_button(space, id, tree, false).upcast()
+        };
         fields.extend([
-            ("Status", self.work_status_button(space, id, tree, false).upcast()),
+            ("Status", status),
             (
                 "Scheduled date",
                 self.date_control(space, item, tree, "scheduled-on", false).upcast(),
@@ -378,15 +382,58 @@ impl Window {
         content
     }
 
-    pub(super) fn task_actions(&self, space: Id, item: &Item, tree: &Tree) -> gtk::MenuButton {
+    pub(super) fn connect_work_context_menu(
+        &self,
+        row: &gtk::Box,
+        space: Id,
+        item: &Item,
+        tree: &Tree,
+    ) {
+        let popup = self.work_actions(space, item, tree);
+        popup.set_has_arrow(false);
+        row.append(&popup);
+
+        let click = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_SECONDARY)
+            .name("zib-work-context-menu")
+            .build();
+        let (w, menu) = (self.clone(), popup.clone());
+        click.connect_pressed(move |gesture, _, x, y| {
+            w.cancel_work_title_open();
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            #[allow(clippy::cast_possible_truncation)]
+            menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            menu.popup();
+        });
+        row.add_controller(click);
+
+        let keys = gtk::EventControllerKey::new();
+        let (w, menu) = (self.clone(), popup.clone());
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            if key == gdk::Key::Menu
+                || (key == gdk::Key::F10 && modifiers.contains(gdk::ModifierType::SHIFT_MASK))
+            {
+                w.cancel_work_title_open();
+                menu.set_pointing_to(None);
+                menu.popup();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        row.add_controller(keys);
+        row.connect_unmap(move |_| {
+            if popup.is_visible() {
+                popup.popdown();
+            }
+        });
+    }
+
+    fn work_actions(&self, space: Id, item: &Item, tree: &Tree) -> gtk::PopoverMenu {
         let note = item.note.id;
-        let button = gtk::MenuButton::builder().icon_name("view-more-symbolic").build();
-        button.add_css_class("flat");
         let task = zib_core::work::is_task(&item.note.type_name);
-        button.set_tooltip_text(Some(if task { "Task actions" } else { "Project actions" }));
         let menu = gio::Menu::new();
         let popup = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
-        // Order the actions by dates, repetition, status, move, and deletion.
+        // Keep the shared actions in the same order in both menus.
         let dates: Vec<_> = [("Add schedule date", "scheduled-on"), ("Add due date", "due-on")]
             .into_iter()
             .filter(|(_, field)| tree.date(note, field).is_none())
@@ -395,21 +442,32 @@ impl Window {
             append_picker_menu(&menu, label, field);
         }
         let actions = gio::SimpleActionGroup::new();
-        let status = self.work_status_menu(&popup, space, note, tree);
         if task {
             self.add_recurrence_actions(space, note, tree, &menu, &popup, &actions);
-            for index in 0..status.model.n_items() {
-                menu.append_item(&gio::MenuItem::from_model(&status.model, index));
-            }
+        }
+        let status = self.work_status_menu(&popup, space, note, tree);
+        for index in 0..status.model.n_items() {
+            menu.append_item(&gio::MenuItem::from_model(&status.model, index));
         }
         append_picker_menu(&menu, "Move…", "parent-id");
+        {
+            menu.append(Some("Rename…"), Some("task.rename"));
+            let rename = gio::SimpleAction::new("rename", None);
+            let (w, popover) = (self.clone(), popup.downgrade());
+            rename.connect_activate(move |_, _| {
+                if let Some(popup) = popover.upgrade() {
+                    popup.popdown();
+                }
+                let w = w.clone();
+                // Focus the title after the menu restores focus.
+                glib::idle_add_local_once(move || w.edit_work_title(space, note));
+            });
+            actions.add_action(&rename);
+        }
         menu.append(
             Some(if task { "Delete task…" } else { "Delete project…" }),
             Some("task.delete"),
         );
-        if !task {
-            menu.append_submenu(Some("Set status…"), &status.model);
-        }
         popup.set_menu_model(Some(&menu));
         status.attach(&popup);
         self.track_work_popover(popup.upcast_ref());
@@ -428,8 +486,7 @@ impl Window {
         });
         actions.add_action(&delete);
         popup.insert_action_group("task", Some(&actions));
-        button.set_popover(Some(&popup));
-        button
+        popup
     }
 
     fn task_picker_page(
@@ -567,7 +624,7 @@ const CSS: &str = "
 list.zib-work-picker-list > row {
     margin: 0;
     min-height: 0;
-    padding: 2px;
+    padding: 1px 2px;
 }
 .zib-work-emphasis.zib-work-overdue {
     color: @error_color;
@@ -585,8 +642,8 @@ list.zib-work-picker-list > row {
 button.zib-work-field-control,
 menubutton.zib-work-field-control > button {
     font-weight: bold;
-    padding-left: 16px;
-    padding-right: 16px;
+    padding-left: 8px;
+    padding-right: 8px;
 }
 checkbutton.zib-work-field-control {
     padding-left: 0;
@@ -599,23 +656,9 @@ menubutton.zib-work-quiet > button:hover {
 menubutton.zib-work-parent > button image {
     -gtk-icon-transform: scaleX(-1);
 }
-button.zib-subproject-link,
-button.zib-work-title {
-    padding-left: 0;
-    padding-right: 0;
-}
 button.zib-work-title,
 button.zib-work-title label {
     font-weight: normal;
-}
-button.zib-task-expander {
-    min-width: 16px;
-    padding-left: 0;
-    padding-right: 0;
-}
-checkbutton.zib-task-completion {
-    padding-left: 0;
-    padding-right: 0;
 }
 flowbox.zib-task-controls > flowboxchild {
     padding: 0;
@@ -623,7 +666,7 @@ flowbox.zib-task-controls > flowboxchild {
 flowbox.zib-task-controls > flowboxchild > menubutton > button,
 box.zib-work-details > menubutton > button {
     padding-left: 0;
-    padding-right: 4px;
+    padding-right: 3px;
 }
 box.zib-work-details > menubutton > button {
     font-weight: normal;

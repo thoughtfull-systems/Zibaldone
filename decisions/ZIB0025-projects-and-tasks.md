@@ -13,8 +13,9 @@ Concurrent offline moves can create cycles even when each machine rejects local 
 ## Decision
 
 Add dedicated `project` and `task` note types. Store explicit `scheduled-on` and `due-on` date
-fields and a `parent-id` link on both. Tasks also have a `completed-on` date, with absence meaning
-incomplete. The owner replaces an ordinary note by creating a project and deleting the old note.
+fields and a `parent-id` link on both. Both types have a `completed-on` date. A missing completion
+date leaves the item incomplete. The owner replaces an ordinary note by creating a project and
+deleting the old note.
 
 Parents belong to the same space. A task can have a task or project parent; a project can have a
 project parent. Each item has at most one parent. Reject local moves that create cycles or invalid
@@ -27,8 +28,8 @@ independently over the derived forest. Store no inherited copies. An explicit su
 date can precede a parent's scheduled date or follow its due date. The initial design has no
 inheritance opt-out.
 
-Completion dates never inherit. Checking a task sets today's local date, and reopening it clears the
-date. Later edits don't change it. The owner confirms that the earlier boolean completion model
+Completion dates never inherit. Checking an item sets today's local date, and reopening it clears
+the date. Later edits don't change it. The owner confirms that the earlier boolean completion model
 exists only in disposable test data, so this implementation doesn't convert those booleans to dates.
 
 Search indexes effective dates, normalized parents, and completion dates. A virtual `project`
@@ -51,21 +52,21 @@ positions before a move or creation, and append newly created items. Ignore dupl
 read and remove extra live occurrences before local sequence edits. Preserve entries for missing
 notes so deletes and older writers don't require order repairs.
 
-Dragging a task moves its existing sequence entry and, when necessary, changes its parent in the
-same commit. Its descendants keep their links and positions. The desktop distinguishes row edges for
+Dragging an item's title moves its existing sequence entry and can change its parent in the same
+commit. Its descendants keep their links and positions. The desktop distinguishes row edges for
 sibling placement from the row's center for nesting, and rejects self-drops and descendant targets.
 Show a line for insertion and a highlighted row for nesting.
 
-Subprojects use the same sequence for manual order. Their drag handles reorder sibling projects
-without changing parent links. Split each project row into before and after halves, so dropping on
-its title still reorders rather than nesting. Keep tasks and projects in separate lists and reject
-drops between their rows.
+Use the same move operation and drop zones for subprojects and tasks. Validate project parents with
+the existing hierarchy rules and use the movable sequence for sibling order. This keeps project
+subtrees intact as they move and lets concurrent moves merge through the existing parent links. Keep
+tasks and projects in separate lists and reject drops between their rows.
 
 Show a Subprojects heading and inline additions beneath the subproject and task lists. Each addition
 has a plain title text box aligned with the list's titles, even when the list is empty. Enter
 submits without navigating away or showing a dialog. Omit Add buttons and the Add subtask menu
 action. Retain focus and preserve drafts across list refreshes so the owner can add items in
-sequence. Drag tasks to create subtasks.
+sequence. Drag items to create subtasks and nested subprojects.
 
 Show project controls, subprojects, and tasks in a permanent right sidebar beside the project note.
 Give the note and sidebar separate scrolling. Use an equal split before the owner chooses a width,

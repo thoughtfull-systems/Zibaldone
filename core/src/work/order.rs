@@ -86,17 +86,32 @@ impl Space {
 
     /// Move a task and its subtree. `before` names a destination sibling; `None` appends it.
     pub fn move_task(&mut self, id: Id, parent: Option<Id>, before: Option<Id>) -> Result<()> {
+        self.move_work(schema::TASK, id, parent, before)
+    }
+
+    /// Move a project and its subtree. `before` names a destination project; `None` appends it.
+    pub fn move_project(&mut self, id: Id, parent: Option<Id>, before: Option<Id>) -> Result<()> {
+        self.move_work(schema::PROJECT, id, parent, before)
+    }
+
+    fn move_work(
+        &mut self,
+        kind: &str,
+        id: Id,
+        parent: Option<Id>,
+        before: Option<Id>,
+    ) -> Result<()> {
         let tree = Tree::read(self);
-        let Some(item) = tree.items.get(&id).filter(|i| i.note.type_name == schema::TASK) else {
-            return Err(Error::Space("Choose a task to move".into()));
+        let Some(item) = tree.items.get(&id).filter(|i| i.note.type_name == kind) else {
+            return Err(Error::Space(format!("Choose a {kind} to move")));
         };
         validate(self, id, "parent-id", parent.map(Value::Link).as_ref())?;
         if let Some(before) = before {
-            if tree
-                .items
-                .get(&before)
-                .is_none_or(|i| i.parent != parent || i.note.is_task_occurrence())
-            {
+            if tree.items.get(&before).is_none_or(|i| {
+                i.parent != parent
+                    || i.note.is_task_occurrence()
+                    || kind == schema::PROJECT && i.note.type_name != kind
+            }) {
                 return Err(Error::Space("Choose a sibling at the destination".into()));
             }
             if before == id {
@@ -164,6 +179,16 @@ mod tests {
         assert_eq!(children(schema::TASK), [task, other_task]);
         assert_eq!(tree.children(c), [child]);
         assert_eq!(reopened.note(c).unwrap(), original);
+
+        space.move_project(c, Some(b), None).unwrap();
+        assert!(space.move_project(b, Some(c), None).is_err());
+        assert!(space.move_project(c, Some(task), None).is_err());
+        assert!(space.move_project(c, Some(root), Some(task)).is_err());
+        let reopened = Space::open(&space.snapshot().unwrap(), Id::generate()).unwrap();
+        let tree = Tree::read(&reopened);
+        assert_eq!(tree.projects(child), [c, b, root]);
+        assert_eq!(tree.children(b), [c]);
+        assert_eq!(tree.items[&task].parent, Some(root));
     }
 
     #[test]

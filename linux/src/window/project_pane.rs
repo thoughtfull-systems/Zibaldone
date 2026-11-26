@@ -33,7 +33,14 @@ pub(super) struct ProjectPane {
 
 impl ProjectPane {
     pub fn new(note: &impl IsA<gtk::Widget>) -> Self {
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_bottom(20)
+            .margin_end(20)
+            .margin_start(20)
+            .margin_top(20)
+            .build();
         let scroll = gtk::ScrolledWindow::builder()
             .child(&content)
             .hscrollbar_policy(gtk::PolicyType::External)

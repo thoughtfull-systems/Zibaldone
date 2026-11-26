@@ -69,14 +69,7 @@ impl SearchSidebar {
         scope.set_hexpand(true);
         options.append(&scope);
         options.append(sort);
-        let widget = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(8)
-            .margin_start(10)
-            .margin_end(10)
-            .margin_top(10)
-            .margin_bottom(10)
-            .build();
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 8);
         widget.append(&picker);
         widget.append(&gtk::Label::builder().label("Search definition").xalign(0.0).build());
         widget.append(&query);

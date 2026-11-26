@@ -37,7 +37,7 @@ impl Status {
             _ => self
                 .waiting_for
                 .as_ref()
-                .map_or_else(|| "Waiting".into(), |value| format!("Waiting · {value}")),
+                .map_or_else(|| "Waiting".into(), |value| format!("Waiting for: {value}")),
         }
     }
 }

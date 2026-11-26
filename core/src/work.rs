@@ -47,9 +47,8 @@ pub struct Item {
 
 impl Item {
     pub fn completed(&self) -> bool {
-        is_task(&self.note.type_name)
-            && (self.explicit_date("completed-on").is_some()
-                || self.explicit_date("skipped-on").is_some())
+        self.explicit_date("completed-on").is_some()
+            || is_task(&self.note.type_name) && self.explicit_date("skipped-on").is_some()
     }
 
     pub fn explicit_date(&self, field: &str) -> Option<String> {
@@ -246,8 +245,9 @@ impl Tree {
     }
 
     pub fn unfinished_below(&self, id: Id) -> bool {
+        let Some(parent) = self.items.get(&id) else { return false };
         self.items.iter().any(|(child, item)| {
-            item.note.type_name == schema::TASK
+            item.note.type_name == parent.note.type_name
                 && !item.note.is_task_occurrence()
                 && !item.completed()
                 && self.ancestors(*child).contains(&id)
@@ -278,10 +278,7 @@ pub(crate) fn validate(space: &Space, id: Id, field: &str, value: Option<&Value>
     }
     let Some(value) = value else { return Ok(()) };
     let valid = match (field, value) {
-        ("completed-on", Value::Date(date)) => {
-            note.type_name == schema::TASK && schema::is_date(date)
-        }
-        ("due-on" | "scheduled-on", Value::Date(date)) => schema::is_date(date),
+        ("completed-on" | "due-on" | "scheduled-on", Value::Date(date)) => schema::is_date(date),
         ("parent-id", Value::Link(parent)) => {
             let tree = Tree::read(space);
             tree.items.get(parent).is_some_and(|p| {
@@ -419,7 +416,7 @@ mod tests {
         let parent = space.create_work(schema::TASK, "Parent", Some(project)).unwrap();
         let child = space.create_work(schema::TASK, "Subtask", Some(parent)).unwrap();
         let date = Value::Date("2026-11-18".into());
-        assert!(space.set_field(project, "completed-on", &date).is_err());
+        space.set_field(project, "completed-on", &date).unwrap();
         assert!(space.set_field(parent, "completed-on", &Value::Boolean(true)).is_err());
         assert!(
             space.set_field(parent, "completed-on", &Value::Date("2026-02-30".into())).is_err()
@@ -428,6 +425,7 @@ mod tests {
         space.set_body(parent, "# Revised\n\nLater notes").unwrap();
         let reopened = Space::open(&space.snapshot().unwrap(), Id::generate()).unwrap();
         let tree = Tree::read(&reopened);
+        assert!(tree.items[&project].completed());
         assert!(tree.items[&parent].completed());
         assert_eq!(
             tree.items[&parent].explicit_date("completed-on").as_deref(),

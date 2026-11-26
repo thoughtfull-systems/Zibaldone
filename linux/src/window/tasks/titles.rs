@@ -28,7 +28,7 @@ pub(super) struct TitleEdit {
 }
 
 impl TitleEdit {
-    fn new(item: &Item) -> Rc<Self> {
+    fn new(window: &Window, space: Id, item: &Item) -> Rc<Self> {
         let title = entry_title(item);
         let entry = gtk::Entry::builder()
             .text(title)
@@ -53,7 +53,6 @@ impl TitleEdit {
         let button = gtk::Button::builder().child(&label).hexpand(true).build();
         button.add_css_class("flat");
         button.add_css_class("zib-work-title");
-        button.set_tooltip_text(Some("Edit title"));
         let view =
             gtk::Stack::builder().hexpand(true).hhomogeneous(false).vhomogeneous(false).build();
         view.add_named(&button, Some("label"));
@@ -71,15 +70,14 @@ impl TitleEdit {
             saved: RefCell::new(title.into()),
             timer: RefCell::default(),
         });
-        let opening = Rc::downgrade(&edit);
-        button.connect_clicked(move |_| {
-            if let Some(edit) = opening.upgrade() {
-                edit.finish.set(false);
-                edit.view.set_visible_child_name("entry");
-                edit.entry.grab_focus();
-            }
-        });
+        window.connect_work_title(&button, space, item);
         edit
+    }
+
+    fn start(&self) {
+        self.finish.set(false);
+        self.view.set_visible_child_name("entry");
+        self.entry.grab_focus();
     }
 
     fn dirty(&self) -> bool {
@@ -113,9 +111,91 @@ fn entry_title(item: &Item) -> &str {
 }
 
 impl Window {
+    fn connect_work_title(&self, button: &gtk::Button, space: Id, item: &Item) {
+        let note = item.note.id;
+        let project = item.note.type_name == schema::PROJECT;
+        button.set_tooltip_text(Some("Open · Double-click to rename · Drag to reorder or nest"));
+        let clicks = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_PRIMARY)
+            .name("zib-work-title-click")
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let count = Rc::new(Cell::new(None));
+        let (w, presses) = (self.clone(), count.clone());
+        clicks.connect_pressed(move |_, number, _, _| {
+            w.cancel_work_title_open();
+            presses.set(Some(number));
+        });
+        let clear_count = |count: &Rc<Cell<Option<i32>>>| {
+            let count = count.clone();
+            let released = count.get();
+            glib::idle_add_local_once(move || {
+                if count.get() == released {
+                    count.set(None);
+                }
+            });
+        };
+        let releases = count.clone();
+        clicks.connect_released(move |_, _, _, _| clear_count(&releases));
+        let cancelled = count.clone();
+        clicks.connect_cancel(move |_, _| clear_count(&cancelled));
+        button.add_controller(clicks);
+        self.work_drag_source(button, space, note);
+
+        let w = self.clone();
+        button.connect_clicked(move |button| {
+            let count = count.take();
+            if w.inner().work.dragging.get() {
+                return;
+            }
+            match count {
+                Some(1) => w.delay_work_title_open(button, space, note, project),
+                Some(2) => w.edit_work_title(space, note),
+                Some(_) => (),
+                // Keyboard and accessibility activation open the item immediately.
+                None => w.open_work_title(space, note, project),
+            }
+        });
+    }
+
+    fn delay_work_title_open(&self, button: &gtk::Button, space: Id, note: Id, project: bool) {
+        self.cancel_work_title_open();
+        let interval = u64::try_from(button.settings().gtk_double_click_time()).unwrap_or(0);
+        let button = button.downgrade();
+        let w = self.clone();
+        let open = glib::timeout_add_local_once(Duration::from_millis(interval), move || {
+            w.inner().work.title_open.take();
+            if button.upgrade().is_some_and(|button| button.is_mapped()) {
+                w.open_work_title(space, note, project);
+            }
+        });
+        self.inner().work.title_open.replace(Some(open));
+    }
+
+    fn open_work_title(&self, space: Id, note: Id, project: bool) {
+        if project {
+            self.open_note(space, note);
+        } else {
+            self.open_task(space, note);
+        }
+    }
+
+    pub(in crate::window) fn cancel_work_title_open(&self) {
+        if let Some(open) = self.inner().work.title_open.take() {
+            open.remove();
+        }
+    }
+
     pub(super) fn work_title_view(&self, space: Id, item: &Item) -> gtk::Stack {
         self.task_title_entry(space, item);
         self.inner().work.titles.borrow()[&(space, item.note.id)].view.clone()
+    }
+
+    pub(super) fn edit_work_title(&self, space: Id, note: Id) {
+        let edit = self.inner().work.titles.borrow().get(&(space, note)).cloned();
+        if let Some(edit) = edit.filter(|edit| edit.view.is_mapped()) {
+            edit.start();
+        }
     }
 
     pub(super) fn task_title_entry(&self, space: Id, item: &Item) -> gtk::Entry {
@@ -126,7 +206,7 @@ impl Window {
             }
             return edit.entry.clone();
         }
-        let edit = TitleEdit::new(item);
+        let edit = TitleEdit::new(self, space, item);
         let entry = edit.entry.clone();
         self.inner().work.titles.borrow_mut().insert((space, id), edit.clone());
         let w = self.clone();
