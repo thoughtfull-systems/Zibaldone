@@ -22,10 +22,12 @@ let
       # keep-sorted end
     };
     inherit ((lib.importTOML (root + "/Cargo.toml")).workspace.package) version;
+    # The GTK wrapper propagates dependencies that affect Cargo's build scripts.
     nativeBuildInputs = [
       # keep-sorted start
       pkgs.mold
       pkgs.pkg-config
+      pkgs.wrapGAppsHook4
       # keep-sorted end
     ];
     pname = "zibaldone";
@@ -79,7 +81,6 @@ let
           platforms = lib.platforms.linux;
           # keep-sorted end
         };
-        nativeBuildInputs = common.nativeBuildInputs ++ [ pkgs.wrapGAppsHook4 ];
         postInstall = lib.concatLines (
           rename
           ++ [

@@ -46,9 +46,11 @@ nextest, and package it with a Nix flake that uses crane.
   reuses the dependencies and rebuilds only Zib's crates. The shell also passes dependencies from
   Cargo's registry and Git caches through sccache, which covers the few that the seed lacks.
 - **Nix.** `flake.nix` defines the `zibaldone` and `zibaldone-dev` packages and a `tests` check.
-  Crane builds the dependencies once into a derivation of their own, which every package and the
-  tests reuse, so a change to Zib rebuilds only Zib's crates. The flake's overlay adds both packages
-  to a NixOS configuration.
+  Crane builds the dependencies into a derivation of their own, which every package and the tests
+  reuse. The dependency build includes the GTK wrapper's native inputs so Cargo can reuse its
+  results. The flake's overlay adds both packages to a NixOS configuration. Each package exposes the
+  dependency derivation as `cargoArtifacts` so builds can keep it in the Nix store or publish it to
+  a binary cache.
 - **Hooks.** The git hooks run `rustfmt`, `clippy` with every warning denied and Clippy's pedantic
   lints, and `taplo` for Tom's Obvious, Minimal Language (TOML) files. Their settings live in
   `.config/rustfmt.toml` and `.config/taplo.toml`, and the lints in the workspace's `Cargo.toml`.
