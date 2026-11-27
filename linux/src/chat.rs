@@ -55,6 +55,7 @@ struct TurnView {
 impl Chat {
     pub fn new(state: Arc<State>) -> Self {
         let root = adw::ToolbarView::new();
+        root.add_css_class("zib-sidebar");
         root.set_width_request(320);
         root.set_visible(false);
         let title = gtk::Button::with_label("New chat");

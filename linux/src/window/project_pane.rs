@@ -4,14 +4,14 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::{gdk, glib, graphene};
+use gtk::{gdk, glib};
 
 use crate::app::core;
 
-use super::Window;
+use super::{Window, pane_event_point};
 
 const MIN_NOTE_WIDTH: i32 = 280;
-const MIN_SIDEBAR_WIDTH: i32 = 600;
+const MIN_SIDEBAR_WIDTH: i32 = 360;
 
 pub(super) struct ProjectPane {
     active: Cell<bool>,
@@ -43,7 +43,7 @@ impl ProjectPane {
             .build();
         let scroll = gtk::ScrolledWindow::builder()
             .child(&content)
-            .hscrollbar_policy(gtk::PolicyType::External)
+            .hscrollbar_policy(gtk::PolicyType::Never)
             .min_content_width(MIN_SIDEBAR_WIDTH)
             .width_request(MIN_SIDEBAR_WIDTH)
             .visible(false)
@@ -131,14 +131,8 @@ impl ProjectPane {
     }
 
     fn on_handle(&self, event: &gdk::Event, touch: bool) -> bool {
-        let (Some((x, y)), Some(native)) = (event.position(), self.widget.native()) else {
-            return false;
-        };
-        let (dx, dy) = native.surface_transform();
-        #[allow(clippy::cast_possible_truncation)]
-        let point = graphene::Point::new((x - dx) as f32, (y - dy) as f32);
         let (Some(point), Some(bounds)) =
-            (native.compute_point(&self.widget, &point), self.handle.compute_bounds(&self.widget))
+            (pane_event_point(&self.widget, event), self.handle.compute_bounds(&self.widget))
         else {
             return false;
         };

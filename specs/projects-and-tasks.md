@@ -542,6 +542,12 @@ closes the dropdown, and focuses a text box to the right of **Waiting for:**. Pr
 the text box to save the reason. Tab completes text from earlier reasons. In search results and
 other item details, show a Waiting reason as `Waiting for: <reason>`.
 
+## Compact project details
+
+Use the note editor's background for the project details sidebar. Replace the original 600-pixel
+minimum with 360 logical pixels, or the width the controls need if they require more room. Let row
+details wrap when the available width can't fit them on one line.
+
 [decision]: ../decisions/ZIB0025-projects-and-tasks.md
 [document]: space-document.md
 [saved]: saved-searches.md

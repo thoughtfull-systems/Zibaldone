@@ -4,12 +4,12 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 use zib_core::store::SidebarLayout;
 
 use crate::app::core;
 
-use super::Window;
+use super::{Window, pane_event_point};
 
 const COLLAPSE_WIDTH: i32 = 100;
 const DEFAULT_WIDTH: u32 = 320;
@@ -18,6 +18,8 @@ const SAVE_PAUSE: Duration = Duration::from_millis(500);
 pub(super) struct SearchPane {
     busy: Cell<bool>,
     changing: Cell<bool>,
+    dragging: Cell<bool>,
+    handle: gtk::Widget,
     interacted: Cell<bool>,
     layout: Cell<SidebarLayout>,
     pending_width: Cell<Option<u32>>,
@@ -41,14 +43,22 @@ impl SearchPane {
             .end_child(content)
             .resize_start_child(false)
             .resize_end_child(true)
-            .shrink_start_child(true)
-            .shrink_end_child(true)
+            .shrink_start_child(false)
+            .shrink_end_child(false)
             .position(i32::try_from(DEFAULT_WIDTH).unwrap())
             .wide_handle(true)
             .build();
+        let handle = std::iter::successors(widget.first_child(), WidgetExt::next_sibling)
+            .find(|child| {
+                child != sidebar.upcast_ref::<gtk::Widget>()
+                    && child != content.upcast_ref::<gtk::Widget>()
+            })
+            .expect("GtkPaned has a handle");
         Self {
             busy: Cell::new(false),
             changing: Cell::new(false),
+            dragging: Cell::new(false),
+            handle,
             interacted: Cell::new(false),
             layout: Cell::new(SidebarLayout { visible: true, width: DEFAULT_WIDTH }),
             pending_width: Cell::new(None),
@@ -67,6 +77,49 @@ impl SearchPane {
 
     pub fn set_show_sidebar(&self, visible: bool) {
         self.toggle.set_active(visible);
+    }
+
+    fn collapse(&self) {
+        // Keep the width from before this drag rather than the last tiny intermediate step.
+        self.dragging.set(false);
+        self.pending_width.take();
+        self.set_show_sidebar(false);
+    }
+
+    fn resize_event(&self, event: &gdk::Event) {
+        match event.event_type() {
+            gdk::EventType::ButtonPress | gdk::EventType::TouchBegin => {
+                let primary = event
+                    .downcast_ref::<gdk::ButtonEvent>()
+                    .is_none_or(|event| event.button() == gdk::BUTTON_PRIMARY);
+                self.dragging.set(
+                    primary
+                        && self.shows_sidebar()
+                        && pane_event_point(&self.widget, event).is_some_and(|point| {
+                            self.handle
+                                .compute_bounds(&self.widget)
+                                .is_some_and(|bounds| bounds.contains_point(&point))
+                        }),
+                );
+            }
+            gdk::EventType::MotionNotify | gdk::EventType::TouchUpdate if self.dragging.get() => {
+                if let Some(point) = pane_event_point(&self.widget, event) {
+                    let mut width = f64::from(point.x());
+                    if self.widget.direction() == gtk::TextDirection::Rtl {
+                        width = f64::from(self.widget.width()) - width;
+                    }
+                    if width <= f64::from(COLLAPSE_WIDTH) {
+                        self.collapse();
+                    }
+                }
+            }
+            gdk::EventType::ButtonRelease
+            | gdk::EventType::TouchEnd
+            | gdk::EventType::TouchCancel => {
+                self.dragging.set(false);
+            }
+            _ => {}
+        }
     }
 
     fn apply(&self) {
@@ -102,9 +155,7 @@ impl Window {
             }
             let width = widget.position();
             if width <= COLLAPSE_WIDTH {
-                // Keep the width from before this drag rather than the last tiny intermediate step.
-                pane.pending_width.take();
-                pane.set_show_sidebar(false);
+                pane.collapse();
                 return;
             }
             pane.pending_width.set(Some(u32::try_from(width).unwrap_or(DEFAULT_WIDTH)));
@@ -117,6 +168,16 @@ impl Window {
                 saving.save_search_pane();
             }));
         });
+        // The divider stops at the content minimum. A continued drag can still hide the sidebar.
+        let pointer = gtk::EventControllerLegacy::builder()
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let w = self.clone();
+        pointer.connect_event(move |_, event| {
+            w.inner().sidebar_split.resize_event(event);
+            glib::Propagation::Proceed
+        });
+        self.inner().sidebar_split.widget.add_controller(pointer);
         let (w, state) = (self.clone(), self.inner().state.clone());
         glib::spawn_future_local(async move {
             let stored = core(async move { state.search_sidebar().await }).await;

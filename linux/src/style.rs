@@ -108,6 +108,15 @@ fn load(provider: &gtk::CssProvider, icon: &str) {
     provider.load_from_string(&format!(
         r#"
 {COMPACT_CONTROLS}
+.zib-sidebar {{
+    background-color: var(--sidebar-bg-color);
+    color: var(--sidebar-fg-color);
+}}
+.zib-search-sidebar {{ padding: 10px; }}
+.zib-search-sidebar > scrolledwindow list.navigation-sidebar {{
+    background-color: transparent;
+    color: inherit;
+}}
 button.zib-task-expander {{ min-height: 20px; min-width: 16px; }}
 button.zib-task-expander,
 button.zib-work-title {{ padding: 2px {column_padding}px; }}

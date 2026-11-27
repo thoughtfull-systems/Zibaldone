@@ -102,6 +102,12 @@ status controls open their pickers directly without navigating away from results
 The sort value `recurrence` orders occurrence dates newest first, followed by notes without an
 occurrence date. Break ties by note identifier. See the [recurring tasks specification][recurring].
 
+## Search sidebar resize limits
+
+While resizing, keep the visible search sidebar and the main view at least as wide as their contents
+require. A drag past the sidebar's minimum still hides it when the pointer reaches 100 logical
+pixels from the sidebar's outer edge.
+
 [decision]: ../decisions/ZIB0022-saved-searches.md
 [document]: space-document.md
 [identifiers]: identifiers.md

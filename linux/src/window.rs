@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::{gdk, gio, glib};
+use gtk::{gdk, gio, glib, graphene};
 use zib_core::body;
 use zib_core::editing::{Drawing, LinkTarget};
 use zib_core::render::Kind;
@@ -204,10 +204,7 @@ impl Window {
         let sidebar_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(8)
-            .margin_bottom(10)
-            .margin_end(10)
-            .margin_start(10)
-            .margin_top(10)
+            .css_classes(["zib-search-sidebar", "zib-sidebar"])
             .build();
         sidebar_box.append(&search_sidebar.widget);
         let results_scroll = gtk::ScrolledWindow::builder().child(&list).vexpand(true).build();
@@ -331,6 +328,7 @@ impl Window {
         panes.set_end_child(Some(chat.widget()));
         panes.set_resize_end_child(false);
         panes.set_shrink_end_child(false);
+        panes.set_shrink_start_child(false);
         panes.set_position(720);
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&panes));
@@ -2271,4 +2269,13 @@ async fn pasted_image(
             .await
             .map_err(|error| error.to_string())?;
     Ok((note, name))
+}
+
+fn pane_event_point(pane: &gtk::Paned, event: &gdk::Event) -> Option<graphene::Point> {
+    let (x, y) = event.position()?;
+    let native = pane.native()?;
+    let (dx, dy) = native.surface_transform();
+    #[allow(clippy::cast_possible_truncation)]
+    let point = graphene::Point::new((x - dx) as f32, (y - dy) as f32);
+    native.compute_point(pane, &point)
 }

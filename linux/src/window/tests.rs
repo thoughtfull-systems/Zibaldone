@@ -152,7 +152,7 @@ fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
     assert_eq!(pane.content.margin_bottom(), pane.content.margin_end());
     assert_eq!(pane.content.margin_top(), pane.content.margin_bottom());
     until(|| {
-        pane.scroll.width() >= 600
+        pane.scroll.width() >= 360
             && (pane.scroll.width() - inner.backlinks.widget.width()).abs() <= 2
     });
     assert_eq!(inner.work.header.parent(), Some(pane.content.clone().upcast()));
@@ -174,7 +174,7 @@ fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
     until(|| pane.scroll.width() == 640);
     assert_eq!(runtime.block_on(state.project_sidebar_width()), Some(640));
     resize(i32::MAX);
-    until(|| pane.scroll.width() == 600);
+    until(|| pane.scroll.width() == 360);
     assert!(pane.scroll.is_visible());
     let row = task_row(&window, "Task").unwrap();
     let grid = row.first_child().unwrap().downcast::<gtk::Grid>().unwrap();
@@ -188,9 +188,9 @@ fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
         assert!((bounds.y() - first.y()).abs() <= 1.0, "task controls must stay on one line");
     }
     let bounds = controls.compute_bounds(&pane.scroll).unwrap();
-    assert!(bounds.x() + bounds.width() <= 601.0, "task controls must fit in the sidebar");
+    assert!(bounds.x() + bounds.width() <= 361.0, "task controls must fit in the sidebar");
     resize(0);
-    until(|| pane.scroll.width() >= 600 && inner.backlinks.widget.width() >= 280);
+    until(|| pane.scroll.width() >= 360 && inner.backlinks.widget.width() >= 280);
     assert!(pane.scroll.width() <= available * 7 / 10);
     assert!(pane.scroll.is_visible());
     resize(available - 640);
@@ -222,13 +222,26 @@ fn project_sidebar_splits_notes_and_restores_a_bounded_machine_width() {
     assert_eq!(runtime.block_on(reopened.project_sidebar_width()), Some(640));
     next.inner().window.destroy();
     runtime.block_on(reopened.set_project_sidebar_width(320)).unwrap();
+    runtime
+        .block_on(reopened.set_work_status(space, project, Some("waiting".into()), "Reply".into()))
+        .unwrap();
     let narrow = Window::new(&app, reopened.clone());
     narrow.inner().window.set_default_size(1800, 900);
     present(&narrow.inner().window.clone().upcast());
     narrow.open_note(space, project);
     until(|| narrow.inner().project_pane.scroll.is_mapped());
     flush(&narrow);
-    until(|| narrow.inner().project_pane.scroll.width() == 600);
+    let pane = &narrow.inner().project_pane;
+    let waiting_entry = || {
+        descendants(&narrow.inner().work.header)
+            .into_iter()
+            .find_map(|child| child.downcast::<gtk::Entry>().ok())
+    };
+    until(|| pane.scroll.width() == 360 && waiting_entry().is_some_and(|entry| entry.width() > 0));
+    let reason = waiting_entry().unwrap();
+    assert_eq!(reason.text(), "Reply");
+    let reason = reason.compute_bounds(&pane.scroll).unwrap();
+    assert!(reason.x() + reason.width() <= 361.0);
     assert_eq!(runtime.block_on(reopened.project_sidebar_width()), Some(320));
     narrow.inner().window.destroy();
 }
@@ -738,6 +751,20 @@ fn search_sidebar_resizes_collapses_and_restores_machine_layout() {
     };
     flush(&window);
     let pane = &window.inner().sidebar_split;
+    let sidebar = pane.widget.start_child().unwrap();
+    let content = pane.widget.end_child().unwrap();
+    let sidebar_min = sidebar.measure(gtk::Orientation::Horizontal, -1).0;
+    pane.widget.set_position(101);
+    until(|| pane.widget.position() >= sidebar_min);
+    assert!(pane.shows_sidebar());
+    assert!(sidebar.compute_bounds(&pane.widget).unwrap().x() >= 0.0);
+    let content_min = content.measure(gtk::Orientation::Horizontal, -1).0;
+    pane.widget.set_position(i32::MAX);
+    until(|| {
+        pane.widget.position() <= pane.widget.max_position() && content.width() >= content_min
+    });
+    let bounds = content.compute_bounds(&pane.widget).unwrap();
+    assert!(f64::from(bounds.x() + bounds.width()) <= f64::from(pane.widget.width()));
     window.inner().search.buffer().set_text("garden AND @type=note");
     pane.widget.set_position(460);
     flush(&window);
